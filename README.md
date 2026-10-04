@@ -20,7 +20,7 @@ $ srvm
 - **Detects** your stack from marker files — `package.json`, `deno.json`, `Makefile`, `manage.py`, `Gemfile`, `Cargo.toml`, `go.mod`, `compose.yaml`, and 15 more. Never evaluates your scripts; it issues the same command you would have typed.
 - **Installs** missing dependencies (`npm install`, etc.) when the workspace lacks them.
 - **Arbitrates ports** — if the port is taken, srvm shifts to the next free one and injects it the way each framework actually understands (`--port`, `-p`, `-a 127.0.0.1:<n>`, `runserver <n>`, …). Unknown commands get a best-effort `PORT` env var instead — but only when a start port exists (a `--port` flag, an inherited numeric `PORT`, or a known framework hint); srvm never invents a port for a fully opaque script. srvm never kills whatever is holding a port, and if the app still binds elsewhere the sniffed URL wins and srvm says so.
-- **Finds your toolchain** even when it's not on `PATH` — bun, deno, pnpm, volta, asdf, mise, pyenv, rbenv shims are all searched.
+- **Finds your toolchain** even when it's not on `PATH` — bun, deno, pnpm, volta, asdf, mise, pyenv, rbenv shims are all searched. If `node`, `python`, `go`, or `cargo` is still missing, srvm downloads an official build, checks SHA-256, and puts that bin directory on the child `PATH`.
 - **Serves static sites itself** — a repo that's just `index.html` and assets needs no runtime at all; a small HTTP server compiled into `srvm` handles it.
 - **Cleans up completely** — Ctrl+C signals the whole process group, so `npm → sh → node` grandchildren can't leak.
 
