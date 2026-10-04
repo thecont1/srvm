@@ -242,6 +242,13 @@ trait ToolchainResolver {
 - **v0.1**: `PathResolver` — binpath dirs only. Missing → error with *actionable* message ("node not found — install it, or wait for `srvm` auto-fetch in a future release"). Rules already return `None` on missing bins so detection degrades rather than dies.
 - **M5**: `FetchingResolver` wrapping `PathResolver` — on miss, download official dist (nodejs.org, python-build-standalone, go.dev, rustup-init) into `cache_dir()/srvm/runtimes/<tool>/<ver>/`, verify SHA-256, return shim path. Detectors consult a `wanted_version(root)` hint (`.nvmrc`, `packageManager`, `.python-version`, `rust-toolchain.toml`, `go.mod` `go` directive) — **design the trait to take that hint now** so M5 needs no refactor.
 
+**Upstream formats (verified live 2026-10):**
+
+- **Node**: `GET nodejs.org/dist/index.json` → array newest-first, `{version:"vX.Y.Z", files:[...], lts, npm}`. `GET /dist/{ver}/SHASUMS256.txt` → `<sha256>  <name>` lines covering every artifact. Archive URL `/dist/{ver}/node-{ver}-{plat}.{ext}` — note the `files` tags ≠ filename tokens (`osx-arm64-tar` → `darwin-arm64.tar.gz`, `win-x64-zip` → `win-x64.zip`); map via the SHASUMS filename, not the `files` tag. `.tar.gz` exists for all unix platforms (no xz dep needed); Windows has `.zip` and a bare `win-x64/node.exe` (no npm).
+- **Python**: `GET api.github.com/repos/astral-sh/python-build-standalone/releases/latest` → date-tagged releases, every asset carries `digest: "sha256:…"` inline (plus a `SHA256SUMS` asset). Assets: `cpython-{ver}+{tag}-{triple}-install_only[_stripped].tar.gz` — triples `aarch64|x86_64-apple-darwin`, `x86_64|aarch64-unknown-linux-gnu|musl` (plus `x86_64_v2/v3/v4` microarch variants), `x86_64|aarch64-pc-windows-msvc`; `-freethreaded` variants exist and must be filtered out. One release ships all maintained CPython lines (3.10–3.15) — pick the asset matching `wanted_version`.
+- **Deps this implies**: `ureq` (sync HTTP — fits the no-tokio policy), `sha2`, `tar`+`flate2` (+`zip` for win Node). No xz/zstd needed if `.tar.gz`/`install_only` artifacts are chosen consistently.
+- **Plumbing**: `resolve()`'s `PathBuf` is currently discarded and `spawn` uses bare names — M5 must either inject resolved absolute paths into spawn **or** prepend the shim dir to the child's `PATH`. Prefer PATH-prepend: grandchildren (`npm` scripts calling `node`, `sh`) resolve by name through the same shim.
+
 ---
 
 ## 5. Milestones
