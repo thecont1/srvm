@@ -60,12 +60,21 @@ pub fn rule_package_json(root: &Path, resolver: &dyn ToolResolver) -> Result<Vec
 
     let mut specs = Vec::new();
     if let Some(script) = pkg.scripts.as_ref().and_then(pick_script) {
+        let framework = pkg
+            .scripts
+            .as_ref()
+            .and_then(|scripts| scripts.get(&script))
+            .and_then(|body| script_framework(body));
+        let (hint, injection) = match framework {
+            Some(fw) => (fw.port, script_injection(&pm, fw)),
+            None => (None, PortInjection::Env("PORT".into())),
+        };
         let mut spec = ServeSpec::new(
             format!("package:{script}"),
             pm.name.clone(),
             CommandSpec::new(pm.name.clone(), ["run".to_string(), script]),
-            None,
-            PortInjection::Env("PORT".into()),
+            hint,
+            injection,
         );
         if !probe::dir_exists(root, "node_modules") {
             spec.install = Some(CommandSpec::new(pm.name.clone(), ["install"]));
@@ -75,24 +84,31 @@ pub fn rule_package_json(root: &Path, resolver: &dyn ToolResolver) -> Result<Vec
     }
 
     if probe::file_exists(root, "turbo.json")
-        && let Some(exec) = pm.exec_command(root, resolver)
+        && let Some(mut exec) = pm.exec_command(root, resolver)
     {
+        exec.args
+            .extend(["turbo", "run", "dev"].into_iter().map(String::from));
         specs.push(ServeSpec::new(
             "turbo",
             pm.name.clone(),
-            CommandSpec::new(exec, ["turbo", "run", "dev"]),
+            exec,
             None,
             PortInjection::Env("PORT".into()),
         ));
     }
 
     if probe::file_exists(root, "nx.json")
-        && let Some(exec) = pm.exec_command(root, resolver)
+        && let Some(mut exec) = pm.exec_command(root, resolver)
     {
+        exec.args.extend(
+            ["nx", "run-many", "-t", "dev"]
+                .into_iter()
+                .map(String::from),
+        );
         specs.push(ServeSpec::new(
             "nx",
             pm.name.clone(),
-            CommandSpec::new(exec, ["nx", "run-many", "-t", "dev"]),
+            exec,
             None,
             PortInjection::Env("PORT".into()),
         ));
@@ -101,14 +117,14 @@ pub fn rule_package_json(root: &Path, resolver: &dyn ToolResolver) -> Result<Vec
     let deps = collect_deps(&pkg);
     for fw in framework_bins() {
         if deps.contains(&fw.dep)
-            && let Some(exec) = pm.exec_command(root, resolver)
+            && let Some(mut exec) = pm.exec_command(root, resolver)
         {
-            let mut args = vec![fw.bin.to_string()];
-            args.extend(fw.args.iter().map(|arg| arg.to_string()));
+            exec.args.push(fw.bin.to_string());
+            exec.args.extend(fw.args.iter().map(|arg| arg.to_string()));
             specs.push(ServeSpec::new(
                 fw.dep,
                 pm.name.clone(),
-                CommandSpec::new(exec, args),
+                exec,
                 fw.port,
                 fw.port_injection(),
             ));
@@ -135,7 +151,7 @@ pub fn rule_wrangler(root: &Path, resolver: &dyn ToolResolver) -> Result<Option<
                 "wrangler",
                 command,
                 Some(8787),
-                PortInjection::Args(vec!["--port".into()]),
+                PortInjection::Args(vec!["--port".into(), "{port}".into()]),
             )
         }),
     )
@@ -147,18 +163,17 @@ struct PackageManager {
 }
 
 impl PackageManager {
-    fn exec_command(&self, root: &Path, resolver: &dyn ToolResolver) -> Option<String> {
-        let candidates: &[&str] = match self.name.as_str() {
-            "npm" => &["npx"],
-            "pnpm" => &["pnpm"],
-            "yarn" => &["yarn"],
-            "bun" => &["bun"],
-            _ => &[],
+    fn exec_command(&self, root: &Path, resolver: &dyn ToolResolver) -> Option<CommandSpec> {
+        let (tool, wrapper): (&str, &[&str]) = match self.name.as_str() {
+            "npm" => ("npx", &[]),
+            "pnpm" => ("pnpm", &["exec"]),
+            "yarn" => ("yarn", &[]),
+            "bun" => ("bun", &["x"]),
+            _ => return None,
         };
-        candidates
-            .iter()
-            .find(|tool| resolver.resolve(tool, root).is_some())
-            .map(|tool| (*tool).to_string())
+        resolver
+            .resolve(tool, root)
+            .map(|_| CommandSpec::new(tool, wrapper.iter().copied()))
     }
 }
 
@@ -234,14 +249,37 @@ impl FrameworkBin {
         if self.port_args.is_empty() {
             PortInjection::Env("PORT".into())
         } else {
-            PortInjection::Args(
-                self.port_args
-                    .iter()
-                    .map(|arg| (*arg).to_string())
-                    .collect(),
-            )
+            let mut args: Vec<String> = self
+                .port_args
+                .iter()
+                .map(|arg| (*arg).to_string())
+                .collect();
+            args.push("{port}".into());
+            PortInjection::Args(args)
         }
     }
+}
+
+fn script_injection(pm: &PackageManager, fw: &FrameworkBin) -> PortInjection {
+    match fw.port_injection() {
+        PortInjection::Args(mut args) if pm.name == "npm" => {
+            args.insert(0, "--".into());
+            PortInjection::Args(args)
+        }
+        injection => injection,
+    }
+}
+
+fn script_framework(body: &str) -> Option<&'static FrameworkBin> {
+    let body = body.trim();
+    if body.contains(['\n', '\r']) {
+        return None;
+    }
+    let tokens: Vec<_> = body.split_whitespace().collect();
+    framework_bins().iter().find(|fw| {
+        (tokens.len() == 1 && tokens[0] == "vite" && fw.bin == "vite")
+            || (tokens.first().copied() == Some(fw.bin) && tokens[1..] == *fw.args)
+    })
 }
 
 fn framework_bins() -> &'static [FrameworkBin] {
@@ -279,7 +317,7 @@ fn framework_bins() -> &'static [FrameworkBin] {
             bin: "remix",
             args: &["dev"],
             port: Some(3000),
-            port_args: &["--port"],
+            port_args: &[],
         },
         FrameworkBin {
             dep: "gatsby",
@@ -360,5 +398,127 @@ mod tests {
         let scripts = BTreeMap::from([("dev:z".into(), "z".into()), ("dev:a".into(), "a".into())]);
 
         assert_eq!(pick_script(&scripts), Some("dev:a".into()));
+    }
+
+    #[test]
+    fn recognizes_exact_framework_script_bodies() {
+        for (body, expected) in [
+            ("vite", "vite"),
+            ("vite dev", "vite"),
+            ("next dev", "next"),
+            ("remix dev", "@remix-run/dev"),
+            ("gatsby develop", "gatsby"),
+            ("wrangler dev", "wrangler"),
+        ] {
+            assert_eq!(
+                script_framework(body).map(|fw| fw.dep),
+                Some(expected),
+                "{body}"
+            );
+        }
+
+        for body in [
+            "",
+            "vite --host",
+            "next dev -p 5000",
+            "node server.js",
+            "echo ok && vite",
+            "vite dev --port 3000",
+            "VITE dev",
+            "npx vite dev",
+            "vite\ndev",
+            "next\rdev",
+        ] {
+            assert!(script_framework(body).is_none(), "{body}");
+        }
+    }
+
+    #[test]
+    fn recognized_script_gets_hint_and_args_forwarding() {
+        let spec = script_spec(r#"{"scripts":{"dev":"vite"}}"#, &["npm", "npx"]);
+        assert_eq!(spec.url_hint, Some(5173));
+        assert_eq!(
+            spec.port,
+            PortInjection::Args(vec!["--".into(), "--port".into(), "{port}".into()])
+        );
+
+        for pm in ["pnpm", "yarn", "bun"] {
+            let spec = script_spec(r#"{"scripts":{"dev":"vite"}}"#, &[pm]);
+            assert_eq!(
+                spec.port,
+                PortInjection::Args(vec!["--port".into(), "{port}".into()]),
+                "{pm} must not add a -- separator"
+            );
+        }
+    }
+
+    #[test]
+    fn recognized_remix_script_uses_env_not_hmr_port() {
+        let spec = script_spec(
+            r#"{"scripts":{"dev":"remix dev"},"dependencies":{"@remix-run/dev":"latest"}}"#,
+            &["npm", "npx"],
+        );
+        assert_eq!(spec.url_hint, Some(3000));
+        assert_eq!(spec.port, PortInjection::Env("PORT".into()));
+    }
+
+    #[test]
+    fn opaque_script_stays_env_only() {
+        let spec = script_spec(r#"{"scripts":{"dev":"vite --host"}}"#, &["npm", "npx"]);
+        assert_eq!(spec.url_hint, None);
+        assert_eq!(spec.port, PortInjection::Env("PORT".into()));
+    }
+
+    #[test]
+    fn pm_exec_wrappers_prefix_framework_and_monorepo_commands() {
+        let exec_line = |pkg: &str, extra: &str, tools: &[&str]| {
+            let dir = tempdir().unwrap();
+            std::fs::write(dir.path().join("package.json"), pkg).unwrap();
+            if !extra.is_empty() {
+                std::fs::write(dir.path().join(extra), "{}").unwrap();
+            }
+            rule_package_json(dir.path(), &StubResolver::with(tools))
+                .unwrap()
+                .first()
+                .map(|spec| spec.command_line())
+                .unwrap()
+        };
+
+        assert_eq!(
+            exec_line(
+                r#"{"scripts":{},"dependencies":{}}"#,
+                "turbo.json",
+                &["pnpm"]
+            ),
+            "pnpm exec turbo run dev"
+        );
+        assert_eq!(
+            exec_line(
+                r#"{"scripts":{},"dependencies":{}}"#,
+                "turbo.json",
+                &["bun"]
+            ),
+            "bun x turbo run dev"
+        );
+        assert_eq!(
+            exec_line(r#"{"dependencies":{"vite":"latest"}}"#, "", &["pnpm"]),
+            "pnpm exec vite dev"
+        );
+        assert_eq!(
+            exec_line(r#"{"dependencies":{"vite":"latest"}}"#, "", &["bun"]),
+            "bun x vite dev"
+        );
+        assert_eq!(
+            exec_line(r#"{"dependencies":{"vite":"latest"}}"#, "", &["yarn"]),
+            "yarn vite dev"
+        );
+    }
+
+    fn script_spec(pkg: &str, tools: &[&str]) -> ServeSpec {
+        let dir = tempdir().unwrap();
+        std::fs::write(dir.path().join("package.json"), pkg).unwrap();
+        rule_package_json(dir.path(), &StubResolver::with(tools))
+            .unwrap()
+            .remove(0)
     }
 }

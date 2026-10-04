@@ -54,7 +54,7 @@ fn rule_rails(root: &Path, resolver: &dyn ToolResolver) -> Option<ServeSpec> {
             "rails",
             CommandSpec::new("bin/rails", ["server"]),
             Some(3000),
-            PortInjection::Args(vec!["-p".into()]),
+            PortInjection::Args(vec!["-p".into(), "{port}".into()]),
         ));
     }
 
@@ -66,7 +66,7 @@ fn rule_rails(root: &Path, resolver: &dyn ToolResolver) -> Option<ServeSpec> {
             "bundle",
             CommandSpec::new("bundle", ["exec", "rails", "server"]),
             Some(3000),
-            PortInjection::Args(vec!["-p".into()]),
+            PortInjection::Args(vec!["-p".into(), "{port}".into()]),
         ));
     }
 
@@ -83,7 +83,7 @@ fn rule_jekyll(root: &Path, resolver: &dyn ToolResolver) -> Option<ServeSpec> {
             "bundle",
             CommandSpec::new("bundle", ["exec", "jekyll", "serve"]),
             Some(4000),
-            PortInjection::Args(vec!["-P".into()]),
+            PortInjection::Args(vec!["-P".into(), "{port}".into()]),
         ));
     }
     None
@@ -99,7 +99,7 @@ fn rule_rackup(root: &Path, resolver: &dyn ToolResolver) -> Option<ServeSpec> {
             "bundle",
             CommandSpec::new("bundle", ["exec", "rackup"]),
             Some(9292),
-            PortInjection::Args(vec!["-p".into()]),
+            PortInjection::Args(vec!["-p".into(), "{port}".into()]),
         ));
     }
     None
@@ -120,7 +120,7 @@ fn rule_hugo(root: &Path, resolver: &dyn ToolResolver) -> Option<ServeSpec> {
                 "hugo",
                 command,
                 Some(1313),
-                PortInjection::Args(vec!["--port".into()]),
+                PortInjection::Args(vec!["--port".into(), "{port}".into()]),
             )
         });
     }
@@ -135,7 +135,7 @@ fn rule_mkdocs(root: &Path, resolver: &dyn ToolResolver) -> Option<ServeSpec> {
                 "mkdocs",
                 command,
                 Some(8000),
-                PortInjection::Args(vec!["-a".into(), "127.0.0.1".into()]),
+                PortInjection::Args(vec!["-a".into(), "127.0.0.1:{port}".into()]),
             )
         });
     }
@@ -165,7 +165,7 @@ fn rule_laravel(root: &Path, resolver: &dyn ToolResolver) -> Option<ServeSpec> {
                 "php",
                 command,
                 Some(8000),
-                PortInjection::Args(vec!["--port".into()]),
+                PortInjection::Args(vec!["--port={port}".into()]),
             )
         });
     }
@@ -180,7 +180,7 @@ fn rule_trunk(root: &Path, resolver: &dyn ToolResolver) -> Option<ServeSpec> {
                 "trunk",
                 command,
                 Some(8080),
-                PortInjection::Args(vec!["--port".into()]),
+                PortInjection::Args(vec!["--port".into(), "{port}".into()]),
             )
         });
     }

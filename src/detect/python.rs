@@ -16,7 +16,7 @@ pub fn rule_django(root: &Path, resolver: &dyn ToolResolver) -> Result<Option<Se
                 py_tool_name(&command),
                 command,
                 Some(8000),
-                PortInjection::Args(vec!["runserver".into()]),
+                PortInjection::Args(vec!["{port}".into()]),
             )
         }),
     )
@@ -43,7 +43,7 @@ pub fn rule_uvicorn(root: &Path, resolver: &dyn ToolResolver) -> Result<Option<S
             py_tool_name(&command),
             command,
             Some(8000),
-            PortInjection::Args(vec!["--port".into()]),
+            PortInjection::Args(vec!["--port".into(), "{port}".into()]),
         )
     }))
 }
@@ -69,7 +69,7 @@ pub fn rule_flask(root: &Path, resolver: &dyn ToolResolver) -> Result<Option<Ser
             py_tool_name(&command),
             command,
             Some(5000),
-            PortInjection::Args(vec!["--port".into()]),
+            PortInjection::Args(vec!["--port".into(), "{port}".into()]),
         )
     }))
 }
