@@ -2,7 +2,7 @@ use std::path::{Path, PathBuf};
 
 use anyhow::Result;
 
-mod binpath;
+pub(crate) mod binpath;
 mod js;
 mod misc;
 mod probe;

@@ -298,7 +298,7 @@ fn spawn(
     env_pairs: &[(String, String)],
     path_prepend: &[PathBuf],
 ) -> Result<std::process::Child> {
-    let mut cmd = Command::new(&command.program);
+    let mut cmd = Command::new(resolve_program(&command.program, root, path_prepend));
     cmd.args(&command.args)
         .current_dir(root)
         .env("BROWSER", "none")
@@ -315,6 +315,21 @@ fn spawn(
     kill::configure_process_group(&mut cmd);
     cmd.spawn()
         .with_context(|| format!("failed to spawn {}", command.command_line()))
+}
+
+/// Bare program names are resolved through the child's search path —
+/// `path_prepend` dirs first, then PATH, shims, and node_modules/.bin — so a
+/// tool detection found is also the tool spawned. On Windows this yields the
+/// spawnable `.cmd`/`.exe` file, which a bare name cannot resolve to.
+/// Programs written with a path (`.venv/bin/python`, `./script.sh`) are left
+/// untouched; `Command` resolves them against the working directory.
+fn resolve_program(program: &str, root: &Path, path_prepend: &[PathBuf]) -> PathBuf {
+    let path = Path::new(program);
+    if path.components().count() != 1 {
+        return path.to_path_buf();
+    }
+    crate::detect::binpath::resolve_for_spawn(program, root, path_prepend)
+        .unwrap_or_else(|| path.to_path_buf())
 }
 
 fn report_port(requested: u16, selected: u16, options: SupervisorOptions) {

@@ -9,14 +9,29 @@ pub fn look_path(tool: &str, root: &Path) -> Option<PathBuf> {
         .find_map(|dir| executable_in(&dir, tool))
 }
 
+/// Resolve `tool` the way a spawned child would see it: `extra` directories
+/// (fetched runtimes, shim dirs) take precedence, then the standard lookup
+/// dirs for `root`. Returns an absolute, spawnable path — on Windows this is
+/// usually a `.cmd`/`.exe`, since bare names cannot be exec'd by
+/// `Command::new` without an extension.
+pub fn resolve_for_spawn(tool: &str, root: &Path, extra: &[PathBuf]) -> Option<PathBuf> {
+    extra
+        .iter()
+        .find_map(|dir| executable_in(dir, tool))
+        .or_else(|| look_path(tool, root))
+}
+
 fn executable_in(dir: &Path, tool: &str) -> Option<PathBuf> {
     let direct = dir.join(tool);
-    if is_executable(&direct) {
-        return Some(direct);
-    }
 
     #[cfg(windows)]
     {
+        // CreateProcess can only run extensions listed in PATHEXT; an
+        // extensionless file (e.g. the `npm` sh script next to npm.cmd)
+        // exists but is not spawnable, so it must not win over npm.cmd.
+        if direct.extension().is_some() && is_executable(&direct) {
+            return Some(direct);
+        }
         let extensions = env::var_os("PATHEXT")
             .map(|v| {
                 env::split_paths(&v)
@@ -24,19 +39,30 @@ fn executable_in(dir: &Path, tool: &str) -> Option<PathBuf> {
                     .collect::<Vec<_>>()
             })
             .unwrap_or_else(|| vec![".COM".into(), ".EXE".into(), ".BAT".into(), ".CMD".into()]);
-        for ext in extensions {
+        extensions.into_iter().find_map(|ext| {
             let candidate = dir.join(format!("{tool}{ext}"));
-            if is_executable(&candidate) {
-                return Some(candidate);
-            }
-        }
+            is_executable(&candidate).then_some(candidate)
+        })
     }
 
-    None
+    #[cfg(not(windows))]
+    {
+        is_executable(&direct).then_some(direct)
+    }
 }
 
 fn is_executable(path: &Path) -> bool {
-    path.is_file()
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        path.metadata()
+            .map(|meta| meta.is_file() && meta.permissions().mode() & 0o111 != 0)
+            .unwrap_or(false)
+    }
+    #[cfg(not(unix))]
+    {
+        path.is_file()
+    }
 }
 
 fn bin_dirs(root: &Path) -> Vec<PathBuf> {
