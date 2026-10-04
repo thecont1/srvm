@@ -242,16 +242,22 @@ trait ToolchainResolver {
 
 ## 5. Milestones
 
-| Milestone | Deliverable | Exit criteria |
-|---|---|---|
-| **M0** Scaffold | `cargo init`, clap CLI skeleton, CI (fmt/clippy/test on macOS+Linux+Windows), LICENSE/README/PLAN | `cargo build` green on CI |
-| **M1** Detection | `probe.rs`, `binpath.rs`, all 22 rules, `detect() -> Vec<Spec>`, `--dry-run` | Full rule table covered by fixture tests (tempdir markers + stub PATH binaries — port `serve_test.go` cases verbatim); `--dry-run` correct on a fixture matrix |
-| **M2** Supervisor | spawn + `BROWSER=none`, install step (15-min cap), pump→ring+dim+collapse, URL scan + probeHint, open browser, Ctrl+C group kill, exit classification | Launch a real `vite`/`python -m http.server` fixture; orphaned-grandchild test (spawn `sh -c "sleep 999"`, kill, assert gone); early-death dumps tail |
-| **M3** Port arbitration | probe/walk/inject per matrix, override verify + "ignored" note | Occupied-port test (hold 3000, assert app lands on 3001 and announced URL matches reality) |
-| **M4** Static fallback | embedded file server for `index.html` repos | `srvm` in a bare-HTML dir serves it |
-| **M5** Runtime fetch | `FetchingResolver`: node + python-build-standalone first, then go/rust; checksum verify; `.nvmrc`/`.python-version`/`rust-toolchain.toml`/`go.mod` hints | `srvm` on a PATH-scrubbed env (mise-style test) boots a Node and a Python app |
-| **M6** Multi-stack | `--all` + `--select`; per-child log prefixes (`[next]`, `[api]`); supervisor already N-shaped | Next+FastAPI fixture launches both, each gets its own URL line |
-| **M7** Distribution | release CI matrix via `cargo-dist` (or manual goreleaser-style), install.sh, brew/scoop/winget taps, shell completions, man page | One-command install on all three OSes |
+| Milestone | Status | Deliverable | Exit criteria |
+|---|---|---|---|
+| **M0** Scaffold | ✅ Done | `cargo init`, clap CLI skeleton, CI (fmt/clippy/test on macOS+Linux+Windows), LICENSE/README/PLAN | `cargo build` green on CI |
+| **M1** Detection | ✅ Done | `probe.rs`, `binpath.rs`, all 22 rules, `detect() -> Vec<Spec>`, `--dry-run`, `--select` | Full rule table covered by fixture tests (tempdir markers + `StubResolver` — implemented in `detect::tests`, 8 fixtures exercising every rule family + missing-binary fall-through); `--dry-run` correct on a fixture matrix |
+| **M2** Supervisor | ✅ Done | spawn + `BROWSER=none`, install step (15-min cap, Ctrl+C-safe), pump→ring+ANSI-dim+collapse (`--no-color`/`NO_COLOR`), URL scan + probeHint (hand-rolled HEAD over `TcpStream`), full `open_browser` port (`$BROWSER` w/ `%s`, WSL, Linux fallback chain), Ctrl+C group kill, exit classification | Remaining from exit criteria: real-toolchain e2e (`vite`/`python -m http.server`) and orphaned-grandchild assertion are not yet automated; early-death tail IS tested (`supervisor_reports_early_failure_tail`) |
+| **M3** Port arbitration | 🔶 Spec-side only | probe/walk/inject per matrix, override verify + "ignored" note | Occupied-port test (hold 3000, assert app lands on 3001 and announced URL matches reality). *Gap: `PortInjection` is populated on every spec and `--port` is parsed, but `spawn` doesn't yet probe or inject* |
+| **M4** Static fallback | ⬜ Stub | embedded file server for `index.html` repos | `srvm` in a bare-HTML dir serves it. *Currently `is_static` bails; detection returns the spec (name `srvm static .`) correctly* |
+| **M5** Runtime fetch | ⬜ Not started | `FetchingResolver`: node + python-build-standalone first, then go/rust; checksum verify; `.nvmrc`/`.python-version`/`rust-toolchain.toml`/`go.mod` hints | `srvm` on a PATH-scrubbed env (mise-style test) boots a Node and a Python app |
+| **M6** Multi-stack | ⬜ Flag reserved | `--all` + `--select`; per-child log prefixes (`[next]`, `[api]`); supervisor already N-shaped | Next+FastAPI fixture launches both, each gets its own URL line. *`--select` already works; `--all` errors cleanly* |
+| **M7** Distribution | ⬜ Not started | release CI matrix via `cargo-dist` (or manual goreleaser-style), install.sh, brew/scoop/winget taps, shell completions, man page | One-command install on all three OSes |
+
+### Current status snapshot (as of 2026-10-04, `dev/akriti`)
+
+**Done:** M0–M2. The launcher works end-to-end on PATH-resolved toolchains: `srvm [dir]` detects, installs deps if missing, spawns supervised, sniffs/probes the URL, opens the browser, and tears down the process tree on Ctrl+C. 30 tests green (25 unit incl. full rule-table fixtures, 5 integration). Deviations worth noting: supervision is a `run()` function over one spec rather than a `Supervisor` struct of `Vec<Child>` — the M6 refactor must introduce that type (still additive, but a refactor, not just wiring).
+
+**Next up:** M3 is the highest-value gap — the injection metadata exists on every spec but is never applied (`spawn` doesn't probe or set `PORT`/args, `--port` is a no-op). Then M4's embedded static server is a small, isolated piece.
 
 Sequencing rationale: M1+M2 is the product's spine and is directly port-verifiable; M3 differentiates (nobody else does silent shifting); M5 is the riskiest and benefits most from a stable foundation.
 
