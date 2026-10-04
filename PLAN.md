@@ -63,7 +63,7 @@ Deviation from the brief's mock: no emojis in output (px0 house style: `uiKV`/`u
 | `srvm <dir>` | detect + launch in `<dir>` |
 | `srvm --dry-run [dir]` | print detection result(s) + resolved commands; exit 0. **Primary testing/debugging surface — build in M1** |
 | `srvm --no-open` | don't auto-open the app URL in a browser |
-| `srvm --port N` | arbitration starts at N instead of the spec's hint |
+| `srvm --port N` | arbitration starts at N instead of the spec's hint; `--port 0` picks an OS-assigned free port |
 | `srvm --select <tool\|n>` | when multiple stacks detected, pick one (v0.1 errors listing candidates without it) |
 | `srvm --no-install` | never run the spec's install step |
 | `srvm -v/--verbose` | child output unfiltered (skip flood-collapse) |
@@ -131,19 +131,20 @@ Supporting machinery to port (all in `serve.go`, tests in `serve_test.go`):
 
 `detect(root) -> Vec<Spec>` — collect **all** matching rules (not just first); `launch` uses `specs[0]` or `--select` pick; empty vec → friendly "no servable app detected" listing what was looked for.
 
-### 3.2 Port override matrix (new — px0 never rewrote ports)
+### 3.2 Port override matrix (implemented in M3 — px0 never rewrote ports)
 
-Each spec gains how to inject a shifted port. Where both env and args exist, **args win** (explicit beats ambient):
+Each spec carries a `PortInjection` plan: `Args` templates where every literal `{port}` is replaced with the selected port, `Env` for a single env pair, or `None`. Where both env and args exist, **args win** (explicit beats ambient):
 
 | Stack | Mechanism |
 |---|---|
-| npm/PM scripts | `PORT=<n>` env (universal convention; react-scripts/vite/next honor it) — plus `PORT` is harmless when ignored |
-| deno task | `PORT` env |
-| wrangler | `--port <n>` arg (or `PORT`) |
-| vite/astro/next/nuxt/remix binaries | `--port <n>` arg where supported; else `PORT` env |
+| npm/PM script exactly matching a known framework command (`vite`, `next dev`, …) | forwarded args per the framework row — npm needs a `--` separator, pnpm/yarn/bun take them directly |
+| other npm/PM script bodies, deno task, turbo/nx | `PORT` env — best-effort convention, honored by many dev servers, harmless when ignored |
+| wrangler | `--port <n>` |
+| astro/next/nuxt/ng/docusaurus/hexo/vite binaries | `--port <n>` (gatsby `-p`) |
+| remix dev | `PORT` env — classic Remix `--port` only sets the HMR port, not the app port |
 | django | append port arg: `runserver <n>` |
 | uvicorn | `--port <n>` |
-| flask | `--port <n>` (or `FLASK_RUN_PORT`) |
+| flask | `--port <n>` |
 | rails | `-p <n>` |
 | jekyll | `-P <n>` |
 | rackup | `-p <n>` |
@@ -153,10 +154,12 @@ Each spec gains how to inject a shifted port. Where both env and args exist, **a
 | laravel | `--port=<n>` |
 | trunk | `--port <n>` |
 | cargo/go/procfile/make/just/task | `PORT` env only (can't know) |
-| compose | none — skip arbitration, warn |
-| static | ours — bind directly |
+| compose | none — warn when an override is requested (`--port` or a port hint exists) |
+| static | ours — bind directly (M4) |
 
-**Arbitration algorithm**: probe `TcpListener::bind(("127.0.0.1", port))` — success → use it; `AddrInUse` → walk `port+1 ..= port+100`; still none → OS-assigned `:0`. Inject via spec mechanism → then **verify against sniffed URL**; if child bound elsewhere anyway, adopt the sniffed URL and print a note ("app reports <url>, override ignored").
+Script-body recognition is deliberately conservative: an exact `framework-bin + args` token match (plus bare `vite`) earns the framework's hint and args forwarding; anything else (`vite --host`, `next dev -p 5000`, compound shell) stays an opaque `PORT`-env spec.
+
+**Arbitration algorithm**: pick the start port — explicit `--port` first (including `0`), then an existing `PORT`-style env value for Env-injection specs, then the spec's `url_hint`. Bind `TcpListener` on `127.0.0.1` — `AddrInUse` → walk `start+1 ..= start+100`; still none → OS-assigned `:0`; any other bind error aborts. The listener is held while the command is rendered, dropped immediately before spawn (FDs can't be handed to arbitrary apps — a racer can still steal the port, so `srvm` **verifies against the sniffed URL** and prints `requested <n>, app reports <url>; override ignored` when they disagree). Hint probing uses the selected port, never the stale default. `--port` never kills whatever holds the port.
 
 ---
 
@@ -247,7 +250,7 @@ trait ToolchainResolver {
 | **M0** Scaffold | ✅ Done | `cargo init`, clap CLI skeleton, CI (fmt/clippy/test on macOS+Linux+Windows), LICENSE/README/PLAN | `cargo build` green on CI |
 | **M1** Detection | ✅ Done | `probe.rs`, `binpath.rs`, all 22 rules, `detect() -> Vec<Spec>`, `--dry-run`, `--select` | Full rule table covered by fixture tests (tempdir markers + `StubResolver` — implemented in `detect::tests`, 8 fixtures exercising every rule family + missing-binary fall-through); `--dry-run` correct on a fixture matrix |
 | **M2** Supervisor | ✅ Done | spawn + `BROWSER=none`, install step (15-min cap, Ctrl+C-safe), pump→ring+ANSI-dim+collapse (`--no-color`/`NO_COLOR`), URL scan + probeHint (hand-rolled HEAD over `TcpStream`), full `open_browser` port (`$BROWSER` w/ `%s`, WSL, Linux fallback chain), Ctrl+C group kill, exit classification | Remaining from exit criteria: real-toolchain e2e (`vite`/`python -m http.server`) and orphaned-grandchild assertion are not yet automated; early-death tail IS tested (`supervisor_reports_early_failure_tail`) |
-| **M3** Port arbitration | 🔶 Spec-side only | probe/walk/inject per matrix, override verify + "ignored" note | Occupied-port test (hold 3000, assert app lands on 3001 and announced URL matches reality). *Gap: `PortInjection` is populated on every spec and `--port` is parsed, but `spawn` doesn't yet probe or inject* |
+| **M3** Port arbitration | ✅ Done | `ports.rs`: requested/explicit/inherited/hint resolution, bounded probe-walk listener reservation, `{port}` template + env injection, sniffed-URL verify + "ignored" note, hardened HTTP probe hint | Occupied-port integration tests assert a real listener lands on the shifted port and the announced URL matches reality (see `tests/ports.rs`; 12s probe fallback exercised once) |
 | **M4** Static fallback | ⬜ Stub | embedded file server for `index.html` repos | `srvm` in a bare-HTML dir serves it. *Currently `is_static` bails; detection returns the spec (name `srvm static .`) correctly* |
 | **M5** Runtime fetch | ⬜ Not started | `FetchingResolver`: node + python-build-standalone first, then go/rust; checksum verify; `.nvmrc`/`.python-version`/`rust-toolchain.toml`/`go.mod` hints | `srvm` on a PATH-scrubbed env (mise-style test) boots a Node and a Python app |
 | **M6** Multi-stack | ⬜ Flag reserved | `--all` + `--select`; per-child log prefixes (`[next]`, `[api]`); supervisor already N-shaped | Next+FastAPI fixture launches both, each gets its own URL line. *`--select` already works; `--all` errors cleanly* |
@@ -255,11 +258,11 @@ trait ToolchainResolver {
 
 ### Current status snapshot (as of 2026-10-04, `dev/akriti`)
 
-**Done:** M0–M2. The launcher works end-to-end on PATH-resolved toolchains: `srvm [dir]` detects, installs deps if missing, spawns supervised, sniffs/probes the URL, opens the browser, and tears down the process tree on Ctrl+C. 30 tests green (25 unit incl. full rule-table fixtures, 5 integration). Deviations worth noting: supervision is a `run()` function over one spec rather than a `Supervisor` struct of `Vec<Child>` — the M6 refactor must introduce that type (still additive, but a refactor, not just wiring).
+**Done:** M0–M3. The launcher works end-to-end on PATH-resolved toolchains: `srvm [dir]` detects, installs deps if missing, reserves and injects a free port, spawns supervised, sniffs/probes the URL, opens the browser, and tears down the process tree on Ctrl+C. Verified on macOS: initial `cargo test` and `cargo build --release` passed; after review corrections, `cargo test --lib` (60), `cargo test --test cli` (6), and `cargo test --test ports` (10) passed, along with `cargo fmt --check` and `cargo clippy --all-targets -- -D warnings`. Deviations worth noting: supervision is a `run()` function over one spec rather than a `Supervisor` struct of `Vec<Child>` — M6 still needs that refactor. M3 verifies real HTTP listeners and cleanup of its fixture child after interruption; M2's real-framework e2e and arbitrary nested process-tree cleanup remain unverified. Windows/Linux verification still requires CI.
 
-**Next up:** M3 is the highest-value gap — the injection metadata exists on every spec but is never applied (`spawn` doesn't probe or set `PORT`/args, `--port` is a no-op). Then M4's embedded static server is a small, isolated piece.
+**Next up:** M4's embedded static server is a small, isolated piece. After that, M5 runtime fetch is the riskiest and benefits most from the now-stable foundation.
 
-Sequencing rationale: M1+M2 is the product's spine and is directly port-verifiable; M3 differentiates (nobody else does silent shifting); M5 is the riskiest and benefits most from a stable foundation.
+Sequencing rationale: M1+M2 is the product's spine and is directly port-verifiable; M3 differentiates (few launchers rewrite the port into the app's own flag/env and then verify by sniffing); M5 is the riskiest and benefits most from a stable foundation.
 
 ---
 
@@ -277,12 +280,12 @@ Sequencing rationale: M1+M2 is the product's spine and is directly port-verifiab
 | Risk | Mitigation |
 |---|---|
 | Windows process-tree kill is weaker than unix pgid | Use Job Objects (`windows-rs`) with `KILL_ON_JOB_CLOSE`, fallback `taskkill /F /T` — decide in M2 |
-| `PORT` ignored by a framework | Per-spec `port_args` where available; post-inject verification against sniffed URL + honest "override ignored" note |
+| `PORT` ignored by a framework | Per-spec args injection where available; post-inject verification against sniffed URL + honest "override ignored" note |
 | Runtime fetch trust (M5) | Pin SHA-256s per release; HTTPS only; verify before exec; document provenance per dist |
 | `.cmd`/`.bat` shims on Windows can't take signals | Same as px0: kill the tree, never just the shim PID |
 | Monorepo false positives (root package.json but real app is deeper) | `--select` + `--dry-run` escape hatches; `turbo.json`/`nx.json` rules help; recursive subdir detection is a possible M6+ exploration — **not** v0.1 |
 | Repos with several matching rules where first is wrong | `detect()` returns all; `--dry-run` shows the full ranked list so `--select` is discoverable |
-| Port race between probe and bind | Arbitrate → inject → verify-by-sniff covers it; the probe listener is dropped before spawn |
+| Port race between probe and bind | The reservation is held until just before spawn, then dropped. A racer can still steal the port and make the app fail; when the app successfully binds elsewhere and prints a URL, srvm reports that actual URL. It does not automatically rerun commands. |
 | AI-generated repos often lack lockfiles/scripts entirely | `fwBins` dep table + static fallback catch most; M5 covers missing PMs themselves |
 
 ## 8. Explicit non-goals (v1)
@@ -296,7 +299,7 @@ Sequencing rationale: M1+M2 is the product's spine and is directly port-verifiab
 
 ## 9. Open questions for the maintainer
 
-1. **`--port` semantics**: arbitration *start* (current spec) vs *exact* port with failure if busy? Plan implements start; exact could be `--port!` or `--exact-port` later.
+1. **`--port` semantics**: settled — it is the arbitration *start* (with `0` meaning OS-assigned). An exact-port flag (`--exact-port`) could be added later if requested.
 2. **Static server binding**: serve on `127.0.0.1` only (px0 posture) or honor `--host`? Recommend loopback-only v0.1 — expose flag if requested.
 3. **Name collision check**: `srvm` is short for "serve 'em"; verify crates.io/`brew` name availability before M7 publish — have `srv`/`srve`/`srvup` as backups.
 4. **Minimum Rust version**: suggest MSRV = latest stable at M0; edition 2024 (check `cargo` default).
