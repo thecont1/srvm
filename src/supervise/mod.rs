@@ -1,7 +1,8 @@
 use std::{
+    env,
     io::{Read, Write},
     net::{SocketAddr, TcpStream},
-    path::Path,
+    path::{Path, PathBuf},
     process::{Command, Stdio},
     sync::{
         Arc, Mutex, OnceLock,
@@ -41,7 +42,12 @@ pub struct SupervisorOptions {
     pub port: Option<u16>,
 }
 
-pub fn run(root: &Path, spec: &ServeSpec, options: SupervisorOptions) -> Result<()> {
+pub fn run(
+    root: &Path,
+    spec: &ServeSpec,
+    options: SupervisorOptions,
+    path_prepend: &[PathBuf],
+) -> Result<()> {
     let stop = spec.is_static.then(|| {
         STATIC_STOP
             .get_or_init(|| Arc::new(AtomicBool::new(false)))
@@ -63,10 +69,10 @@ pub fn run(root: &Path, spec: &ServeSpec, options: SupervisorOptions) -> Result<
             "  step       installing dependencies — {}",
             install.command_line()
         );
-        run_install(root, install, options)?;
+        run_install(root, install, options, path_prepend)?;
     }
 
-    run_server(root, spec, requested, options)
+    run_server(root, spec, requested, options, path_prepend)
 }
 
 fn run_static(
@@ -118,9 +124,14 @@ fn plan_port(spec: &ServeSpec, options: SupervisorOptions) -> Result<Option<u16>
     Ok(requested)
 }
 
-fn run_install(root: &Path, command: &CommandSpec, options: SupervisorOptions) -> Result<()> {
+fn run_install(
+    root: &Path,
+    command: &CommandSpec,
+    options: SupervisorOptions,
+    path_prepend: &[PathBuf],
+) -> Result<()> {
     let ring = Arc::new(Mutex::new(Ring::default()));
-    let mut child = spawn(command, root, &[])?;
+    let mut child = spawn(command, root, &[], path_prepend)?;
     set_current_child(Some(child.id()));
     let (tx, _rx) = mpsc::channel::<String>();
     let mut joins = attach_pumps(&mut child, ring.clone(), false, tx, options)?;
@@ -158,6 +169,7 @@ fn run_server(
     spec: &ServeSpec,
     requested: Option<u16>,
     options: SupervisorOptions,
+    path_prepend: &[PathBuf],
 ) -> Result<()> {
     let ring = Arc::new(Mutex::new(Ring::default()));
 
@@ -180,7 +192,7 @@ fn run_server(
 
     println!("  step       starting — {}", command.command_line());
     drop(reservation);
-    let mut child = spawn(&command, root, &env)?;
+    let mut child = spawn(&command, root, &env, path_prepend)?;
     set_current_child(Some(child.id()));
 
     let (tx, rx) = mpsc::channel::<String>();
@@ -283,15 +295,23 @@ fn attach_pumps(
 fn spawn(
     command: &CommandSpec,
     root: &Path,
-    env: &[(String, String)],
+    env_pairs: &[(String, String)],
+    path_prepend: &[PathBuf],
 ) -> Result<std::process::Child> {
     let mut cmd = Command::new(&command.program);
     cmd.args(&command.args)
         .current_dir(root)
         .env("BROWSER", "none")
-        .envs(env.iter().map(|(key, value)| (key, value)))
+        .envs(env_pairs.iter().map(|(key, value)| (key, value)))
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
+    if !path_prepend.is_empty() {
+        let mut parts = path_prepend.to_vec();
+        if let Some(existing) = env::var_os("PATH") {
+            parts.extend(env::split_paths(&existing));
+        }
+        cmd.env("PATH", env::join_paths(parts)?);
+    }
     kill::configure_process_group(&mut cmd);
     cmd.spawn()
         .with_context(|| format!("failed to spawn {}", command.command_line()))

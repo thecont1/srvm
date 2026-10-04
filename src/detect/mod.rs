@@ -110,8 +110,18 @@ impl ToolResolver for PathResolver {
     }
 }
 
+pub struct AvailabilityResolver;
+
+impl ToolResolver for AvailabilityResolver {
+    fn resolve(&self, tool: &str, root: &Path) -> Option<PathBuf> {
+        PathResolver
+            .resolve(tool, root)
+            .or_else(|| crate::runtime::can_fetch(tool).then(|| PathBuf::from(tool)))
+    }
+}
+
 pub fn detect(root: &Path) -> Result<Vec<ServeSpec>> {
-    detect_with(root, &PathResolver)
+    detect_with(root, &AvailabilityResolver)
 }
 
 pub fn detect_with(root: &Path, resolver: &dyn ToolResolver) -> Result<Vec<ServeSpec>> {

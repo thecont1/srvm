@@ -1,11 +1,15 @@
-use std::path::PathBuf;
+use std::{
+    env,
+    path::{Path, PathBuf},
+};
 
 use anyhow::{Result, bail};
 use clap::Parser;
 
 use crate::{
-    detect::{PortInjection, ServeSpec, detect},
+    detect::{PathResolver, PortInjection, ServeSpec, ToolResolver, detect},
     ports,
+    runtime::{self, RuntimeKind},
     supervise::{self, SupervisorOptions},
 };
 
@@ -54,7 +58,7 @@ pub fn run() -> Result<()> {
     let specs = detect(&root)?;
 
     if cli.dry_run {
-        return print_dry_run(&root.display().to_string(), &specs, cli.port);
+        return print_dry_run(&root, &specs, cli.port);
     }
 
     if specs.is_empty() {
@@ -63,6 +67,7 @@ pub fn run() -> Result<()> {
 
     let selected = select_spec(&specs, cli.select.as_deref())?;
     print_intro(&root.display().to_string(), selected);
+    let path_prepend = prepare_runtimes(&root, selected, cli.quiet)?;
     supervise::run(
         &root,
         selected,
@@ -74,6 +79,7 @@ pub fn run() -> Result<()> {
             no_color: cli.no_color,
             port: cli.port,
         },
+        &path_prepend,
     )
 }
 
@@ -83,9 +89,9 @@ fn print_intro(root: &str, spec: &ServeSpec) {
     println!("  serve      {}", spec.summary());
 }
 
-fn print_dry_run(root: &str, specs: &[ServeSpec], port: Option<u16>) -> Result<()> {
+fn print_dry_run(root: &Path, specs: &[ServeSpec], port: Option<u16>) -> Result<()> {
     println!("  srvm {}", env!("CARGO_PKG_VERSION"));
-    println!("  workspace  {root}");
+    println!("  workspace  {}", root.display());
 
     if specs.is_empty() {
         println!("  detect     no servable app detected");
@@ -101,6 +107,7 @@ fn print_dry_run(root: &str, specs: &[ServeSpec], port: Option<u16>) -> Result<(
         if let Some(install) = &spec.install {
             println!("  install    {}", install.command_line());
         }
+        print_runtime_note(root, spec);
 
         let inherited = match &spec.port {
             PortInjection::Env(key) => std::env::var(key).ok(),
@@ -128,6 +135,110 @@ fn print_dry_run(root: &str, specs: &[ServeSpec], port: Option<u16>) -> Result<(
     Ok(())
 }
 
+fn print_runtime_note(root: &Path, spec: &ServeSpec) {
+    let mut seen = Vec::new();
+    for program in programs_of(spec) {
+        if program_file(root, program).is_some() {
+            continue;
+        }
+        let tool = bare_tool(program);
+        if PathResolver.resolve(&tool, root).is_some() {
+            continue;
+        }
+        let Some(kind) = runtime::kind_for(&tool) else {
+            continue;
+        };
+        let label = match kind {
+            RuntimeKind::Node => "node",
+            RuntimeKind::Python => "python",
+            RuntimeKind::Go => "go",
+            RuntimeKind::Rust => "rust",
+        };
+        if seen.contains(&label) {
+            continue;
+        }
+        seen.push(label);
+        println!("  runtime    {label} (will fetch on launch)");
+    }
+}
+
+fn prepare_runtimes(root: &Path, spec: &ServeSpec, quiet: bool) -> Result<Vec<PathBuf>> {
+    let mut dirs = Vec::new();
+    let mut seen = Vec::new();
+    for program in programs_of(spec) {
+        if let Some(file) = program_file(root, program) {
+            if let Some(dir) = file.parent() {
+                push_unique(&mut dirs, dir.to_path_buf());
+            }
+            continue;
+        }
+        let tool = bare_tool(program);
+        if let Some(resolved) = PathResolver.resolve(&tool, root) {
+            if let Some(dir) = resolved.parent()
+                && !on_path(dir)
+            {
+                push_unique(&mut dirs, dir.to_path_buf());
+            }
+            continue;
+        }
+        let Some(kind) = runtime::kind_for(&tool) else {
+            continue;
+        };
+        if seen.contains(&kind) {
+            continue;
+        }
+        seen.push(kind);
+        dirs.extend(runtime::fetch_if_missing(kind, root, quiet)?);
+    }
+    Ok(dirs)
+}
+
+fn programs_of(spec: &ServeSpec) -> Vec<&str> {
+    let mut programs = vec![spec.command.program.as_str()];
+    if let Some(install) = &spec.install {
+        programs.push(install.program.as_str());
+    }
+    programs
+}
+
+fn program_file(root: &Path, program: &str) -> Option<PathBuf> {
+    let path = Path::new(program);
+    if !path.is_absolute() && path.components().count() < 2 {
+        return None;
+    }
+    let candidate = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        root.join(path)
+    };
+    candidate.is_file().then_some(candidate)
+}
+
+fn on_path(dir: &Path) -> bool {
+    let Some(path) = env::var_os("PATH") else {
+        return false;
+    };
+    let dir = dir.canonicalize().unwrap_or_else(|_| dir.to_path_buf());
+    env::split_paths(&path).any(|entry| entry.canonicalize().unwrap_or(entry) == dir)
+}
+
+fn push_unique(dirs: &mut Vec<PathBuf>, dir: PathBuf) {
+    if !dirs.contains(&dir) {
+        dirs.push(dir);
+    }
+}
+
+fn bare_tool(program: &str) -> String {
+    let name = Path::new(program)
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or(program);
+    name.trim_end_matches(".exe")
+        .trim_end_matches(".cmd")
+        .trim_end_matches(".bat")
+        .to_string()
+}
+
 fn override_description(spec: &ServeSpec) -> String {
     match &spec.port {
         PortInjection::Env(key) => format!("env {key}=<port>"),
@@ -151,5 +262,45 @@ fn select_spec<'a>(specs: &'a [ServeSpec], select: Option<&str>) -> Result<&'a S
                 .find(|spec| spec.name == raw || spec.tool == raw)
                 .ok_or_else(|| anyhow::anyhow!("no detected stack matches --select {raw:?}"))
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::detect::CommandSpec;
+    use std::fs;
+
+    fn spec_with_program(program: &str) -> ServeSpec {
+        ServeSpec::new(
+            "test",
+            "test",
+            CommandSpec::new(program, Vec::<String>::new()),
+            None,
+            PortInjection::None,
+        )
+    }
+
+    #[test]
+    fn repo_local_program_prepends_its_own_bin_dir() {
+        let root = tempfile::tempdir().unwrap();
+        let bin = root.path().join(".venv").join("bin");
+        fs::create_dir_all(&bin).unwrap();
+        fs::write(bin.join("python"), "#!/bin/sh\n").unwrap();
+
+        let spec = spec_with_program(".venv/bin/python");
+        let dirs = prepare_runtimes(root.path(), &spec, true).unwrap();
+        assert_eq!(dirs, vec![bin]);
+    }
+
+    #[test]
+    fn bare_named_file_in_repo_is_not_a_program_path() {
+        let root = tempfile::tempdir().unwrap();
+        fs::write(root.path().join("npm"), "echo nope\n").unwrap();
+        assert!(program_file(root.path(), "npm").is_none());
+        assert!(
+            program_file(root.path(), "./npm").is_some(),
+            "relative ./npm resolves inside the repo"
+        );
     }
 }
