@@ -38,6 +38,7 @@ impl CommandSpec {
 pub enum PortInjection {
     Env(String),
     Args(Vec<String>),
+    Listener,
     None,
 }
 
@@ -79,12 +80,16 @@ impl ServeSpec {
             install: None,
             url_hint: Some(url_hint),
             is_static: true,
-            port: PortInjection::None,
+            port: PortInjection::Listener,
         }
     }
 
     pub fn command_line(&self) -> String {
-        self.command.command_line()
+        if self.is_static {
+            "built-in static server".into()
+        } else {
+            self.command.command_line()
+        }
     }
 
     pub fn summary(&self) -> String {
@@ -349,7 +354,11 @@ pub(crate) mod tests {
         );
 
         let static_site = fixture(&[("index.html", "hello\n")]);
-        assert_has(&detected(&static_site, &[]), "static", "srvm static .");
+        assert_has(
+            &detected(&static_site, &[]),
+            "static",
+            "built-in static server",
+        );
     }
 
     #[test]
@@ -362,7 +371,7 @@ pub(crate) mod tests {
         let specs = detected(&repo, &[]);
 
         assert!(!specs.iter().any(|spec| spec.name == "deno"));
-        assert_has(&specs, "static", "srvm static .");
+        assert_has(&specs, "static", "built-in static server");
     }
 
     fn fixture(files: &[(&str, &str)]) -> TempDir {

@@ -44,7 +44,7 @@ pub fn apply(spec: &ServeSpec, port: u16) -> (CommandSpec, Vec<(String, String)>
                 .args
                 .extend(template.iter().map(|arg| arg.replace("{port}", &port)));
         }
-        PortInjection::None => {}
+        PortInjection::Listener | PortInjection::None => {}
     }
 
     (command, env)
@@ -143,6 +143,25 @@ mod tests {
             requested_port(&opaque, Some(5000), None).unwrap(),
             Some(5000)
         );
+    }
+
+    #[test]
+    fn requested_port_listener_ignores_inherited_env() {
+        let owned = spec(PortInjection::Listener, Some(8000));
+        assert_eq!(requested_port(&owned, None, None).unwrap(), Some(8000));
+        assert_eq!(requested_port(&owned, Some(0), None).unwrap(), Some(0));
+        assert_eq!(
+            requested_port(&owned, Some(8123), None).unwrap(),
+            Some(8123)
+        );
+        assert_eq!(
+            requested_port(&owned, None, Some("bogus")).unwrap(),
+            Some(8000)
+        );
+
+        let (command, env) = apply(&owned, 8123);
+        assert_eq!(command.command_line(), "run it");
+        assert!(env.is_empty());
     }
 
     #[test]

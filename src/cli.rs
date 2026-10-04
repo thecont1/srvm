@@ -132,6 +132,7 @@ fn override_description(spec: &ServeSpec) -> String {
     match &spec.port {
         PortInjection::Env(key) => format!("env {key}=<port>"),
         PortInjection::Args(template) => format!("args {}", template.join(" ")),
+        PortInjection::Listener => "built-in loopback listener (no child process)".into(),
         PortInjection::None => "unsupported — ports left unchanged".into(),
     }
 }

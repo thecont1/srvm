@@ -3,16 +3,20 @@ use std::{
     net::{SocketAddr, TcpStream},
     path::Path,
     process::{Command, Stdio},
-    sync::{Arc, Mutex, OnceLock, mpsc},
+    sync::{
+        Arc, Mutex, OnceLock,
+        atomic::{AtomicBool, Ordering},
+        mpsc,
+    },
     thread,
     time::{Duration, Instant},
 };
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result};
 
 use crate::{
     detect::{CommandSpec, PortInjection, ServeSpec},
-    ports,
+    ports, staticsrv,
 };
 
 mod collapse;
@@ -25,6 +29,7 @@ pub mod scan;
 use ring::Ring;
 
 static CURRENT_CHILD: OnceLock<Arc<Mutex<Option<u32>>>> = OnceLock::new();
+static STATIC_STOP: OnceLock<Arc<AtomicBool>> = OnceLock::new();
 
 #[derive(Debug, Clone, Copy)]
 pub struct SupervisorOptions {
@@ -37,13 +42,19 @@ pub struct SupervisorOptions {
 }
 
 pub fn run(root: &Path, spec: &ServeSpec, options: SupervisorOptions) -> Result<()> {
-    if spec.is_static {
-        bail!("static serving is not implemented yet");
-    }
+    let stop = spec.is_static.then(|| {
+        STATIC_STOP
+            .get_or_init(|| Arc::new(AtomicBool::new(false)))
+            .clone()
+    });
 
-    install_signal_handler();
+    install_signal_handler()?;
 
     let requested = plan_port(spec, options)?;
+
+    if let Some(stop) = stop {
+        return run_static(root, requested, options, stop);
+    }
 
     if !options.no_install
         && let Some(install) = &spec.install
@@ -56,6 +67,32 @@ pub fn run(root: &Path, spec: &ServeSpec, options: SupervisorOptions) -> Result<
     }
 
     run_server(root, spec, requested, options)
+}
+
+fn run_static(
+    root: &Path,
+    requested: Option<u16>,
+    options: SupervisorOptions,
+    stop: Arc<AtomicBool>,
+) -> Result<()> {
+    let start = requested.unwrap_or(8000);
+    let server = staticsrv::StaticServer::bind(root, start)?;
+    let actual = server.local_addr()?.port();
+    report_port(start, actual, options);
+    if !options.quiet {
+        println!("  step       starting — built-in static server");
+    }
+
+    let url = format!("http://{}/", server.local_addr()?);
+    let mut announced = None;
+    let mut opened = false;
+    announce_reported_url(&url, Some(actual), &mut announced, &mut opened, options);
+
+    server.serve(stop.clone())?;
+    if stop.load(Ordering::SeqCst) {
+        std::process::exit(130);
+    }
+    Ok(())
 }
 
 fn plan_port(spec: &ServeSpec, options: SupervisorOptions) -> Result<Option<u16>> {
@@ -363,18 +400,24 @@ fn error_with_tail(message: String, ring: &Arc<Mutex<Ring>>) -> anyhow::Error {
     anyhow::anyhow!(message)
 }
 
-fn install_signal_handler() {
+fn install_signal_handler() -> Result<()> {
     let child = CURRENT_CHILD
         .get_or_init(|| Arc::new(Mutex::new(None)))
         .clone();
 
-    let _ = ctrlc::set_handler(move || {
+    ctrlc::set_handler(move || {
+        if let Some(stop) = STATIC_STOP.get()
+            && !stop.swap(true, Ordering::SeqCst)
+        {
+            return;
+        }
         let pid = *child.lock().expect("signal child lock poisoned");
         if let Some(pid) = pid {
             kill::terminate_tree_by_pid(pid);
         }
         std::process::exit(130);
-    });
+    })?;
+    Ok(())
 }
 
 fn set_current_child(pid: Option<u32>) {
