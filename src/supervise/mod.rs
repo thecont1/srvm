@@ -1,5 +1,5 @@
 use std::{
-    io::Write,
+    io::{Read, Write},
     net::{SocketAddr, TcpStream},
     path::Path,
     process::{Command, Stdio},
@@ -10,7 +10,10 @@ use std::{
 
 use anyhow::{Context, Result, bail};
 
-use crate::detect::{CommandSpec, ServeSpec};
+use crate::{
+    detect::{CommandSpec, PortInjection, ServeSpec},
+    ports,
+};
 
 mod collapse;
 mod kill;
@@ -30,6 +33,7 @@ pub struct SupervisorOptions {
     pub verbose: bool,
     pub quiet: bool,
     pub no_color: bool,
+    pub port: Option<u16>,
 }
 
 pub fn run(root: &Path, spec: &ServeSpec, options: SupervisorOptions) -> Result<()> {
@@ -38,6 +42,8 @@ pub fn run(root: &Path, spec: &ServeSpec, options: SupervisorOptions) -> Result<
     }
 
     install_signal_handler();
+
+    let requested = plan_port(spec, options)?;
 
     if !options.no_install
         && let Some(install) = &spec.install
@@ -49,13 +55,35 @@ pub fn run(root: &Path, spec: &ServeSpec, options: SupervisorOptions) -> Result<
         run_install(root, install, options)?;
     }
 
-    println!("  step       starting — {}", spec.command_line());
-    run_server(root, spec, options)
+    run_server(root, spec, requested, options)
+}
+
+fn plan_port(spec: &ServeSpec, options: SupervisorOptions) -> Result<Option<u16>> {
+    let inherited = match &spec.port {
+        PortInjection::Env(key) => std::env::var(key).ok(),
+        _ => None,
+    };
+    let requested = ports::requested_port(spec, options.port, inherited.as_deref())?;
+
+    if matches!(spec.port, PortInjection::None)
+        && (options.port.is_some() || spec.url_hint.is_some())
+    {
+        let mut warning = format!(
+            "port overrides are unsupported for {}; leaving its ports unchanged",
+            spec.name
+        );
+        if let Some(port) = options.port {
+            warning.push_str(&format!("; --port {port} ignored"));
+        }
+        eprintln!("  warning    {warning}");
+    }
+
+    Ok(requested)
 }
 
 fn run_install(root: &Path, command: &CommandSpec, options: SupervisorOptions) -> Result<()> {
     let ring = Arc::new(Mutex::new(Ring::default()));
-    let mut child = spawn(command, root)?;
+    let mut child = spawn(command, root, &[])?;
     set_current_child(Some(child.id()));
     let (tx, _rx) = mpsc::channel::<String>();
     let mut joins = attach_pumps(&mut child, ring.clone(), false, tx, options)?;
@@ -88,49 +116,68 @@ fn run_install(root: &Path, command: &CommandSpec, options: SupervisorOptions) -
     }
 }
 
-fn run_server(root: &Path, spec: &ServeSpec, options: SupervisorOptions) -> Result<()> {
+fn run_server(
+    root: &Path,
+    spec: &ServeSpec,
+    requested: Option<u16>,
+    options: SupervisorOptions,
+) -> Result<()> {
     let ring = Arc::new(Mutex::new(Ring::default()));
-    let mut child = spawn(&spec.command, root)?;
+
+    let mut reservation = None;
+    let (command, env, selected) = match requested {
+        Some(start) => {
+            let listener = ports::reserve(start)
+                .with_context(|| format!("could not find a free port starting at {start}"))?;
+            let selected = listener.local_addr()?.port();
+            reservation = Some(listener);
+            let (command, env) = ports::apply(spec, selected);
+            (command, env, Some(selected))
+        }
+        None => (spec.command.clone(), Vec::new(), None),
+    };
+
+    if let (Some(start), Some(selected)) = (requested, selected) {
+        report_port(start, selected, options);
+    }
+
+    println!("  step       starting — {}", command.command_line());
+    drop(reservation);
+    let mut child = spawn(&command, root, &env)?;
     set_current_child(Some(child.id()));
 
     let (tx, rx) = mpsc::channel::<String>();
     let mut joins = attach_pumps(&mut child, ring.clone(), true, tx, options)?;
     let started = Instant::now();
-    let mut announced = false;
+    let probe_port = selected.or(spec.url_hint);
+    let mut announced: Option<String> = None;
+    let mut opened = false;
     let mut probed_hint = false;
 
     loop {
-        if !announced {
-            match rx.try_recv() {
-                Ok(url) => {
-                    announce_url(&url, options.no_open);
-                    announced = true;
-                }
-                Err(mpsc::TryRecvError::Disconnected | mpsc::TryRecvError::Empty) => {}
-            }
+        while let Ok(url) = rx.try_recv() {
+            announce_reported_url(&url, selected, &mut announced, &mut opened, options);
         }
 
-        if !announced
+        if announced.is_none()
             && !probed_hint
             && started.elapsed() >= Duration::from_secs(12)
-            && let Some(port) = spec.url_hint
+            && let Some(port) = probe_port
         {
             probed_hint = true;
             if let Some(url) = probe_hint(port) {
-                announce_url(&url, options.no_open);
-                announced = true;
+                announce_reported_url(&url, selected, &mut announced, &mut opened, options);
             }
         }
 
         if let Some(status) = child.try_wait()? {
             set_current_child(None);
             join_pumps(&mut joins);
-            if !announced && let Ok(url) = rx.try_recv() {
-                announce_url(&url, options.no_open);
-                announced = true;
+            while let Ok(url) = rx.try_recv() {
+                announce_reported_url(&url, selected, &mut announced, &mut opened, options);
             }
             if status.success() {
-                if announced {
+                if announced.is_some() {
                     println!("  exited     {}", status);
                 }
                 return Ok(());
@@ -196,11 +243,16 @@ fn attach_pumps(
     Ok(joins)
 }
 
-fn spawn(command: &CommandSpec, root: &Path) -> Result<std::process::Child> {
+fn spawn(
+    command: &CommandSpec,
+    root: &Path,
+    env: &[(String, String)],
+) -> Result<std::process::Child> {
     let mut cmd = Command::new(&command.program);
     cmd.args(&command.args)
         .current_dir(root)
         .env("BROWSER", "none")
+        .envs(env.iter().map(|(key, value)| (key, value)))
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
     kill::configure_process_group(&mut cmd);
@@ -208,12 +260,45 @@ fn spawn(command: &CommandSpec, root: &Path) -> Result<std::process::Child> {
         .with_context(|| format!("failed to spawn {}", command.command_line()))
 }
 
-fn announce_url(url: &str, no_open: bool) {
-    println!("  app        {url}");
-    if !no_open {
-        let _ = open::open_browser(url);
+fn report_port(requested: u16, selected: u16, options: SupervisorOptions) {
+    if options.quiet {
+        return;
     }
-    println!("  ctrl-c to stop");
+    if requested == 0 {
+        println!("  port       selected {selected}");
+    } else if requested != selected {
+        println!("  port       {requested} busy -> {selected}");
+    } else {
+        println!("  port       {selected}");
+    }
+}
+
+fn announce_reported_url(
+    url: &str,
+    selected: Option<u16>,
+    announced: &mut Option<String>,
+    opened: &mut bool,
+    options: SupervisorOptions,
+) {
+    if announced.as_deref() == Some(url) {
+        return;
+    }
+    *announced = Some(url.to_string());
+
+    println!("  app        {url}");
+    if !*opened {
+        *opened = true;
+        if !options.no_open {
+            let _ = open::open_browser(url);
+        }
+        println!("  ctrl-c to stop");
+    }
+    if let Some(expected) = selected
+        && let Some(actual) = ports::url_port(url)
+        && actual != expected
+    {
+        eprintln!("  port       requested {expected}, app reports {url}; override ignored");
+    }
 }
 
 fn probe_hint(port: u16) -> Option<String> {
@@ -223,9 +308,51 @@ fn probe_hint(port: u16) -> Option<String> {
         .set_read_timeout(Some(Duration::from_millis(250)))
         .ok()?;
     stream
-        .write_all(b"HEAD / HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n")
+        .set_write_timeout(Some(Duration::from_millis(250)))
         .ok()?;
-    Some(format!("http://127.0.0.1:{port}"))
+    stream
+        .write_all(
+            format!("HEAD / HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nConnection: close\r\n\r\n")
+                .as_bytes(),
+        )
+        .ok()?;
+
+    let deadline = Instant::now() + Duration::from_millis(250);
+    let mut buf = Vec::with_capacity(256);
+    let mut chunk = [0u8; 256];
+    let end = loop {
+        if let Some(end) = buf.iter().position(|byte| *byte == b'\n') {
+            break end;
+        }
+        if buf.len() == 256 {
+            return None;
+        }
+        let remaining = deadline.checked_duration_since(Instant::now())?;
+        if remaining.is_zero() {
+            return None;
+        }
+        stream.set_read_timeout(Some(remaining)).ok()?;
+        let limit = 256 - buf.len();
+        let n = stream.read(&mut chunk[..limit]).ok()?;
+        if n == 0 {
+            return None;
+        }
+        buf.extend_from_slice(&chunk[..n]);
+    };
+
+    let mut status = std::str::from_utf8(&buf[..end]).ok()?.split_whitespace();
+    match status.next()? {
+        "HTTP/1.0" | "HTTP/1.1" => {}
+        _ => return None,
+    }
+    let raw_code = status.next()?;
+    if raw_code.len() != 3 || !raw_code.bytes().all(|byte| byte.is_ascii_digit()) {
+        return None;
+    }
+    let code: u16 = raw_code.parse().ok()?;
+    (100..=599)
+        .contains(&code)
+        .then(|| format!("http://127.0.0.1:{port}"))
 }
 
 fn error_with_tail(message: String, ring: &Arc<Mutex<Ring>>) -> anyhow::Error {
@@ -264,20 +391,245 @@ fn join_pumps(joins: &mut Vec<thread::JoinHandle<()>>) {
 
 #[cfg(test)]
 mod tests {
-    use super::probe_hint;
-    use std::{io::Read, net::TcpListener, thread};
+    use super::{SupervisorOptions, announce_reported_url, probe_hint};
+    use std::{
+        io::{Read, Write},
+        net::{TcpListener, TcpStream},
+        thread,
+        time::{Duration, Instant},
+    };
 
-    #[test]
-    fn probe_hint_adopts_open_loopback_port() {
+    fn probe_server(
+        respond: impl FnOnce(&mut TcpStream) + Send + 'static,
+    ) -> (u16, thread::JoinHandle<()>) {
         let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
         let port = listener.local_addr().unwrap().port();
         let handle = thread::spawn(move || {
-            let (mut stream, _) = listener.accept().unwrap();
-            let mut buf = [0; 64];
+            if let Ok((mut stream, _)) = listener.accept() {
+                let _ = stream.set_read_timeout(Some(Duration::from_secs(2)));
+                let _ = stream.set_write_timeout(Some(Duration::from_secs(2)));
+                respond(&mut stream);
+            }
+        });
+        (port, handle)
+    }
+
+    fn http_response(response: &'static [u8]) -> impl FnOnce(&mut TcpStream) + Send + 'static {
+        move |stream| {
+            let mut buf = [0; 128];
             let _ = stream.read(&mut buf);
+            let _ = stream.write_all(response);
+        }
+    }
+
+    #[test]
+    fn probe_hint_adopts_port_serving_http() {
+        let (port, handle) = probe_server(http_response(
+            b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n",
+        ));
+
+        assert_eq!(probe_hint(port), Some(format!("http://127.0.0.1:{port}")));
+        handle.join().unwrap();
+    }
+
+    #[test]
+    fn probe_hint_accepts_fragmented_status_line() {
+        let (port, handle) = probe_server(|stream| {
+            let mut buf = [0; 128];
+            let _ = stream.read(&mut buf);
+            stream.write_all(b"HTTP/1.1 2").unwrap();
+            thread::sleep(Duration::from_millis(30));
+            stream.write_all(b"00 OK\r\n").unwrap();
         });
 
         assert_eq!(probe_hint(port), Some(format!("http://127.0.0.1:{port}")));
         handle.join().unwrap();
+    }
+
+    #[test]
+    fn probe_hint_counts_http_errors_as_alive() {
+        for status in [
+            b"HTTP/1.1 404 Not Found\r\n\r\n" as &[u8],
+            b"HTTP/1.0 500 Server Error\r\n\r\n",
+        ] {
+            let (port, handle) = probe_server(http_response(status));
+
+            assert_eq!(probe_hint(port), Some(format!("http://127.0.0.1:{port}")));
+            handle.join().unwrap();
+        }
+    }
+
+    #[test]
+    fn probe_hint_rejects_tcp_only_endpoint() {
+        let (port, handle) = probe_server(|stream| {
+            let mut buf = [0; 128];
+            let _ = stream.read(&mut buf);
+        });
+
+        assert_eq!(probe_hint(port), None);
+        handle.join().unwrap();
+    }
+
+    #[test]
+    fn probe_hint_rejects_stalled_endpoint() {
+        let (port, handle) = probe_server(|stream| {
+            let mut buf = [0; 128];
+            let _ = stream.read(&mut buf);
+            thread::sleep(Duration::from_millis(400));
+        });
+
+        assert_eq!(probe_hint(port), None);
+        handle.join().unwrap();
+    }
+
+    #[test]
+    fn probe_hint_slow_drip_respects_total_deadline() {
+        let (port, handle) = probe_server(|stream| {
+            let mut buf = [0; 128];
+            let _ = stream.read(&mut buf);
+            for byte in b"HTTP/1.1 200 OK\r\n" {
+                if stream.write_all(&[*byte]).is_err() {
+                    return;
+                }
+                thread::sleep(Duration::from_millis(80));
+            }
+        });
+
+        let started = Instant::now();
+        assert_eq!(probe_hint(port), None);
+        assert!(
+            started.elapsed() < Duration::from_millis(700),
+            "probe should give up at the 250ms total deadline"
+        );
+        handle.join().unwrap();
+    }
+
+    #[test]
+    fn probe_hint_rejects_missing_newline() {
+        let (port, handle) = probe_server(http_response(b"HTTP/1.1 200 OK"));
+
+        assert_eq!(probe_hint(port), None);
+        handle.join().unwrap();
+    }
+
+    #[test]
+    fn probe_hint_rejects_malformed_status_codes() {
+        for status in [
+            b"HTTP/1.1 0200\r\n" as &[u8],
+            b"HTTP/1.1 +200\r\n",
+            b"HTTP/1.1 20\r\n",
+        ] {
+            let (port, handle) = probe_server(http_response(status));
+
+            assert_eq!(probe_hint(port), None);
+            handle.join().unwrap();
+        }
+    }
+
+    #[test]
+    fn probe_hint_rejects_overlong_status_line() {
+        let (port, handle) = probe_server(|stream| {
+            let mut buf = [0; 128];
+            let _ = stream.read(&mut buf);
+            let _ = stream.write_all(&[b'X'; 300]);
+        });
+
+        assert_eq!(probe_hint(port), None);
+        handle.join().unwrap();
+    }
+
+    #[test]
+    fn probe_hint_rejects_non_http_and_out_of_range() {
+        for status in [
+            b"garbage\r\n" as &[u8],
+            b"HTTP/2 200\r\n\r\n",
+            b"HTTP/1.1 999 Weird\r\n\r\n",
+            b"HTTP/1.1 099 Nope\r\n\r\n",
+        ] {
+            let (port, handle) = probe_server(http_response(status));
+
+            assert_eq!(probe_hint(port), None);
+            handle.join().unwrap();
+        }
+    }
+
+    #[test]
+    fn probe_hint_rejects_closed_port() {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let port = listener.local_addr().unwrap().port();
+        drop(listener);
+
+        assert_eq!(probe_hint(port), None);
+    }
+
+    fn quiet_options() -> SupervisorOptions {
+        SupervisorOptions {
+            no_open: true,
+            no_install: false,
+            verbose: false,
+            quiet: true,
+            no_color: true,
+            port: None,
+        }
+    }
+
+    #[test]
+    fn first_announcement_opens_browser_once() {
+        let mut announced = None;
+        let mut opened = false;
+        let options = quiet_options();
+
+        announce_reported_url(
+            "http://127.0.0.1:8000",
+            None,
+            &mut announced,
+            &mut opened,
+            options,
+        );
+        assert_eq!(announced.as_deref(), Some("http://127.0.0.1:8000"));
+        assert!(opened);
+
+        announce_reported_url(
+            "http://127.0.0.1:8000",
+            None,
+            &mut announced,
+            &mut opened,
+            options,
+        );
+        assert_eq!(announced.as_deref(), Some("http://127.0.0.1:8000"));
+        assert!(opened);
+    }
+
+    #[test]
+    fn late_sniffed_url_replaces_probe_announcement() {
+        let mut announced = Some("http://127.0.0.1:8123".to_string());
+        let mut opened = true;
+        let options = quiet_options();
+
+        announce_reported_url(
+            "http://127.0.0.1:9123/app?x=1#f",
+            Some(8123),
+            &mut announced,
+            &mut opened,
+            options,
+        );
+        assert_eq!(
+            announced.as_deref(),
+            Some("http://127.0.0.1:9123/app?x=1#f")
+        );
+        assert!(opened);
+
+        announce_reported_url(
+            "http://127.0.0.1:9123/app?x=1#f",
+            Some(8123),
+            &mut announced,
+            &mut opened,
+            options,
+        );
+        assert_eq!(
+            announced.as_deref(),
+            Some("http://127.0.0.1:9123/app?x=1#f")
+        );
+        assert!(opened);
     }
 }

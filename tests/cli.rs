@@ -85,6 +85,36 @@ fn supervisor_reports_early_failure_tail() {
 }
 
 #[test]
+fn dry_run_rejects_invalid_inherited_port() {
+    let repo = tempdir().unwrap();
+    let bin = tempdir().unwrap();
+    stub_tool(bin.path(), "npm");
+    fs::write(
+        repo.path().join("package.json"),
+        r#"{"scripts":{"dev":"node server.js"}}"#,
+    )
+    .unwrap();
+
+    srvm(bin.path())
+        .env("PORT", "not-a-port")
+        .arg("--dry-run")
+        .arg(repo.path())
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("is not a valid port"));
+
+    srvm(bin.path())
+        .env("PORT", "not-a-port")
+        .arg("--dry-run")
+        .arg("--port")
+        .arg("0")
+        .arg(repo.path())
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("OS-assigned"));
+}
+
+#[test]
 fn all_flag_is_reserved() {
     let repo = tempdir().unwrap();
     let bin = tempdir().unwrap();

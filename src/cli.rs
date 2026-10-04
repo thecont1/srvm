@@ -4,7 +4,8 @@ use anyhow::{Result, bail};
 use clap::Parser;
 
 use crate::{
-    detect::{ServeSpec, detect},
+    detect::{PortInjection, ServeSpec, detect},
+    ports,
     supervise::{self, SupervisorOptions},
 };
 
@@ -20,7 +21,7 @@ struct Cli {
     #[arg(long)]
     no_open: bool,
 
-    #[arg(long)]
+    #[arg(long, help = "Start port search at N (0 chooses a free port)")]
     port: Option<u16>,
 
     #[arg(long)]
@@ -53,8 +54,7 @@ pub fn run() -> Result<()> {
     let specs = detect(&root)?;
 
     if cli.dry_run {
-        print_dry_run(&root.display().to_string(), &specs);
-        return Ok(());
+        return print_dry_run(&root.display().to_string(), &specs, cli.port);
     }
 
     if specs.is_empty() {
@@ -72,6 +72,7 @@ pub fn run() -> Result<()> {
             verbose: cli.verbose,
             quiet: cli.quiet,
             no_color: cli.no_color,
+            port: cli.port,
         },
     )
 }
@@ -82,7 +83,7 @@ fn print_intro(root: &str, spec: &ServeSpec) {
     println!("  serve      {}", spec.summary());
 }
 
-fn print_dry_run(root: &str, specs: &[ServeSpec]) {
+fn print_dry_run(root: &str, specs: &[ServeSpec], port: Option<u16>) -> Result<()> {
     println!("  srvm {}", env!("CARGO_PKG_VERSION"));
     println!("  workspace  {root}");
 
@@ -91,7 +92,7 @@ fn print_dry_run(root: &str, specs: &[ServeSpec]) {
         println!(
             "  looked     deno, package.json, wrangler, Procfile, make, just, task, python, ruby, docs, elixir, php, rust, go, compose, static"
         );
-        return;
+        return Ok(());
     }
 
     for (idx, spec) in specs.iter().enumerate() {
@@ -100,9 +101,38 @@ fn print_dry_run(root: &str, specs: &[ServeSpec]) {
         if let Some(install) = &spec.install {
             println!("  install    {}", install.command_line());
         }
-        if let Some(port) = spec.url_hint {
-            println!("  port       {port}");
+
+        let inherited = match &spec.port {
+            PortInjection::Env(key) => std::env::var(key).ok(),
+            _ => None,
+        };
+        match ports::requested_port(spec, port, inherited.as_deref())? {
+            Some(start) => {
+                if start == 0 {
+                    println!("  port       0 (OS-assigned free port chosen at launch)");
+                } else {
+                    println!("  port       {start} (start; availability checked at launch)");
+                }
+                println!("  override   {}", override_description(spec));
+            }
+            None => {
+                if let Some(hint) = spec.url_hint {
+                    println!("  port       {hint}");
+                }
+                if port.is_some() && matches!(spec.port, PortInjection::None) {
+                    println!("  override   {}", override_description(spec));
+                }
+            }
         }
+    }
+    Ok(())
+}
+
+fn override_description(spec: &ServeSpec) -> String {
+    match &spec.port {
+        PortInjection::Env(key) => format!("env {key}=<port>"),
+        PortInjection::Args(template) => format!("args {}", template.join(" ")),
+        PortInjection::None => "unsupported — ports left unchanged".into(),
     }
 }
 
