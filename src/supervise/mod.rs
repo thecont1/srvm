@@ -14,6 +14,7 @@ use crate::detect::{CommandSpec, ServeSpec};
 
 mod collapse;
 mod kill;
+mod open;
 mod pump;
 pub mod ring;
 pub mod scan;
@@ -28,6 +29,7 @@ pub struct SupervisorOptions {
     pub no_install: bool,
     pub verbose: bool,
     pub quiet: bool,
+    pub no_color: bool,
 }
 
 pub fn run(root: &Path, spec: &ServeSpec, options: SupervisorOptions) -> Result<()> {
@@ -54,12 +56,14 @@ pub fn run(root: &Path, spec: &ServeSpec, options: SupervisorOptions) -> Result<
 fn run_install(root: &Path, command: &CommandSpec, options: SupervisorOptions) -> Result<()> {
     let ring = Arc::new(Mutex::new(Ring::default()));
     let mut child = spawn(command, root)?;
+    set_current_child(Some(child.id()));
     let (tx, _rx) = mpsc::channel::<String>();
     let mut joins = attach_pumps(&mut child, ring.clone(), false, tx, options)?;
     let started = Instant::now();
 
     loop {
         if let Some(status) = child.try_wait()? {
+            set_current_child(None);
             join_pumps(&mut joins);
             if status.success() {
                 return Ok(());
@@ -72,6 +76,7 @@ fn run_install(root: &Path, command: &CommandSpec, options: SupervisorOptions) -
 
         if started.elapsed() > Duration::from_secs(15 * 60) {
             kill::terminate_tree(&mut child);
+            set_current_child(None);
             join_pumps(&mut joins);
             return Err(error_with_tail(
                 format!("install command timed out: {}", command.command_line()),
@@ -168,6 +173,7 @@ fn attach_pumps(
                 verbose: options.verbose,
                 quiet: options.quiet,
                 detect_urls,
+                no_color: options.no_color,
             },
         ));
     }
@@ -182,6 +188,7 @@ fn attach_pumps(
                 verbose: options.verbose,
                 quiet: options.quiet,
                 detect_urls,
+                no_color: options.no_color,
             },
         ));
     }
@@ -204,43 +211,9 @@ fn spawn(command: &CommandSpec, root: &Path) -> Result<std::process::Child> {
 fn announce_url(url: &str, no_open: bool) {
     println!("  app        {url}");
     if !no_open {
-        let _ = open_browser(url);
+        let _ = open::open_browser(url);
     }
     println!("  ctrl-c to stop");
-}
-
-fn open_browser(url: &str) -> Result<()> {
-    if std::env::var("BROWSER").is_ok_and(|value| value == "none") {
-        return Ok(());
-    }
-
-    #[cfg(target_os = "macos")]
-    let mut command = {
-        let mut cmd = Command::new("open");
-        cmd.arg(url);
-        cmd
-    };
-
-    #[cfg(target_os = "windows")]
-    let mut command = {
-        let mut cmd = Command::new("cmd");
-        cmd.args(["/C", "start", "", url]);
-        cmd
-    };
-
-    #[cfg(all(unix, not(target_os = "macos")))]
-    let mut command = {
-        let mut cmd = Command::new("xdg-open");
-        cmd.arg(url);
-        cmd
-    };
-
-    command
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()?;
-    Ok(())
 }
 
 fn probe_hint(port: u16) -> Option<String> {
@@ -286,5 +259,25 @@ fn set_current_child(pid: Option<u32>) {
 fn join_pumps(joins: &mut Vec<thread::JoinHandle<()>>) {
     for join in joins.drain(..) {
         let _ = join.join();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::probe_hint;
+    use std::{io::Read, net::TcpListener, thread};
+
+    #[test]
+    fn probe_hint_adopts_open_loopback_port() {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let handle = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut buf = [0; 64];
+            let _ = stream.read(&mut buf);
+        });
+
+        assert_eq!(probe_hint(port), Some(format!("http://127.0.0.1:{port}")));
+        handle.join().unwrap();
     }
 }

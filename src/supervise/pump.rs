@@ -10,6 +10,7 @@ pub struct PumpOptions {
     pub verbose: bool,
     pub quiet: bool,
     pub detect_urls: bool,
+    pub no_color: bool,
 }
 
 pub fn spawn_pump<R>(
@@ -42,9 +43,9 @@ where
 
             if !options.quiet {
                 if options.verbose {
-                    println!("    {line}");
+                    println!("{}", format_child_line(&line, options.no_color));
                 } else if let Some(line) = collapse.accept(&line) {
-                    println!("    {line}");
+                    println!("{}", format_child_line(&line, options.no_color));
                 }
             }
         }
@@ -53,7 +54,26 @@ where
             && !options.verbose
             && let Some(line) = collapse.flush()
         {
-            println!("    {line}");
+            println!("{}", format_child_line(&line, options.no_color));
         }
     })
+}
+
+fn format_child_line(line: &str, no_color: bool) -> String {
+    if no_color || std::env::var_os("NO_COLOR").is_some() {
+        format!("    {line}")
+    } else {
+        format!("\x1b[2m    {line}\x1b[0m")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::format_child_line;
+
+    #[test]
+    fn child_lines_can_be_plain_or_dimmed() {
+        assert_eq!(format_child_line("hello", true), "    hello");
+        assert_eq!(format_child_line("hello", false), "\x1b[2m    hello\x1b[0m");
+    }
 }

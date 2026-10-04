@@ -71,6 +71,7 @@ pub fn run() -> Result<()> {
             no_install: cli.no_install,
             verbose: cli.verbose,
             quiet: cli.quiet,
+            no_color: cli.no_color,
         },
     )
 }
