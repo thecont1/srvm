@@ -95,7 +95,11 @@ fn accept_loop(
             Ok((stream, _)) => {
                 // Accepted sockets inherit non-blocking mode on Windows and
                 // BSD/macOS; blocking mode is required for read/write timeouts.
-                let _ = stream.set_nonblocking(false);
+                // A stream that cannot return to blocking mode would busy-spin
+                // its worker, so drop it instead of serving it.
+                if stream.set_nonblocking(false).is_err() {
+                    continue;
+                }
                 match tx.try_send(stream) {
                     Ok(()) | Err(mpsc::TrySendError::Full(_)) => {}
                     Err(mpsc::TrySendError::Disconnected(_)) => return Ok(()),
