@@ -13,7 +13,7 @@ use tempfile::{TempDir, tempdir};
 
 #[test]
 fn occupied_start_shifts_env_port_and_install_sees_no_port() {
-    let (held, busy, shifted) = occupied_with_free_next();
+    let (held, busy, _first_free) = occupied_with_free_next();
     let repo = package_repo(r#"{"scripts":{"dev":"node server.js"}}"#);
     let bin = tempdir().unwrap();
     stub_exec(bin.path(), "npm");
@@ -25,18 +25,29 @@ fn occupied_start_shifts_env_port_and_install_sees_no_port() {
     let out = line_reader(child.0.stdout.take().unwrap());
     let _err = line_reader(child.0.stderr.take().unwrap());
 
-    wait_line(
+    // The exact successor may be grabbed by a parallel test between the
+    // free-check and srvm's reserve (Windows hands out port-0 assigns
+    // sequentially), so assert the shift rather than a specific port.
+    let port_line = wait_line(
         &out,
-        &format!("port       {busy} busy -> {shifted}"),
+        &format!("port       {busy} busy -> "),
         Duration::from_secs(15),
     );
+    let selected: u16 = port_line
+        .rsplit("->")
+        .next()
+        .unwrap()
+        .trim()
+        .parse()
+        .unwrap();
+    assert_ne!(selected, busy);
     wait_line(
         &out,
-        &format!("app        http://127.0.0.1:{shifted}"),
+        &format!("app        http://127.0.0.1:{selected}"),
         Duration::from_secs(15),
     );
 
-    let response = http_get(shifted);
+    let response = http_get(selected);
     assert!(response.starts_with("HTTP/1.1 200"), "{response}");
     assert!(wait_exit(&mut child.0, Duration::from_secs(15)).success());
 
@@ -47,7 +58,7 @@ fn occupied_start_shifts_env_port_and_install_sees_no_port() {
     assert!(marker.contains("PORT=\n"), "install saw a port: {marker}");
     let log = fs::read_to_string(&log).unwrap();
     assert!(
-        log.contains(&format!("PORT={shifted}")),
+        log.contains(&format!("PORT={selected}")),
         "server env missing shifted port: {log}"
     );
     assert!(log.contains("ARGS=run dev"), "{log}");
@@ -308,7 +319,7 @@ fn cli_rejects_out_of_range_port() {
 
 #[test]
 fn silent_server_is_found_by_probing_the_shifted_port() {
-    let (mut decoy, decoy_port, shifted) = decoy_with_free_next();
+    let (mut decoy, decoy_port, _first_free) = decoy_with_free_next();
     let repo = package_repo(r#"{"scripts":{"dev":"node server.js"}}"#);
     let bin = tempdir().unwrap();
     stub_exec(bin.path(), "npm");
@@ -327,14 +338,23 @@ fn silent_server_is_found_by_probing_the_shifted_port() {
         "app        http://127.0.0.1:",
         Duration::from_secs(25),
     );
-    assert_eq!(
-        app_line_port(&app_line),
-        shifted,
+    // Parallel tests can claim decoy_port + 1 between the free-check and
+    // srvm's reserve; what matters is that srvm shifted off the busy port
+    // and announced a port the child is actually serving.
+    let announced = app_line_port(&app_line);
+    assert_ne!(
+        announced, decoy_port,
         "srvm must announce the shifted port, not the busy one"
     );
 
-    assert!(http_get(shifted).starts_with("HTTP/1.1 200"));
+    assert!(http_get(announced).starts_with("HTTP/1.1 200"));
     assert!(wait_exit(&mut child.0, Duration::from_secs(15)).success());
+
+    let log = fs::read_to_string(&log).unwrap();
+    assert!(
+        log.contains(&format!("PORT={announced}")),
+        "server env missing announced port: {log}"
+    );
 
     let _ = http_get(decoy_port);
     let _ = decoy.0.wait();
