@@ -9,7 +9,7 @@ use clap::Parser;
 
 use crate::{
     detect::{PortInjection, ServeSpec, binpath},
-    launch, ports,
+    dotenv, launch, ports,
     runtime::{self, RuntimeKind, hint::Scope},
     supervise::{self, LaunchItem, SupervisorOptions},
     workspace::{self, Candidate},
@@ -88,7 +88,14 @@ pub fn run() -> Result<()> {
         let candidate = &workspace.candidates[set[0]];
         print_intro(&workspace.root, candidate);
         let path_prepend = prepare_runtimes(candidate, &workspace.root, cli.quiet)?;
-        return supervise::run(&candidate.root, &candidate.spec, options, &path_prepend);
+        let env = prepare_env(candidate);
+        return supervise::run(
+            &candidate.root,
+            &candidate.spec,
+            options,
+            &path_prepend,
+            &env,
+        );
     }
 
     println!("  srvm {}", env!("CARGO_PKG_VERSION"));
@@ -112,6 +119,7 @@ pub fn run() -> Result<()> {
             label: label.clone(),
             candidate,
             path_prepend,
+            env: prepare_env(candidate),
         });
     }
     supervise::run_many(&items, options)
@@ -198,6 +206,19 @@ fn print_dry_run(
         println!("  command    {}", candidate.spec.command_line());
         if let Some(install) = &candidate.spec.install {
             println!("  install    {}", install.command_line());
+        }
+        let env_file = dotenv::load(&candidate.root);
+        if !env_file.pairs.is_empty() {
+            println!("  env        .env ({} vars)", env_file.pairs.len());
+        }
+        for note in env_file.notes {
+            eprintln!("  warn       [{}] {note}", display_rel(candidate));
+        }
+        if let Some(sample) = dotenv::sample_without_env(&candidate.root) {
+            println!(
+                "  note       [{}] no .env; {sample} exists — copy it if the app needs configuration",
+                display_rel(candidate)
+            );
         }
         print_runtime_note(&workspace.root, candidate);
 
@@ -299,6 +320,23 @@ fn print_runtime_note(workspace_root: &Path, candidate: &Candidate) {
         seen.push(label);
         println!("  runtime    {label} (will fetch on launch)");
     }
+}
+
+/// The app's own `.env`, injected for keys the ambient environment does not
+/// already define. Parsing problems are reported, never fatal: a repository
+/// with a questionable `.env` still runs.
+fn prepare_env(candidate: &Candidate) -> Vec<(String, String)> {
+    let (pairs, notes) = dotenv::child_env(&candidate.root);
+    for note in notes {
+        eprintln!("  warn       [{}] {note}", display_rel(candidate));
+    }
+    if let Some(sample) = dotenv::sample_without_env(&candidate.root) {
+        println!(
+            "  note       [{}] no .env; {sample} exists — copy it if the app needs configuration",
+            display_rel(candidate)
+        );
+    }
+    pairs
 }
 
 fn prepare_runtimes(

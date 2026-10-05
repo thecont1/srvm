@@ -10,9 +10,10 @@ fn main() {
 
     if let Some(log) = env::var_os("PORT_FIXTURE_LOG") {
         let record = format!(
-            "PORT={}\nARGS={}\n",
+            "PORT={}\nARGS={}\nSRVM_TEST_ENV={}\n",
             env::var("PORT").unwrap_or_default(),
-            args.join(" ")
+            args.join(" "),
+            env::var("SRVM_TEST_ENV").unwrap_or_default()
         );
         let _ = fs::write(log, record);
     }

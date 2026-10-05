@@ -240,3 +240,102 @@ fn empty_workspace_reports_no_app() {
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(stderr.contains("no servable app detected"), "{stderr}");
 }
+
+#[test]
+fn dotenv_values_reach_the_app_child() {
+    let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let repo = tempdir().unwrap();
+    js_app(&repo.path().join("frontend"));
+    fs::write(
+        repo.path().join("frontend/.env"),
+        "SRVM_TEST_ENV=from-dotenv # trailing\n",
+    )
+    .unwrap();
+    let bin = tempdir().unwrap();
+    stub_exec_mode(bin.path(), "npm", Some("env-port"));
+    let log = repo.path().join("frontend/fixture.log");
+
+    let mut cmd = srvm(bin.path());
+    cmd.env("PORT_FIXTURE_LOG", &log).arg(repo.path());
+    let mut child = ChildGuard::new(&mut cmd);
+    let out = line_reader(child.0.stdout.take().unwrap());
+    let err = line_reader(child.0.stderr.take().unwrap());
+
+    let line = wait_for(&out, &err, "app        ", Duration::from_secs(30));
+    let record = fs::read_to_string(&log).unwrap();
+    assert!(record.contains("SRVM_TEST_ENV=from-dotenv"), "{record}");
+
+    assert!(http_get(app_line_port(&line)).starts_with("HTTP/1.1 200"));
+    assert!(wait_exit(&mut child.0, Duration::from_secs(30)).success());
+}
+
+#[test]
+fn ambient_environment_beats_dotenv() {
+    let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let repo = tempdir().unwrap();
+    js_app(&repo.path().join("frontend"));
+    fs::write(
+        repo.path().join("frontend/.env"),
+        "SRVM_TEST_ENV=from-dotenv\n",
+    )
+    .unwrap();
+    let bin = tempdir().unwrap();
+    stub_exec_mode(bin.path(), "npm", Some("env-port"));
+    let log = repo.path().join("frontend/fixture.log");
+
+    let mut cmd = srvm(bin.path());
+    cmd.env("PORT_FIXTURE_LOG", &log)
+        .env("SRVM_TEST_ENV", "from-os")
+        .arg(repo.path());
+    let mut child = ChildGuard::new(&mut cmd);
+    let out = line_reader(child.0.stdout.take().unwrap());
+    let err = line_reader(child.0.stderr.take().unwrap());
+
+    let line = wait_for(&out, &err, "app        ", Duration::from_secs(30));
+    let record = fs::read_to_string(&log).unwrap();
+    assert!(record.contains("SRVM_TEST_ENV=from-os"), "{record}");
+    assert!(!record.contains("from-dotenv"), "{record}");
+
+    assert!(http_get(app_line_port(&line)).starts_with("HTTP/1.1 200"));
+    assert!(wait_exit(&mut child.0, Duration::from_secs(30)).success());
+}
+
+#[test]
+fn dry_run_reports_dotenv_and_warns_without_failing() {
+    let repo = tempdir().unwrap();
+    js_app(&repo.path().join("frontend"));
+    fs::write(repo.path().join("frontend/.env"), "GOOD=1\n1BAD=2\n").unwrap();
+    let bin = tempdir().unwrap();
+    stub_exec_mode(bin.path(), "npm", Some("env-port"));
+
+    let output = srvm(bin.path())
+        .arg("--dry-run")
+        .arg(repo.path())
+        .output()
+        .unwrap();
+
+    assert!(output.status.success());
+    let stdout = stdout_of(&output);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stdout.contains("env        .env (1 vars)"), "{stdout}");
+    assert!(stderr.contains("warn       [frontend] line 2"), "{stderr}");
+}
+
+#[test]
+fn a_sample_env_without_a_dotenv_is_announced() {
+    let repo = tempdir().unwrap();
+    js_app(&repo.path().join("frontend"));
+    fs::write(repo.path().join("frontend/.env.example"), "API_URL=\n").unwrap();
+    let bin = tempdir().unwrap();
+    stub_exec_mode(bin.path(), "npm", Some("env-port"));
+
+    let output = srvm(bin.path())
+        .arg("--dry-run")
+        .arg(repo.path())
+        .output()
+        .unwrap();
+
+    assert!(output.status.success());
+    let stdout = stdout_of(&output);
+    assert!(stdout.contains("no .env; .env.example exists"), "{stdout}");
+}

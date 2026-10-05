@@ -49,6 +49,7 @@ pub fn run(
     spec: &ServeSpec,
     options: SupervisorOptions,
     path_prepend: &[PathBuf],
+    app_env: &[(String, String)],
 ) -> Result<()> {
     let stop = spec.is_static.then(|| {
         STATIC_STOP
@@ -71,11 +72,20 @@ pub fn run(
             "  step       installing dependencies — {}",
             install.command_line()
         );
-        run_install(root, install, options, path_prepend, None)?;
+        run_install(root, install, options, path_prepend, None, app_env)?;
     }
 
     let opened = Arc::new(AtomicBool::new(false));
-    run_server(root, spec, requested, options, path_prepend, None, &opened)
+    run_server(
+        root,
+        spec,
+        requested,
+        options,
+        path_prepend,
+        None,
+        &opened,
+        app_env,
+    )
 }
 
 fn run_static(
@@ -108,6 +118,8 @@ pub struct LaunchItem<'a> {
     pub label: String,
     pub candidate: &'a Candidate,
     pub path_prepend: Vec<PathBuf>,
+    /// Parsed `.env` pairs for this app, injected for unset vars only.
+    pub env: Vec<(String, String)>,
 }
 
 /// Launches several apps under one supervisor: ports are allocated up front
@@ -144,6 +156,7 @@ pub fn run_many(items: &[LaunchItem], options: SupervisorOptions) -> Result<()> 
                 options,
                 &item.path_prepend,
                 Some(&item.label),
+                &item.env,
             )?;
         }
     }
@@ -197,6 +210,7 @@ pub fn run_many(items: &[LaunchItem], options: SupervisorOptions) -> Result<()> 
                     &item.path_prepend,
                     Some(item.label.as_str()),
                     &opened,
+                    &item.env,
                 );
                 let _ = tx.send(result);
             });
@@ -269,9 +283,10 @@ fn run_install(
     options: SupervisorOptions,
     path_prepend: &[PathBuf],
     label: Option<&str>,
+    app_env: &[(String, String)],
 ) -> Result<()> {
     let ring = Arc::new(Mutex::new(Ring::default()));
-    let mut child = spawn(command, root, &[], path_prepend)?;
+    let mut child = spawn(command, root, &child_env(app_env, &[]), path_prepend)?;
     register_child(child.id());
     let (tx, _rx) = mpsc::channel::<String>();
     let mut joins = attach_pumps(&mut child, ring.clone(), false, tx, options, label)?;
@@ -317,6 +332,7 @@ enum Attempt {
     Retry { next_start: u16, err: anyhow::Error },
 }
 
+#[allow(clippy::too_many_arguments)]
 fn run_server(
     root: &Path,
     spec: &ServeSpec,
@@ -325,6 +341,7 @@ fn run_server(
     path_prepend: &[PathBuf],
     label: Option<&str>,
     opened: &Arc<AtomicBool>,
+    app_env: &[(String, String)],
 ) -> Result<()> {
     let mut start = requested;
     for attempt in 0..=HANDOFF_RETRIES {
@@ -337,6 +354,7 @@ fn run_server(
             path_prepend,
             label,
             opened,
+            app_env,
         )? {
             Attempt::Done | Attempt::Stopped => return Ok(()),
             Attempt::Retry { next_start, .. } if attempt < HANDOFF_RETRIES => {
@@ -362,6 +380,7 @@ fn serve_attempt(
     path_prepend: &[PathBuf],
     label: Option<&str>,
     opened: &Arc<AtomicBool>,
+    app_env: &[(String, String)],
 ) -> Result<Attempt> {
     let ring = Arc::new(Mutex::new(Ring::default()));
 
@@ -388,7 +407,7 @@ fn serve_attempt(
         command.command_line()
     );
     drop(reservation);
-    let mut child = spawn(&command, root, &env, path_prepend)?;
+    let mut child = spawn(&command, root, &child_env(app_env, &env), path_prepend)?;
     register_child(child.id());
 
     let (tx, rx) = mpsc::channel::<String>();
@@ -534,6 +553,28 @@ fn attach_pumps(
     Ok(joins)
 }
 
+/// The environment a child of an app receives: the app's `.env` pairs, then
+/// srvm's own injection (a reserved port), with `BROWSER=none` forced last so a
+/// dev server never hijacks the user's browser even when `.env` asks it to.
+fn child_env(app_env: &[(String, String)], injected: &[(String, String)]) -> Vec<(String, String)> {
+    let mut pairs: Vec<(String, String)> = app_env
+        .iter()
+        .filter(|(key, _)| key != "BROWSER")
+        .cloned()
+        .collect();
+    for (key, value) in injected {
+        if key == "BROWSER" {
+            continue;
+        }
+        match pairs.iter_mut().find(|(name, _)| name == key) {
+            Some(existing) => existing.1 = value.clone(),
+            None => pairs.push((key.clone(), value.clone())),
+        }
+    }
+    pairs.push(("BROWSER".into(), "none".into()));
+    pairs
+}
+
 fn spawn(
     command: &CommandSpec,
     root: &Path,
@@ -543,7 +584,6 @@ fn spawn(
     let mut cmd = Command::new(resolve_program(&command.program, root, path_prepend));
     cmd.args(&command.args)
         .current_dir(root)
-        .env("BROWSER", "none")
         .envs(env_pairs.iter().map(|(key, value)| (key, value)))
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
@@ -565,6 +605,39 @@ fn spawn(
 /// spawnable `.cmd`/`.exe` file, which a bare name cannot resolve to.
 /// Programs written with a path (`.venv/bin/python`, `./script.sh`) are left
 /// untouched; `Command` resolves them against the working directory.
+#[cfg(test)]
+mod env_tests {
+    use super::child_env;
+
+    fn pairs(items: &[(&str, &str)]) -> Vec<(String, String)> {
+        items
+            .iter()
+            .map(|(key, value)| ((*key).to_string(), (*value).to_string()))
+            .collect()
+    }
+
+    #[test]
+    fn reserved_ports_override_dotenv_and_browser_is_forced_last() {
+        let app = pairs(&[("PORT", "9999"), ("BROWSER", "firefox"), ("DEBUG", "1")]);
+
+        let env = child_env(&app, &pairs(&[("PORT", "54123")]));
+
+        assert_eq!(
+            env,
+            vec![
+                ("PORT".into(), "54123".into()),
+                ("DEBUG".into(), "1".into()),
+                ("BROWSER".into(), "none".into()),
+            ]
+        );
+    }
+
+    #[test]
+    fn browser_is_injected_even_without_a_dotenv() {
+        assert_eq!(child_env(&[], &[]), pairs(&[("BROWSER", "none")]));
+    }
+}
+
 fn resolve_program(program: &str, root: &Path, path_prepend: &[PathBuf]) -> PathBuf {
     let path = Path::new(program);
     if path.components().count() != 1 {
