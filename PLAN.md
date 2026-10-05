@@ -2,7 +2,7 @@
 
 > **One-liner:** `srvm` is a single-binary, zero-config CLI that detects how any repository is meant to run, launches it, absorbs the boring failures (missing deps, busy ports), and gets out of the way.
 
-This plan merges the original project brief with lessons distilled from building the same feature inside px0 (`serve.go`, `docs/internals/dev-server.md`). Where the brief and the px0 experience conflict, the px0-informed decisions below win — each divergence is flagged explicitly.
+This plan merges the original project brief with the locked design decisions below. Where the brief and a locked decision conflict, the decision wins — each divergence is flagged explicitly.
 
 ---
 
@@ -10,7 +10,7 @@ This plan merges the original project brief with lessons distilled from building
 
 ### 1.1 What srvm is
 
-A **launcher**, full stop. px0's `-s` proved the concept of marker-file detection + supervised launch inside a read-only code viewer. srvm extracts that idea into a dedicated tool whose entire job is the run lifecycle: detect → provision → arbitrate port → spawn → supervise → surface URL → clean shutdown. No viewer, no editor, no panes.
+A **launcher**, full stop. srvm's entire job is the run lifecycle: detect → provision → arbitrate port → spawn → supervise → surface URL → clean shutdown. Marker-file detection produces a fixed command the user would have typed; srvm supervises that process and absorbs the boring failures. No viewer, no editor, no panes.
 
 ### 1.2 Divergences from the original brief (locked decisions)
 
@@ -18,17 +18,17 @@ A **launcher**, full stop. px0's `-s` proved the concept of marker-file detectio
 |---|---|---|
 | "LaunchPad (`lp`)" branding | **`srvm`** everywhere | Consistent binary/repo name; cache dirs derive from it |
 | `~/.launchpad/runtimes/` cache | **Platform cache dir** (`dirs::cache_dir()/srvm`: `~/Library/Caches/srvm`, `~/.cache/srvm`, `%LOCALAPPDATA%\srvm`) | OS conventions; only needed once runtime fetching lands (M5) |
-| "Never install runtimes; embed a version manager day 1" | **Phased** — v0.1 resolves toolchains from PATH + shim dirs (like px0); auto-fetch is M5 | Runtime download is the highest-risk component; sequencing it after the launcher works avoids a big-bang first release. The seam is designed in from day 1 (§5.4) so M5 is additive |
+| "Never install runtimes; embed a version manager day 1" | **Phased** — v0.1 resolves toolchains from PATH + shim dirs; auto-fetch is M5 | Runtime download is the highest-risk component; sequencing it after the launcher works avoids a big-bang first release. The seam is designed in from day 1 (§5.4) so M5 is additive |
 | Both frontend + backend launched in one repo | **Single best match now; architected for N** | `detect()` returns `Vec<Spec>`; `Supervisor` owns `Vec<Child>`; v0.1 launches `specs[0]`, `--all` lands in M6 without a rewrite |
-| Language "Go or Rust" | **Rust** | User's call; every px0 mechanism has a Rust equivalent (§4.2) |
+| Language "Go or Rust" | **Rust** | User's call; the design maps cleanly onto Rust threads + channels (§4.2) |
 | Table claiming "Vercel CLI" comparison vs `lp` | Keep the positioning, drop the stale table | Same pitch: no Docker daemon, no host toolchains required (eventually), silent port shifting |
 
-### 1.3 What carries over from px0 `-s` (the proven parts)
+### 1.3 Core design invariants
 
 - **Pure detection, zero evaluation** — read marker files only, emit a fixed command the user would have typed. Never evaluate repo script bodies.
 - **First-match ordered rules** with fall-through when a marker's binary is missing.
 - **`BROWSER=none`** in child env so toolchains don't race srvm to open tabs.
-- **URL sniffing** — scan child output line-by-line for loopback URLs; regexes already designed (`serveURLRe`, `serveBareRe`, `normalizeServeURL`); **probe-hint fallback** — HEAD the framework's default port after ~12s of silence.
+- **URL sniffing** — scan child output line-by-line for loopback URLs (`URL_RE`/`BARE_RE`/`normalize_url` in `supervise/scan.rs`); **probe-hint fallback** — HEAD the framework's default port after ~12s of silence.
 - **Process-group kill** — Unix: own pgid + `SIGTERM` → grace → `SIGKILL`; Windows: `taskkill /F /T` or Job Objects. No orphan grandchildren.
 - **Auto-install** — `node_modules` missing + JS spec → `<pm> install` first (15-min cap), streamed like server output.
 - **Early-death classification** — non-zero exit < 3s = `failed` + last ~12 log lines; no auto-restart.
@@ -53,7 +53,7 @@ $ srvm
   ctrl-c to stop
 ```
 
-Deviation from the brief's mock: no emojis in output (px0 house style: `uiKV`/`uiStatus` key-value narration), runtime-download lines only appear once M5 lands, and multi-stack detection isn't claimed.
+Deviation from the brief's mock: no emojis in output (key-value narration: aligned lowercase labels), runtime-download lines only appear once M5 lands, and multi-stack detection isn't claimed.
 
 ### 2.2 CLI surface
 
@@ -63,11 +63,11 @@ Deviation from the brief's mock: no emojis in output (px0 house style: `uiKV`/`u
 | `srvm <dir>` | detect + launch in `<dir>` |
 | `srvm --dry-run [dir]` | print detection result(s) + resolved commands; exit 0. **Primary testing/debugging surface — build in M1** |
 | `srvm --no-open` | don't auto-open the app URL in a browser |
-| `srvm --port N` | arbitration starts at N instead of the spec's hint |
+| `srvm --port N` | arbitration starts at N instead of the spec's hint; `--port 0` picks an OS-assigned free port |
 | `srvm --select <tool\|n>` | when multiple stacks detected, pick one (v0.1 errors listing candidates without it) |
 | `srvm --no-install` | never run the spec's install step |
 | `srvm -v/--verbose` | child output unfiltered (skip flood-collapse) |
-| `srvm --quiet`, `--no-color` | narration controls (port px0's `uiQuiet`/`uiForcedColor`) |
+| `srvm --quiet`, `--no-color` | narration controls (`--quiet` suppresses narration; `--no-color`/`NO_COLOR` disables ANSI) |
 | `srvm --version` | print and exit |
 | `srvm --all` | **reserved for M6** — accept the flag, error "not yet supported" |
 
@@ -85,7 +85,7 @@ No subcommands in v0.1 — the bare invocation IS the product. (If a `doctor`/`r
 
 ## 3. Detection engine (M1 — the core asset)
 
-Port px0's full ordered rule table. **Order is semantics** — first match wins, so meta-frameworks precede their bundlers and heavyweight fallbacks come last.
+The detection engine is a fixed ordered rule table. **Order is semantics** — first match wins, so meta-frameworks precede their bundlers and heavyweight fallbacks come last.
 
 | # | Rule | Markers | Command | Port hint |
 |---|---|---|---|---|
@@ -114,16 +114,16 @@ Port px0's full ordered rule table. **Order is semantics** — first match wins,
 | 21 | compose | `compose.y[a]ml`/`docker-compose.y[a]ml` | `docker compose up` | — |
 | 22 | static | `index.html` at root | embedded file server | 8000 |
 
-Supporting machinery to port (all in `serve.go`, tests in `serve_test.go`):
+Supporting machinery (implemented; names match `src/detect/`):
 
-- `ServeSpec { name, tool, cmd, install, url_hint, is_static, port_env, port_args }` — **new fields** `port_env`/`port_args` for arbitration (§3.2)
-- `pickPM`: `packageManager` field → lockfile (`bun.lock[b]`/`pnpm-lock|workspace`/`yarn.lock|.yarnrc.yml`/`package-lock|npm-shrinkwrap`) → ubiquity order npm/pnpm/yarn/bun; `execCmd` per-PM runner (npx/pnpm exec/bun x/yarn)
-- `pickScript`: exact list then sorted `dev[:_-]*`
-- `fwBins`: dependency→args+port table (ordered as above)
-- `fileTargets`: col-0 `name:` parser skipping recipes/comments/`VAR :=`/`.PHONY`/patterns
-- `pyPrefix`/`pyDeps`/`pyAppModule`/`pyToolBin`: venv `.venv|venv|env` (POSIX+Windows layouts) → `uv|poetry|pipenv run` by lockfile → `python3|python`
-- `serveBinDirs`: `PATH` + `~/.bun/bin`, `~/.deno/bin`, `~/.local/share/pnpm`, `~/.volta/bin`, `~/.asdf/shims`, `~/.local/share/mise/shims`, `~/.pyenv/shims`, `~/.rbenv/shims` + Windows (`%LOCALAPPDATA%\pnpm`, `%USERPROFILE%\.bun|.deno\bin`, `%ProgramFiles%\nodejs`)
-- `serveFileContains` (1 MB probe cap), `readJSONC`/`stripJSONC` (comments + trailing commas)
+- `ServeSpec { name, command, install, url_hint, is_static, port }` — `port` is a `PortInjection` plan for arbitration (§3.2)
+- `pick_pm`: `packageManager` field → lockfile (`bun.lock[b]`/`pnpm-lock|workspace`/`yarn.lock|.yarnrc.yml`/`package-lock|npm-shrinkwrap`) → ubiquity order npm/pnpm/yarn/bun; `PackageManager::exec_command` per-PM runner (npx/pnpm exec/bun x/yarn)
+- `pick_script`: exact list then sorted `dev[:_-]*`
+- `framework_bins`/`script_framework`: dependency→args+port table (ordered as above); conservative exact-token script-body recognition
+- `file_targets`: col-0 `name:` parser skipping recipes/comments/`VAR :=`/`.PHONY`/patterns
+- `py_command`/`py_deps_contain`/`py_app_module`/`py_tool_name`: venv `.venv|venv|env` (POSIX+Windows layouts) → `uv|poetry|pipenv run` by lockfile → `python3|python`
+- `look_path`/`bin_dirs`: `PATH` + `~/.bun/bin`, `~/.deno/bin`, `~/.local/share/pnpm`, `~/.volta/bin`, `~/.asdf/shims`, `~/.local/share/mise/shims`, `~/.pyenv/shims`, `~/.rbenv/shims` + Windows (`%LOCALAPPDATA%\pnpm`, `%USERPROFILE%\.bun|.deno\bin`, `%ProgramFiles%\nodejs`)
+- `file_contains` (probe-cap), `read_jsonc`/`strip_jsonc` (comments + trailing commas)
 
 **Missing-binary fall-through is the key invariant**: a marker whose toolchain can't be resolved returns `None`, letting the next rule try — including per-rule inside one ecosystem (`bundle`→`jekyll`, binstub→`bundle`).
 
@@ -131,19 +131,20 @@ Supporting machinery to port (all in `serve.go`, tests in `serve_test.go`):
 
 `detect(root) -> Vec<Spec>` — collect **all** matching rules (not just first); `launch` uses `specs[0]` or `--select` pick; empty vec → friendly "no servable app detected" listing what was looked for.
 
-### 3.2 Port override matrix (new — px0 never rewrote ports)
+### 3.2 Port override matrix (implemented in M3)
 
-Each spec gains how to inject a shifted port. Where both env and args exist, **args win** (explicit beats ambient):
+Each spec carries a `PortInjection` plan: `Args` templates where every literal `{port}` is replaced with the selected port, `Env` for a single env pair, or `None`. Where both env and args exist, **args win** (explicit beats ambient):
 
 | Stack | Mechanism |
 |---|---|
-| npm/PM scripts | `PORT=<n>` env (universal convention; react-scripts/vite/next honor it) — plus `PORT` is harmless when ignored |
-| deno task | `PORT` env |
-| wrangler | `--port <n>` arg (or `PORT`) |
-| vite/astro/next/nuxt/remix binaries | `--port <n>` arg where supported; else `PORT` env |
+| npm/PM script exactly matching a known framework command (`vite`, `next dev`, …) | forwarded args per the framework row — npm needs a `--` separator, pnpm/yarn/bun take them directly |
+| other npm/PM script bodies, deno task, turbo/nx | `PORT` env — best-effort convention, honored by many dev servers, harmless when ignored |
+| wrangler | `--port <n>` |
+| astro/next/nuxt/ng/docusaurus/hexo/vite binaries | `--port <n>` (gatsby `-p`) |
+| remix dev | `PORT` env — classic Remix `--port` only sets the HMR port, not the app port |
 | django | append port arg: `runserver <n>` |
 | uvicorn | `--port <n>` |
-| flask | `--port <n>` (or `FLASK_RUN_PORT`) |
+| flask | `--port <n>` |
 | rails | `-p <n>` |
 | jekyll | `-P <n>` |
 | rackup | `-p <n>` |
@@ -153,10 +154,12 @@ Each spec gains how to inject a shifted port. Where both env and args exist, **a
 | laravel | `--port=<n>` |
 | trunk | `--port <n>` |
 | cargo/go/procfile/make/just/task | `PORT` env only (can't know) |
-| compose | none — skip arbitration, warn |
-| static | ours — bind directly |
+| compose | none — warn when an override is requested (`--port` or a port hint exists) |
+| static | owned in-process listener — srvm binds and serves directly; ambient `PORT` is ignored |
 
-**Arbitration algorithm**: probe `TcpListener::bind(("127.0.0.1", port))` — success → use it; `AddrInUse` → walk `port+1 ..= port+100`; still none → OS-assigned `:0`. Inject via spec mechanism → then **verify against sniffed URL**; if child bound elsewhere anyway, adopt the sniffed URL and print a note ("app reports <url>, override ignored").
+Script-body recognition is deliberately conservative: an exact `framework-bin + args` token match (plus bare `vite`) earns the framework's hint and args forwarding; anything else (`vite --host`, `next dev -p 5000`, compound shell) stays an opaque `PORT`-env spec.
+
+**Arbitration algorithm**: pick the start port — explicit `--port` first (including `0`), then an existing `PORT`-style env value for Env-injection specs, then the spec's `url_hint`. Bind `TcpListener` on `127.0.0.1` — `AddrInUse` → walk `start+1 ..= start+100`; still none → OS-assigned `:0`; any other bind error aborts. The listener is held while the command is rendered, dropped immediately before spawn (FDs can't be handed to arbitrary apps — a racer can still steal the port, so `srvm` **verifies against the sniffed URL** and prints `requested <n>, app reports <url>; override ignored` when they disagree). Hint probing uses the selected port, never the stale default. `--port` never kills whatever holds the port.
 
 ---
 
@@ -168,46 +171,47 @@ Each spec gains how to inject a shifted port. Where both env and args exist, **a
 src/
   main.rs        CLI parse (clap), orchestration, signal handling
   detect/
-    mod.rs       detect() -> Vec<Spec>; ServeSpec, ServeRule
-    js.rs        pickPM, pmTable, execCmd, pickScript, fwBins, rulePackageJSON/ruleDeno/ruleWrangler
-    targets.rs   fileTargets, targetSpec, ruleMake/ruleJust/ruleTaskfile, ruleProcfile
-    python.rs    pyPrefix, pyDeps, pyAppModule, pyToolBin, ruleDjango/Uvicorn/Flask
-    misc.rs      rails/jekyll/rackup/hugo/mkdocs/phoenix/laravel/trunk/cargo/go/compose/static
-    probe.rs     fileExists, dirExists, fileContains, readJSONC, stripJSONC
-    binpath.rs   lookPathIn, binDirs (PATH + shim dirs), cached
+    mod.rs       detect() -> Vec<Spec>; ServeSpec, CommandSpec, PortInjection
+    js.rs        pick_pm, PackageManager::exec_command, pick_script, framework_bins/script_framework, rule_package_json/rule_deno/rule_wrangler
+    targets.rs   file_targets, rule_make/rule_just/rule_task, rule_procfile
+    python.rs    py_command, py_deps_contain, py_app_module, py_tool_name, rule_django/rule_uvicorn/rule_flask
+    misc.rs      rules() — rails/jekyll/rackup/hugo/mkdocs/phoenix/laravel/trunk/cargo/go/compose/static
+    probe.rs     file_exists, dir_exists, file_contains, read_to_string, read_jsonc, strip_jsonc
+    binpath.rs   look_path, bin_dirs (PATH + shim dirs)
   ports.rs       probe/arbitrate/inject
   supervise/
-    mod.rs       Supervisor { children: Vec<Child> } — N-ready from day 1
-    child.rs     Child { spec, proc, state, url, ring, done } — spawn, install step, wait, classify exit
+    mod.rs       run() — spawn, install step, wait, classify exit; Supervisor { children: Vec<Child> } refactor lands with M6
     pump.rs      io pump: child stdout/stderr → ring buffer + dim echo + line scanner → url
-    scan.rs      URL regexes (serveURLRe, serveBareRe, normalize), probeHint equivalent
+    scan.rs      URL regexes (URL_RE, BARE_RE, normalize_url), ANSI strip
     kill.rs      process-group teardown: #[cfg(unix)] setsid+killpg SIGTERM→SIGKILL; #[cfg(windows)] Job Object / taskkill /T
     ring.rs      tail ring buffer (64 KB)
-    collapse.rs  noiseKey normalization + flood folding (port of dimWriter)
+    collapse.rs  noise_key normalization + flood folding
+    open.rs      browser opening: $BROWSER, darwin open, windows rundll32/cmd start, WSL branch + xdg-open/sensible-browser/gio/chrome fallbacks
   runtime/
     mod.rs       ToolchainResolver trait — v0.1 PathResolver; seam for M5 fetchers
     path.rs      resolve tool name → absolute path via binpath
-  open.rs        openBrowser port: $BROWSER, darwin open, windows rundll32/cmd start, WSL branch + xdg-open/sensible-browser/gio/chrome fallbacks
   ui.rs          narration primitives (kv/status/bullet/hint), color + NO_COLOR/--no-color, quiet
-  staticsrv.rs   embedded file server for rule 22 (tiny_http or ~100-line hand-rolled std::net)
+  staticsrv.rs   embedded loopback file server for rule 22 (httparse request parsing, cap-std
+                 relative opens for confinement, 4 bounded workers + bounded socket queue)
 ```
 
 ### 4.2 Dependency policy
 
-Lean like px0; every dep must justify itself:
+Lean — every dep must justify itself:
 
 | Crate | For |
 |---|---|
 | `clap` (derive) | CLI surface |
-| `serde`, `serde_json` | package.json/deno.json parsing (+ `json5` or hand-ported `stripJSONC` for .jsonc) |
-| `regex` | URL sniffing, noise collapse, fileTargets |
+| `serde`, `serde_json` | package.json/deno.json parsing (+ `strip_jsonc` for .jsonc) |
+| `regex` | URL sniffing, noise collapse, file_targets |
 | `anyhow` | error paths (keep `thiserror` for lib-grade errors if split later) |
 | `ctrlc` | SIGINT/SIGTERM handling |
 | `dirs` | platform cache dir (needed at M5; cheap to add now) |
-| `tiny_http` *(evaluate)* | static fallback; alternative is a minimal hand-rolled responder |
+| `httparse` | request parsing for the embedded static server |
+| `cap-std` | capability-relative opens confining static paths to the served root (no symlink/traversal escape) |
 | `tempfile`, `assert_cmd` *(dev)* | fixture + CLI tests |
 
-**Deliberately avoided**: `tokio` (threads + channels suffice — px0 used goroutines the same way; async buys nothing here and doubles conceptual weight), `mise`/`asdf` linking (M5 is a downloader, not an embedded manager).
+**Deliberately avoided**: `tokio` (threads + channels suffice; async buys nothing here and doubles conceptual weight), `mise`/`asdf` linking (M5 is a downloader, not an embedded manager).
 
 ### 4.3 Supervisor model (N-ready)
 
@@ -222,9 +226,9 @@ struct Child {
 }
 ```
 
-v0.1 runs `children[0]` only; `--select` picks index. Threads: one pump thread per child stream (or one merged `stderr+stdout` pipe like px0: `cmd.stderr(Stdio::piped())`→`stdout` merge via `Command::new` + `[Stdio]` — px0 merged by pointing both at one writer; in Rust spawn one thread per stream feeding one `Mutex<Pump>`), one probe-hint timer thread, main thread waits on children + signals.
+v0.1 runs `children[0]` only; `--select` picks index. Threads: one pump thread per child stream feeding one `Mutex<Pump>`, one probe-hint timer thread, main thread waits on children + signals.
 
-**Stop sequence**: `stopped=true` → SIGTERM to pgid (unix) / taskkill /T (win) → 1.5s grace → SIGKILL. Static server: graceful shutdown of the listener. Race: if stop arrives during spawn, kill immediately after `proc` assigned (px0's closed race — replicate).
+**Stop sequence**: `stopped=true` → SIGTERM to pgid (unix) / taskkill /T (win) → 1.5s grace → SIGKILL. Static server: graceful shutdown of the listener. Race: if stop arrives during spawn, kill immediately after the child handle is stored — the stop flag is re-checked right after assignment, closing the spawn-window race.
 
 ### 4.4 The toolchain-resolution seam (for M5)
 
@@ -236,31 +240,44 @@ trait ToolchainResolver {
 ```
 
 - **v0.1**: `PathResolver` — binpath dirs only. Missing → error with *actionable* message ("node not found — install it, or wait for `srvm` auto-fetch in a future release"). Rules already return `None` on missing bins so detection degrades rather than dies.
-- **M5**: `FetchingResolver` wrapping `PathResolver` — on miss, download official dist (nodejs.org, python-build-standalone, go.dev, rustup-init) into `cache_dir()/srvm/runtimes/<tool>/<ver>/`, verify SHA-256, return shim path. Detectors consult a `wanted_version(root)` hint (`.nvmrc`, `packageManager`, `.python-version`, `rust-toolchain.toml`, `go.mod` `go` directive) — **design the trait to take that hint now** so M5 needs no refactor.
+- **M5**: `FetchingResolver` wrapping `PathResolver` — on miss, download an official archive (nodejs.org, python-build-standalone, go.dev/dl, static.rust-lang.org rustc+cargo components) into `cache_dir()/srvm/runtimes/<tool>/<ver>/`, verify SHA-256, extract, prepend the bin dir to the child PATH. Rust is not installed by executing `rustup-init`: that installer downloads further artifacts and would write outside the verified extract sandbox. `rust-toolchain.toml` / `rust-toolchain` still select the channel. Version hints: `.nvmrc` / `.node-version`, `.python-version`, `go.mod` (`toolchain` exact, language line as major.minor), `rust-toolchain.toml`.
+
+**Upstream formats (verified live 2026-10):**
+
+- **Node**: `GET nodejs.org/dist/index.json` → array newest-first, `{version:"vX.Y.Z", files:[...], lts, npm}`. `GET /dist/{ver}/SHASUMS256.txt` → `<sha256>  <name>` lines covering every artifact. Archive URL `/dist/{ver}/node-{ver}-{plat}.{ext}` — note the `files` tags ≠ filename tokens (`osx-arm64-tar` → `darwin-arm64.tar.gz`, `win-x64-zip` → `win-x64.zip`); map via the SHASUMS filename, not the `files` tag. `.tar.gz` exists for all unix platforms (no xz dep needed); Windows has `.zip` and a bare `win-x64/node.exe` (no npm).
+- **Python**: `GET api.github.com/repos/astral-sh/python-build-standalone/releases/latest` → date-tagged releases, every asset carries `digest: "sha256:…"` inline (plus a `SHA256SUMS` asset). Assets: `cpython-{ver}+{tag}-{triple}-install_only[_stripped].tar.gz` — triples `aarch64|x86_64-apple-darwin`, `x86_64|aarch64-unknown-linux-gnu|musl` (plus `x86_64_v2/v3/v4` microarch variants), `x86_64|aarch64-pc-windows-msvc`; `-freethreaded` variants exist and must be filtered out. One release ships all maintained CPython lines (3.10–3.15) — pick the asset matching `wanted_version`.
+- **Deps this implies**: `ureq` (sync HTTP — fits the no-tokio policy), `sha2`, `tar`+`flate2` (+`zip` for win Node). No xz/zstd needed if `.tar.gz`/`install_only` artifacts are chosen consistently.
+- **Plumbing**: `resolve()`'s `PathBuf` is currently discarded and `spawn` uses bare names — M5 must either inject resolved absolute paths into spawn **or** prepend the shim dir to the child's `PATH`. Prefer PATH-prepend: grandchildren (`npm` scripts calling `node`, `sh`) resolve by name through the same shim.
 
 ---
 
 ## 5. Milestones
 
-| Milestone | Deliverable | Exit criteria |
-|---|---|---|
-| **M0** Scaffold | `cargo init`, clap CLI skeleton, CI (fmt/clippy/test on macOS+Linux+Windows), LICENSE/README/PLAN | `cargo build` green on CI |
-| **M1** Detection | `probe.rs`, `binpath.rs`, all 22 rules, `detect() -> Vec<Spec>`, `--dry-run` | Full rule table covered by fixture tests (tempdir markers + stub PATH binaries — port `serve_test.go` cases verbatim); `--dry-run` correct on a fixture matrix |
-| **M2** Supervisor | spawn + `BROWSER=none`, install step (15-min cap), pump→ring+dim+collapse, URL scan + probeHint, open browser, Ctrl+C group kill, exit classification | Launch a real `vite`/`python -m http.server` fixture; orphaned-grandchild test (spawn `sh -c "sleep 999"`, kill, assert gone); early-death dumps tail |
-| **M3** Port arbitration | probe/walk/inject per matrix, override verify + "ignored" note | Occupied-port test (hold 3000, assert app lands on 3001 and announced URL matches reality) |
-| **M4** Static fallback | embedded file server for `index.html` repos | `srvm` in a bare-HTML dir serves it |
-| **M5** Runtime fetch | `FetchingResolver`: node + python-build-standalone first, then go/rust; checksum verify; `.nvmrc`/`.python-version`/`rust-toolchain.toml`/`go.mod` hints | `srvm` on a PATH-scrubbed env (mise-style test) boots a Node and a Python app |
-| **M6** Multi-stack | `--all` + `--select`; per-child log prefixes (`[next]`, `[api]`); supervisor already N-shaped | Next+FastAPI fixture launches both, each gets its own URL line |
-| **M7** Distribution | release CI matrix via `cargo-dist` (or manual goreleaser-style), install.sh, brew/scoop/winget taps, shell completions, man page | One-command install on all three OSes |
+| Milestone | Status | Deliverable | Exit criteria |
+|---|---|---|---|
+| **M0** Scaffold | ✅ Done | `cargo init`, clap CLI skeleton, CI (fmt/clippy/test on macOS+Linux+Windows), LICENSE/README/PLAN | `cargo build` green on CI |
+| **M1** Detection | ✅ Done | `probe.rs`, `binpath.rs`, all 22 rules, `detect() -> Vec<Spec>`, `--dry-run`, `--select` | Full rule table covered by fixture tests (tempdir markers + `StubResolver` — implemented in `detect::tests`, 8 fixtures exercising every rule family + missing-binary fall-through); `--dry-run` correct on a fixture matrix |
+| **M2** Supervisor | ✅ Done | spawn + `BROWSER=none`, install step (15-min cap, Ctrl+C-safe), pump→ring+ANSI-dim+collapse (`--no-color`/`NO_COLOR`), URL scan + `probe_hint` (hand-rolled HEAD over `TcpStream`), `open_browser` (`$BROWSER` w/ `%s`, WSL, Linux fallback chain), Ctrl+C group kill, exit classification | Remaining from exit criteria: real-toolchain e2e (`vite`/`python -m http.server`) and orphaned-grandchild assertion are not yet automated; early-death tail IS tested (`supervisor_reports_early_failure_tail`) |
+| **M3** Port arbitration | ✅ Done | `ports.rs`: requested/explicit/inherited/hint resolution, bounded probe-walk listener reservation, `{port}` template + env injection, sniffed-URL verify + "ignored" note, hardened HTTP probe hint | Occupied-port integration tests assert a real listener lands on the shifted port and the announced URL matches reality (see `tests/ports.rs`; 12s probe fallback exercised once) |
+| **M4** Static fallback | ✅ Done | `staticsrv.rs`: in-process loopback HTTP server on the M3-reserved `TcpListener` (no drop/rebind), httparse + cap-std confinement, 4 bounded workers, GET/HEAD only | `srvm` in a bare-HTML dir serves it with an empty `PATH`; `tests/staticsrv.rs` covers MIME, traversal/symlink/dotfile denial (real sibling secrets), Host validation, request limits + 408 deadline, index-gated redirects, streaming/range semantics, read-only roots, `--no-open` positive/negative control, and signal shutdown |
+| **M5** Runtime fetch | ✅ Done | node, python-build-standalone, go.dev/dl, and rustc+cargo component archives. SHA-256 before unpack, safe extract, PATH prepend. Hints: `.nvmrc`/`.node-version`, `.python-version`, `go.mod`, `rust-toolchain.toml` | PATH-scrubbed fixture boots for Node, Python, Go, and Rust (`tests/runtime_boot.rs`). Live upstream tarballs are not in the default suite. Rust does not execute `rustup-init` |
+| **M6** Multi-stack | ⬜ Flag reserved | `--all` + `--select`; per-child log prefixes (`[next]`, `[api]`); supervisor already N-shaped | Next+FastAPI fixture launches both, each gets its own URL line. *`--select` already works; `--all` errors cleanly* |
+| **M7** Distribution | ⬜ Not started | release CI matrix via `cargo-dist` (or manual goreleaser-style), install.sh, brew/scoop/winget taps, shell completions, man page | One-command install on all three OSes |
 
-Sequencing rationale: M1+M2 is the product's spine and is directly port-verifiable; M3 differentiates (nobody else does silent shifting); M5 is the riskiest and benefits most from a stable foundation.
+### Current status snapshot (as of 2026-10-04, `dev/akriti`)
+
+**Done:** M0–M5. Missing `node`/`npm`/`npx`, `python`/`python3`, `go`, and `cargo`/`rustc` are fetched into the platform cache (`dirs::cache_dir()/srvm`, override `SRVM_CACHE_DIR`), SHA-256 checked before unpack, and the bin directory prepended to the child PATH. The same prepend reaches repo-local interpreters (`.venv/bin/python` — no wasted fetch) and tools resolved from shim dirs that aren't on PATH. Version hints: `.nvmrc` / `.node-version`, `.python-version`, `go.mod` (`toolchain` is exact; the `go` language line selects that major.minor), and `rust-toolchain.toml` / `rust-toolchain`. No hint means newest Node LTS, newest stable CPython, newest stable Go, and Rust stable. Dry-run does not download. Rust uses official rustc and cargo component tarballs from static.rust-lang.org rather than executing `rustup-init`, so the trust boundary stays "verify, then extract" for every runtime — consequence: `nightly`/`beta` channels error clearly instead of installing (component archives are dated, not `X.Y.Z`). Verified on macOS: `cargo fmt --check`, `cargo clippy --all-targets -- -D warnings`, and `cargo test`, including PATH-scrubbed fixture boots for all four runtimes. Live upstream downloads are not in the default suite. Supervision is still a `run()` function over one spec rather than a `Supervisor` struct of `Vec<Child>` — M6 still needs that refactor. M2's real-framework e2e and arbitrary nested process-tree cleanup remain unverified. Windows/Linux verification still requires CI.
+
+**Next up:** M6 multi-stack (`--all`).
+
+Sequencing rationale: M1+M2 is the product's spine and is directly port-verifiable; M3 differentiates (few launchers rewrite the port into the app's own flag/env and then verify by sniffing); M5 is the riskiest and benefits most from a stable foundation.
 
 ---
 
 ## 6. Testing strategy
 
-- **Unit**: `fileTargets` parser, `pickScript`/`pickPM`, `stripJSONC`, URL regexes against real captured lines (Vite/Next/Django/Uvicorn/Phoenix/ANSI — copy px0's cases), `noiseKey` collapse, port-walk logic against a held socket.
-- **Fixture** (the `serve_test.go` pattern): `tempdir` + marker files + stub binaries (shell scripts on unix, `.bat`/tiny `.exe` on Windows) injected via a private `binDirs` override — detection never depends on the host toolchain.
+- **Unit**: `file_targets` parser, `pick_script`/`pick_pm`, `strip_jsonc`, URL regexes against real captured lines (Vite/Next/Django/Uvicorn/Phoenix/ANSI), `noise_key` collapse, port-walk logic against a held socket.
+- **Fixture**: `tempdir` + marker files + stub binaries (shell scripts on unix, `.bat`/tiny `.exe` on Windows) injected via a private `bin_dirs`/`ToolResolver` override — detection never depends on the host toolchain.
 - **Integration**: `assert_cmd` on `--dry-run` matrix; gated "e2e" tests (`#[ignore]` + env flag) that really spawn `python3 -m http.server`-equivalents.
 - **Verification per change**: `cargo fmt --check`, `cargo clippy -- -D warnings`, `cargo test`, `cargo build --release`.
 
@@ -271,26 +288,26 @@ Sequencing rationale: M1+M2 is the product's spine and is directly port-verifiab
 | Risk | Mitigation |
 |---|---|
 | Windows process-tree kill is weaker than unix pgid | Use Job Objects (`windows-rs`) with `KILL_ON_JOB_CLOSE`, fallback `taskkill /F /T` — decide in M2 |
-| `PORT` ignored by a framework | Per-spec `port_args` where available; post-inject verification against sniffed URL + honest "override ignored" note |
+| `PORT` ignored by a framework | Per-spec args injection where available; post-inject verification against sniffed URL + honest "override ignored" note |
 | Runtime fetch trust (M5) | Pin SHA-256s per release; HTTPS only; verify before exec; document provenance per dist |
-| `.cmd`/`.bat` shims on Windows can't take signals | Same as px0: kill the tree, never just the shim PID |
+| `.cmd`/`.bat` shims on Windows can't take signals | Kill the tree, never just the shim PID |
 | Monorepo false positives (root package.json but real app is deeper) | `--select` + `--dry-run` escape hatches; `turbo.json`/`nx.json` rules help; recursive subdir detection is a possible M6+ exploration — **not** v0.1 |
 | Repos with several matching rules where first is wrong | `detect()` returns all; `--dry-run` shows the full ranked list so `--select` is discoverable |
-| Port race between probe and bind | Arbitrate → inject → verify-by-sniff covers it; the probe listener is dropped before spawn |
-| AI-generated repos often lack lockfiles/scripts entirely | `fwBins` dep table + static fallback catch most; M5 covers missing PMs themselves |
+| Port race between probe and bind | The reservation is held until just before spawn, then dropped. If a racer claims the port and the child dies on bind before announcing, srvm re-reserves from the next port and retries (bounded, twice). When the app binds elsewhere and prints a URL, srvm reports that actual URL. |
+| AI-generated repos often lack lockfiles/scripts entirely | `framework_bins` dep table + static fallback catch most; M5 covers missing PMs themselves |
 
 ## 8. Explicit non-goals (v1)
 
-- Web UI / embedded app panes (the px0 iframe-proxy idea is **obsolete** — srvm is a CLI; if a dashboard is ever wanted, a TUI via `ratatui` or thin local web UI is a separate product decision)
+- Web UI / embedded app panes (srvm is a CLI; if a dashboard is ever wanted, a TUI via `ratatui` or thin local web UI is a separate product decision)
 - Config files (`srvm.toml`) — the repo is the config; escape hatches are flags
 - Docker/VM isolation — srvm launches on the host by design
-- Telemetry (px0 had opt-out anonymous events; srvm ships without any — revisit only with explicit user demand)
+- Telemetry (srvm ships without any — revisit only with explicit user demand)
 - Auto-restart / crash-loop supervision — fail loudly once
 - Plugin architecture
 
 ## 9. Open questions for the maintainer
 
-1. **`--port` semantics**: arbitration *start* (current spec) vs *exact* port with failure if busy? Plan implements start; exact could be `--port!` or `--exact-port` later.
-2. **Static server binding**: serve on `127.0.0.1` only (px0 posture) or honor `--host`? Recommend loopback-only v0.1 — expose flag if requested.
+1. **`--port` semantics**: settled — it is the arbitration *start* (with `0` meaning OS-assigned). An exact-port flag (`--exact-port`) could be added later if requested.
+2. **Static server binding**: settled — loopback `127.0.0.1` only, no `--host` flag in v0.1; expose it only if requested.
 3. **Name collision check**: `srvm` is short for "serve 'em"; verify crates.io/`brew` name availability before M7 publish — have `srv`/`srve`/`srvup` as backups.
 4. **Minimum Rust version**: suggest MSRV = latest stable at M0; edition 2024 (check `cargo` default).
