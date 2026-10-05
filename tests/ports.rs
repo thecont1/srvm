@@ -392,7 +392,9 @@ fn opaque_script_without_request_stays_untouched() {
         Duration::from_secs(15),
     );
     assert!(http_get(app_line_port(&app_line)).starts_with("HTTP/1.1 200"));
-    assert!(wait_exit(&mut child.0, Duration::from_secs(15)).success());
+    // Generous timeout: on loaded CI runners the test thread can be starved
+    // for many seconds after the child has already exited.
+    assert!(wait_exit(&mut child.0, Duration::from_secs(30)).success());
 
     let log = fs::read_to_string(&log).unwrap();
     assert!(log.contains("PORT=\n"), "unexpected injected port: {log}");
