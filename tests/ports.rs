@@ -193,8 +193,13 @@ fn unrelated_early_failure_is_surfaced_even_when_the_port_is_claimed() {
     // three-second early-failure window (a timing detail unit-tested
     // elsewhere), so assert the outcome: the failure is surfaced with the
     // app's own tail, never silently dropped.
+    let exit_text = if cfg!(windows) {
+        "exit code: 7"
+    } else {
+        "exit status: 7"
+    };
     assert!(
-        stderr.contains("exit status: 7") && stderr.contains("boom"),
+        stderr.contains(exit_text) && stderr.contains("boom"),
         "{stderr}"
     );
 
