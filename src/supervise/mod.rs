@@ -128,9 +128,30 @@ pub fn run_many(root: &Path, items: &[LaunchItem], options: SupervisorOptions) -
         requested.push(plan_port(item.spec, options, Some(&item.label))?);
     }
 
+    for item in items {
+        if !options.no_install
+            && let Some(install) = &item.spec.install
+        {
+            println!(
+                "  step       {}installing dependencies — {}",
+                labeled(Some(&item.label)),
+                install.command_line()
+            );
+            run_install(
+                root,
+                install,
+                options,
+                &item.path_prepend,
+                Some(&item.label),
+            )?;
+        }
+    }
+
     // Hold every reservation while selecting so siblings cannot win the same
-    // port. With --port N the first app starts at N and each later app starts
-    // one past the previously selected port; --port 0 is OS-assigned per app.
+    // port, and release them only right before the workers spawn so installs
+    // never widen the reservation-to-bind gap. With --port N the first app
+    // starts at N and each later app starts one past the previously selected
+    // port; --port 0 is OS-assigned per app.
     let mut held = Vec::with_capacity(items.len());
     let mut selected = Vec::with_capacity(items.len());
     let mut previous = None;
@@ -159,25 +180,6 @@ pub fn run_many(root: &Path, items: &[LaunchItem], options: SupervisorOptions) -
     }
     drop(held);
 
-    for item in items {
-        if !options.no_install
-            && let Some(install) = &item.spec.install
-        {
-            println!(
-                "  step       {}installing dependencies — {}",
-                labeled(Some(&item.label)),
-                install.command_line()
-            );
-            run_install(
-                root,
-                install,
-                options,
-                &item.path_prepend,
-                Some(&item.label),
-            )?;
-        }
-    }
-
     let opened = Arc::new(AtomicBool::new(false));
     thread::scope(|scope| -> Result<()> {
         let (tx, rx) = mpsc::channel();
@@ -204,8 +206,12 @@ pub fn run_many(root: &Path, items: &[LaunchItem], options: SupervisorOptions) -
         let mut pending = items.len();
         let mut deadline = None;
         while pending > 0 {
+            // Workers still alive past the teardown deadline would make the
+            // scope block on join; kill what is registered and exit instead.
             if deadline.is_some_and(|d: Instant| Instant::now() >= d) {
-                break;
+                eprintln!("  failed     sibling apps did not stop within 5s; forcing exit");
+                terminate_registered_children();
+                std::process::exit(1);
             }
             match rx.recv_timeout(Duration::from_millis(50)) {
                 Ok(result) => {
@@ -676,9 +682,7 @@ fn error_with_tail(message: String, ring: &Arc<Mutex<Ring>>, label: Option<&str>
 }
 
 fn install_signal_handler() -> Result<()> {
-    let children = CURRENT_CHILDREN
-        .get_or_init(|| Arc::new(Mutex::new(Vec::new())))
-        .clone();
+    CURRENT_CHILDREN.get_or_init(|| Arc::new(Mutex::new(Vec::new())));
 
     ctrlc::set_handler(move || {
         if let Some(stop) = STATIC_STOP.get()
@@ -687,6 +691,14 @@ fn install_signal_handler() -> Result<()> {
             return;
         }
         SHUTDOWN.store(true, Ordering::SeqCst);
+        terminate_registered_children();
+        std::process::exit(130);
+    })?;
+    Ok(())
+}
+
+fn terminate_registered_children() {
+    if let Some(children) = CURRENT_CHILDREN.get() {
         let pids = children
             .lock()
             .unwrap_or_else(|err| err.into_inner())
@@ -694,9 +706,7 @@ fn install_signal_handler() -> Result<()> {
         for pid in pids {
             kill::terminate_tree_by_pid(pid);
         }
-        std::process::exit(130);
-    })?;
-    Ok(())
+    }
 }
 
 fn register_child(pid: u32) {

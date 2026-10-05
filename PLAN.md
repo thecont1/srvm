@@ -53,7 +53,7 @@ $ srvm
   ctrl-c to stop
 ```
 
-Deviation from the brief's mock: key-value narration uses aligned lowercase labels without decorative symbols. Runtime-download lines are implemented since M5 and appear only when fetching is needed; multi-stack launch is not yet implemented.
+Deviation from the brief's mock: key-value narration uses aligned lowercase labels without decorative symbols. Runtime-download lines are implemented since M5 and appear only when fetching is needed.
 
 ### 2.2 CLI surface
 
