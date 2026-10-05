@@ -13,6 +13,19 @@ use tempfile::{TempDir, tempdir};
 
 #[test]
 fn occupied_start_shifts_env_port_and_install_sees_no_port() {
+    // srvm releases its reservation before the child can bind; a parallel
+    // port-0 assign (Windows hands them out sequentially) can snipe the
+    // selected port in the gap, killing the fixture before it announces.
+    // A lost handoff is a legitimate outcome, so retry a fresh scenario.
+    for _ in 0..3 {
+        if shift_attempt().is_some() {
+            return;
+        }
+    }
+    panic!("srvm never completed a shifted launch in 3 attempts");
+}
+
+fn shift_attempt() -> Option<()> {
     let (held, busy, _first_free) = occupied_with_free_next();
     let repo = package_repo(r#"{"scripts":{"dev":"node server.js"}}"#);
     let bin = tempdir().unwrap();
@@ -25,27 +38,14 @@ fn occupied_start_shifts_env_port_and_install_sees_no_port() {
     let out = line_reader(child.0.stdout.take().unwrap());
     let _err = line_reader(child.0.stderr.take().unwrap());
 
-    // The exact successor may be grabbed by a parallel test between the
-    // free-check and srvm's reserve (Windows hands out port-0 assigns
-    // sequentially), so assert the shift rather than a specific port.
-    let port_line = wait_line(
+    let port_line = try_line(
         &out,
         &format!("port       {busy} busy -> "),
         Duration::from_secs(15),
-    );
-    let selected: u16 = port_line
-        .rsplit("->")
-        .next()
-        .unwrap()
-        .trim()
-        .parse()
-        .unwrap();
+    )?;
+    let selected: u16 = port_line.rsplit("->").next()?.trim().parse().ok()?;
     assert_ne!(selected, busy);
-    wait_line(
-        &out,
-        &format!("app        http://127.0.0.1:{selected}"),
-        Duration::from_secs(15),
-    );
+    announced_or_exit(&mut child.0, &out, Duration::from_secs(15))?;
 
     let response = http_get(selected);
     assert!(response.starts_with("HTTP/1.1 200"), "{response}");
@@ -62,10 +62,20 @@ fn occupied_start_shifts_env_port_and_install_sees_no_port() {
         "server env missing shifted port: {log}"
     );
     assert!(log.contains("ARGS=run dev"), "{log}");
+    Some(())
 }
 
 #[test]
 fn port_zero_injects_os_assigned_port_via_args() {
+    for _ in 0..3 {
+        if port_zero_attempt().is_some() {
+            return;
+        }
+    }
+    panic!("srvm never completed a port-0 launch in 3 attempts");
+}
+
+fn port_zero_attempt() -> Option<()> {
     let repo = tempdir().unwrap();
     let bin = tempdir().unwrap();
     stub_exec(bin.path(), "wrangler");
@@ -78,20 +88,13 @@ fn port_zero_injects_os_assigned_port_via_args() {
     let out = line_reader(child.0.stdout.take().unwrap());
     let _err = line_reader(child.0.stderr.take().unwrap());
 
-    let port_line = wait_line(&out, "port       selected ", Duration::from_secs(15));
-    let selected: u16 = port_line
-        .split_whitespace()
-        .last()
-        .unwrap()
-        .parse()
-        .unwrap();
+    let port_line = try_line(&out, "port       selected ", Duration::from_secs(15))?;
+    let selected: u16 = port_line.split_whitespace().last()?.parse().ok()?;
     assert_ne!(selected, 0);
 
-    let app_line = wait_line(
-        &out,
-        "app        http://127.0.0.1:",
-        Duration::from_secs(15),
-    );
+    // Another process may claim the selected port between reservation
+    // release and the fixture bind; a dead child means a lost handoff.
+    let app_line = announced_or_exit(&mut child.0, &out, Duration::from_secs(15))?;
     assert_eq!(app_line_port(&app_line), selected);
 
     let log = fs::read_to_string(&log).unwrap();
@@ -102,6 +105,7 @@ fn port_zero_injects_os_assigned_port_via_args() {
 
     assert!(http_get(selected).starts_with("HTTP/1.1 200"));
     assert!(wait_exit(&mut child.0, Duration::from_secs(15)).success());
+    Some(())
 }
 
 #[test]
@@ -319,6 +323,15 @@ fn cli_rejects_out_of_range_port() {
 
 #[test]
 fn silent_server_is_found_by_probing_the_shifted_port() {
+    for _ in 0..3 {
+        if silent_attempt().is_some() {
+            return;
+        }
+    }
+    panic!("srvm never completed a silent launch in 3 attempts");
+}
+
+fn silent_attempt() -> Option<()> {
     let (mut decoy, decoy_port, _first_free) = decoy_with_free_next();
     let repo = package_repo(r#"{"scripts":{"dev":"node server.js"}}"#);
     let bin = tempdir().unwrap();
@@ -333,14 +346,10 @@ fn silent_server_is_found_by_probing_the_shifted_port() {
     let out = line_reader(child.0.stdout.take().unwrap());
     let _err = line_reader(child.0.stderr.take().unwrap());
 
-    let app_line = wait_line(
-        &out,
-        "app        http://127.0.0.1:",
-        Duration::from_secs(25),
-    );
-    // Parallel tests can claim decoy_port + 1 between the free-check and
-    // srvm's reserve; what matters is that srvm shifted off the busy port
-    // and announced a port the child is actually serving.
+    let app_line = announced_or_exit(&mut child.0, &out, Duration::from_secs(25))?;
+    // What matters is that srvm shifted off the busy port and announced a
+    // port the child is actually serving — the exact successor can be
+    // claimed by a parallel test before srvm's reserve.
     let announced = app_line_port(&app_line);
     assert_ne!(
         announced, decoy_port,
@@ -358,6 +367,7 @@ fn silent_server_is_found_by_probing_the_shifted_port() {
 
     let _ = http_get(decoy_port);
     let _ = decoy.0.wait();
+    Some(())
 }
 
 fn package_repo(pkg: &str) -> TempDir {
@@ -489,15 +499,41 @@ fn line_reader(stream: impl Read + Send + 'static) -> mpsc::Receiver<String> {
 }
 
 fn wait_line(rx: &mpsc::Receiver<String>, needle: &str, timeout: Duration) -> String {
+    try_line(rx, needle, timeout)
+        .unwrap_or_else(|| panic!("timed out waiting for output containing {needle:?}"))
+}
+
+fn try_line(rx: &mpsc::Receiver<String>, needle: &str, timeout: Duration) -> Option<String> {
     let deadline = Instant::now() + timeout;
     loop {
         let remaining = deadline.saturating_duration_since(Instant::now());
         match rx.recv_timeout(remaining) {
-            Ok(line) if line.contains(needle) => return line,
+            Ok(line) if line.contains(needle) => return Some(line),
             Ok(_) => {}
-            Err(_) => panic!("timed out waiting for output containing {needle:?}"),
+            Err(_) => return None,
         }
     }
+}
+
+/// Waits for srvm's `app` announcement, giving up — rather than failing — if
+/// the process exits first or the window expires. A None result means the
+/// child lost the reservation-to-bind handoff and the caller may retry.
+fn announced_or_exit(
+    child: &mut Child,
+    rx: &mpsc::Receiver<String>,
+    timeout: Duration,
+) -> Option<String> {
+    let deadline = Instant::now() + timeout;
+    while Instant::now() < deadline {
+        match rx.recv_timeout(Duration::from_millis(100)) {
+            Ok(line) if line.contains("app        http://") => return Some(line),
+            _ => {}
+        }
+        if child.try_wait().unwrap().is_some() {
+            return None;
+        }
+    }
+    None
 }
 
 fn app_line_port(line: &str) -> u16 {
