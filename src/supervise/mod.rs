@@ -13,7 +13,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 
 use crate::{
     detect::{CommandSpec, PortInjection, ServeSpec},
@@ -29,8 +29,9 @@ pub mod scan;
 
 use ring::Ring;
 
-static CURRENT_CHILD: OnceLock<Arc<Mutex<Option<u32>>>> = OnceLock::new();
+static CURRENT_CHILDREN: OnceLock<Arc<Mutex<Vec<u32>>>> = OnceLock::new();
 static STATIC_STOP: OnceLock<Arc<AtomicBool>> = OnceLock::new();
+static SHUTDOWN: AtomicBool = AtomicBool::new(false);
 
 #[derive(Debug, Clone, Copy)]
 pub struct SupervisorOptions {
@@ -56,7 +57,7 @@ pub fn run(
 
     install_signal_handler()?;
 
-    let requested = plan_port(spec, options)?;
+    let requested = plan_port(spec, options, None)?;
 
     if let Some(stop) = stop {
         return run_static(root, requested, options, stop);
@@ -69,10 +70,11 @@ pub fn run(
             "  step       installing dependencies — {}",
             install.command_line()
         );
-        run_install(root, install, options, path_prepend)?;
+        run_install(root, install, options, path_prepend, None)?;
     }
 
-    run_server(root, spec, requested, options, path_prepend)
+    let opened = Arc::new(AtomicBool::new(false));
+    run_server(root, spec, requested, options, path_prepend, None, &opened)
 }
 
 fn run_static(
@@ -84,15 +86,15 @@ fn run_static(
     let start = requested.unwrap_or(8000);
     let server = staticsrv::StaticServer::bind(root, start)?;
     let actual = server.local_addr()?.port();
-    report_port(start, actual, options);
+    report_port(start, actual, options, None);
     if !options.quiet {
         println!("  step       starting — built-in static server");
     }
 
     let url = format!("http://{}/", server.local_addr()?);
     let mut announced = None;
-    let mut opened = false;
-    announce_reported_url(&url, Some(actual), &mut announced, &mut opened, options);
+    let opened = Arc::new(AtomicBool::new(false));
+    announce_reported_url(&url, Some(actual), &mut announced, &opened, options, None);
 
     server.serve(stop.clone())?;
     if stop.load(Ordering::SeqCst) {
@@ -101,7 +103,143 @@ fn run_static(
     Ok(())
 }
 
-fn plan_port(spec: &ServeSpec, options: SupervisorOptions) -> Result<Option<u16>> {
+pub struct LaunchItem<'a> {
+    pub label: String,
+    pub spec: &'a ServeSpec,
+    pub path_prepend: Vec<PathBuf>,
+}
+
+/// Launches several apps under one supervisor: ports are allocated up front
+/// so every app gets a distinct one, installs still run sequentially, and one
+/// worker thread supervises each child. Any app failing shuts the rest down
+/// and propagates the error; apps that exit 0 keep the others running.
+pub fn run_many(root: &Path, items: &[LaunchItem], options: SupervisorOptions) -> Result<()> {
+    if items.iter().any(|item| item.spec.is_static) {
+        bail!("static serving does not participate in multi-app launch");
+    }
+    if items.len() < 2 {
+        bail!("run_many requires at least two launch items");
+    }
+
+    install_signal_handler()?;
+
+    let mut requested = Vec::with_capacity(items.len());
+    for item in items {
+        requested.push(plan_port(item.spec, options, Some(&item.label))?);
+    }
+
+    for item in items {
+        if !options.no_install
+            && let Some(install) = &item.spec.install
+        {
+            println!(
+                "  step       {}installing dependencies — {}",
+                labeled(Some(&item.label)),
+                install.command_line()
+            );
+            run_install(
+                root,
+                install,
+                options,
+                &item.path_prepend,
+                Some(&item.label),
+            )?;
+        }
+    }
+
+    // Hold every reservation while selecting so siblings cannot win the same
+    // port, and release them only right before the workers spawn so installs
+    // never widen the reservation-to-bind gap. With --port N the first app
+    // starts at N and each later app starts one past the previously selected
+    // port; --port 0 is OS-assigned per app.
+    let mut held = Vec::with_capacity(items.len());
+    let mut selected = Vec::with_capacity(items.len());
+    let mut previous = None;
+    for (idx, _) in items.iter().enumerate() {
+        let start = match options.port {
+            Some(0) => requested[idx].map(|_| 0),
+            Some(port) => {
+                requested[idx].map(|_| previous.map_or(port, |prev: u16| prev.saturating_add(1)))
+            }
+            None => requested[idx],
+        };
+        let sel = match start {
+            Some(start) => {
+                let listener = ports::reserve(start)
+                    .with_context(|| format!("could not find a free port starting at {start}"))?;
+                let port = listener.local_addr()?.port();
+                held.push(listener);
+                Some(port)
+            }
+            None => None,
+        };
+        if sel.is_some() {
+            previous = sel;
+        }
+        selected.push(sel);
+    }
+    drop(held);
+
+    let opened = Arc::new(AtomicBool::new(false));
+    thread::scope(|scope| -> Result<()> {
+        let (tx, rx) = mpsc::channel();
+        for (idx, item) in items.iter().enumerate() {
+            let tx = tx.clone();
+            let opened = opened.clone();
+            let start = selected[idx];
+            scope.spawn(move || {
+                let result = run_server(
+                    root,
+                    item.spec,
+                    start,
+                    options,
+                    &item.path_prepend,
+                    Some(item.label.as_str()),
+                    &opened,
+                );
+                let _ = tx.send(result);
+            });
+        }
+        drop(tx);
+
+        let mut first_error = None;
+        let mut pending = items.len();
+        let mut deadline = None;
+        while pending > 0 {
+            // Workers still alive past the teardown deadline would make the
+            // scope block on join; kill what is registered and exit instead.
+            if deadline.is_some_and(|d: Instant| Instant::now() >= d) {
+                eprintln!("  failed     sibling apps did not stop within 5s; forcing exit");
+                terminate_registered_children();
+                std::process::exit(1);
+            }
+            match rx.recv_timeout(Duration::from_millis(50)) {
+                Ok(result) => {
+                    pending -= 1;
+                    if let Err(err) = result
+                        && first_error.is_none()
+                    {
+                        SHUTDOWN.store(true, Ordering::SeqCst);
+                        deadline = Some(Instant::now() + Duration::from_secs(5));
+                        first_error = Some(err);
+                    }
+                }
+                Err(mpsc::RecvTimeoutError::Timeout) => {}
+                Err(mpsc::RecvTimeoutError::Disconnected) => break,
+            }
+        }
+        match first_error {
+            Some(err) => Err(err),
+            None => Ok(()),
+        }
+    })
+}
+
+fn plan_port(
+    spec: &ServeSpec,
+    options: SupervisorOptions,
+    label: Option<&str>,
+) -> Result<Option<u16>> {
     let inherited = match &spec.port {
         PortInjection::Env(key) => std::env::var(key).ok(),
         _ => None,
@@ -113,7 +251,7 @@ fn plan_port(spec: &ServeSpec, options: SupervisorOptions) -> Result<Option<u16>
     {
         let mut warning = format!(
             "port overrides are unsupported for {}; leaving its ports unchanged",
-            spec.name
+            label.unwrap_or(&spec.name)
         );
         if let Some(port) = options.port {
             warning.push_str(&format!("; --port {port} ignored"));
@@ -129,17 +267,18 @@ fn run_install(
     command: &CommandSpec,
     options: SupervisorOptions,
     path_prepend: &[PathBuf],
+    label: Option<&str>,
 ) -> Result<()> {
     let ring = Arc::new(Mutex::new(Ring::default()));
     let mut child = spawn(command, root, &[], path_prepend)?;
-    set_current_child(Some(child.id()));
+    register_child(child.id());
     let (tx, _rx) = mpsc::channel::<String>();
-    let mut joins = attach_pumps(&mut child, ring.clone(), false, tx, options)?;
+    let mut joins = attach_pumps(&mut child, ring.clone(), false, tx, options, label)?;
     let started = Instant::now();
 
     loop {
         if let Some(status) = child.try_wait()? {
-            set_current_child(None);
+            unregister_child(child.id());
             join_pumps(&mut joins);
             if status.success() {
                 return Ok(());
@@ -147,16 +286,18 @@ fn run_install(
             return Err(error_with_tail(
                 format!("install command failed: {}", command.command_line()),
                 &ring,
+                label,
             ));
         }
 
         if started.elapsed() > Duration::from_secs(15 * 60) {
             kill::terminate_tree(&mut child);
-            set_current_child(None);
+            unregister_child(child.id());
             join_pumps(&mut joins);
             return Err(error_with_tail(
                 format!("install command timed out: {}", command.command_line()),
                 &ring,
+                label,
             ));
         }
 
@@ -171,6 +312,7 @@ const HANDOFF_RETRIES: usize = 2;
 
 enum Attempt {
     Done,
+    Stopped,
     Retry { next_start: u16, err: anyhow::Error },
 }
 
@@ -180,13 +322,27 @@ fn run_server(
     requested: Option<u16>,
     options: SupervisorOptions,
     path_prepend: &[PathBuf],
+    label: Option<&str>,
+    opened: &Arc<AtomicBool>,
 ) -> Result<()> {
     let mut start = requested;
     for attempt in 0..=HANDOFF_RETRIES {
-        match serve_attempt(root, spec, requested, start, options, path_prepend)? {
-            Attempt::Done => return Ok(()),
+        match serve_attempt(
+            root,
+            spec,
+            requested,
+            start,
+            options,
+            path_prepend,
+            label,
+            opened,
+        )? {
+            Attempt::Done | Attempt::Stopped => return Ok(()),
             Attempt::Retry { next_start, .. } if attempt < HANDOFF_RETRIES => {
-                println!("  step       port was claimed before the app bound it; retrying");
+                println!(
+                    "  step       {}port was claimed before the app bound it; retrying",
+                    labeled(label)
+                );
                 start = Some(next_start);
             }
             Attempt::Retry { err, .. } => return Err(err),
@@ -195,6 +351,7 @@ fn run_server(
     unreachable!()
 }
 
+#[allow(clippy::too_many_arguments)]
 fn serve_attempt(
     root: &Path,
     spec: &ServeSpec,
@@ -202,6 +359,8 @@ fn serve_attempt(
     start: Option<u16>,
     options: SupervisorOptions,
     path_prepend: &[PathBuf],
+    label: Option<&str>,
+    opened: &Arc<AtomicBool>,
 ) -> Result<Attempt> {
     let ring = Arc::new(Mutex::new(Ring::default()));
 
@@ -219,25 +378,28 @@ fn serve_attempt(
     };
 
     if let (Some(start), Some(selected)) = (report_start, selected) {
-        report_port(start, selected, options);
+        report_port(start, selected, options, label);
     }
 
-    println!("  step       starting — {}", command.command_line());
+    println!(
+        "  step       {}starting — {}",
+        labeled(label),
+        command.command_line()
+    );
     drop(reservation);
     let mut child = spawn(&command, root, &env, path_prepend)?;
-    set_current_child(Some(child.id()));
+    register_child(child.id());
 
     let (tx, rx) = mpsc::channel::<String>();
-    let mut joins = attach_pumps(&mut child, ring.clone(), true, tx, options)?;
+    let mut joins = attach_pumps(&mut child, ring.clone(), true, tx, options, label)?;
     let started = Instant::now();
     let probe_port = selected.or(spec.url_hint);
     let mut announced: Option<String> = None;
-    let mut opened = false;
     let mut probed_hint = false;
 
     loop {
         while let Ok(url) = rx.try_recv() {
-            announce_reported_url(&url, selected, &mut announced, &mut opened, options);
+            announce_reported_url(&url, selected, &mut announced, opened, options, label);
         }
 
         if announced.is_none()
@@ -247,27 +409,38 @@ fn serve_attempt(
         {
             probed_hint = true;
             if let Some(url) = probe_hint(port) {
-                announce_reported_url(&url, selected, &mut announced, &mut opened, options);
+                announce_reported_url(&url, selected, &mut announced, opened, options, label);
             }
         }
 
+        if SHUTDOWN.load(Ordering::SeqCst) {
+            kill::terminate_tree(&mut child);
+            unregister_child(child.id());
+            join_pumps(&mut joins);
+            return Ok(Attempt::Stopped);
+        }
+
         if let Some(status) = child.try_wait()? {
-            set_current_child(None);
+            unregister_child(child.id());
             join_pumps(&mut joins);
             while let Ok(url) = rx.try_recv() {
-                announce_reported_url(&url, selected, &mut announced, &mut opened, options);
+                announce_reported_url(&url, selected, &mut announced, opened, options, label);
             }
             if status.success() {
                 if announced.is_some() {
-                    println!("  exited     {status}");
+                    println!("  exited     {}{status}", labeled(label));
                 }
                 return Ok(Attempt::Done);
             }
 
             let err = if started.elapsed() < Duration::from_secs(3) {
-                error_with_tail(format!("{} failed early: {status}", spec.name), &ring)
+                error_with_tail(
+                    format!("{} failed early: {status}", spec.name),
+                    &ring,
+                    label,
+                )
             } else {
-                error_with_tail(format!("{} exited: {status}", spec.name), &ring)
+                error_with_tail(format!("{} exited: {status}", spec.name), &ring, label)
             };
             // A child that died without announcing may have lost the
             // reservation-to-bind handoff. The thief can come and go between
@@ -319,8 +492,10 @@ fn attach_pumps(
     detect_urls: bool,
     tx: mpsc::Sender<String>,
     options: SupervisorOptions,
+    label: Option<&str>,
 ) -> Result<Vec<thread::JoinHandle<()>>> {
     let url = Arc::new(Mutex::new(None));
+    let label = label.map(str::to_string);
     let mut joins = Vec::new();
 
     if let Some(stdout) = child.stdout.take() {
@@ -334,6 +509,7 @@ fn attach_pumps(
                 quiet: options.quiet,
                 detect_urls,
                 no_color: options.no_color,
+                label: label.clone(),
             },
         ));
     }
@@ -349,6 +525,7 @@ fn attach_pumps(
                 quiet: options.quiet,
                 detect_urls,
                 no_color: options.no_color,
+                label,
             },
         ));
     }
@@ -396,16 +573,21 @@ fn resolve_program(program: &str, root: &Path, path_prepend: &[PathBuf]) -> Path
         .unwrap_or_else(|| path.to_path_buf())
 }
 
-fn report_port(requested: u16, selected: u16, options: SupervisorOptions) {
+fn labeled(label: Option<&str>) -> String {
+    label.map(|label| format!("[{label}] ")).unwrap_or_default()
+}
+
+fn report_port(requested: u16, selected: u16, options: SupervisorOptions, label: Option<&str>) {
     if options.quiet {
         return;
     }
+    let label = labeled(label);
     if requested == 0 {
-        println!("  port       selected {selected}");
+        println!("  port       {label}selected {selected}");
     } else if requested != selected {
-        println!("  port       {requested} busy -> {selected}");
+        println!("  port       {label}{requested} busy -> {selected}");
     } else {
-        println!("  port       {selected}");
+        println!("  port       {label}{selected}");
     }
 }
 
@@ -413,17 +595,17 @@ fn announce_reported_url(
     url: &str,
     selected: Option<u16>,
     announced: &mut Option<String>,
-    opened: &mut bool,
+    opened: &Arc<AtomicBool>,
     options: SupervisorOptions,
+    label: Option<&str>,
 ) {
     if announced.as_deref() == Some(url) {
         return;
     }
     *announced = Some(url.to_string());
 
-    println!("  app        {url}");
-    if !*opened {
-        *opened = true;
+    println!("  app        {}{url}", labeled(label));
+    if !opened.swap(true, Ordering::SeqCst) {
         if !options.no_open {
             let _ = open::open_browser(url);
         }
@@ -491,8 +673,8 @@ fn probe_hint(port: u16) -> Option<String> {
         .then(|| format!("http://127.0.0.1:{port}"))
 }
 
-fn error_with_tail(message: String, ring: &Arc<Mutex<Ring>>) -> anyhow::Error {
-    eprintln!("  failed     {message}");
+fn error_with_tail(message: String, ring: &Arc<Mutex<Ring>>, label: Option<&str>) -> anyhow::Error {
+    eprintln!("  failed     {}{message}", labeled(label));
     for line in ring.lock().expect("ring lock poisoned").tail(12) {
         eprintln!("    {line}");
     }
@@ -500,9 +682,7 @@ fn error_with_tail(message: String, ring: &Arc<Mutex<Ring>>) -> anyhow::Error {
 }
 
 fn install_signal_handler() -> Result<()> {
-    let child = CURRENT_CHILD
-        .get_or_init(|| Arc::new(Mutex::new(None)))
-        .clone();
+    CURRENT_CHILDREN.get_or_init(|| Arc::new(Mutex::new(Vec::new())));
 
     ctrlc::set_handler(move || {
         if let Some(stop) = STATIC_STOP.get()
@@ -510,18 +690,40 @@ fn install_signal_handler() -> Result<()> {
         {
             return;
         }
-        let pid = *child.lock().unwrap_or_else(|err| err.into_inner());
-        if let Some(pid) = pid {
-            kill::terminate_tree_by_pid(pid);
-        }
+        SHUTDOWN.store(true, Ordering::SeqCst);
+        terminate_registered_children();
         std::process::exit(130);
     })?;
     Ok(())
 }
 
-fn set_current_child(pid: Option<u32>) {
-    if let Some(slot) = CURRENT_CHILD.get() {
-        *slot.lock().unwrap_or_else(|err| err.into_inner()) = pid;
+fn terminate_registered_children() {
+    if let Some(children) = CURRENT_CHILDREN.get() {
+        let pids = children
+            .lock()
+            .unwrap_or_else(|err| err.into_inner())
+            .clone();
+        for pid in pids {
+            kill::terminate_tree_by_pid(pid);
+        }
+    }
+}
+
+fn register_child(pid: u32) {
+    if let Some(children) = CURRENT_CHILDREN.get() {
+        children
+            .lock()
+            .unwrap_or_else(|err| err.into_inner())
+            .push(pid);
+    }
+}
+
+fn unregister_child(pid: u32) {
+    if let Some(children) = CURRENT_CHILDREN.get() {
+        children
+            .lock()
+            .unwrap_or_else(|err| err.into_inner())
+            .retain(|registered| *registered != pid);
     }
 }
 
@@ -768,61 +970,75 @@ mod tests {
 
     #[test]
     fn first_announcement_opens_browser_once() {
+        use std::sync::{
+            Arc,
+            atomic::{AtomicBool, Ordering},
+        };
+
         let mut announced = None;
-        let mut opened = false;
+        let opened = Arc::new(AtomicBool::new(false));
         let options = quiet_options();
 
         announce_reported_url(
             "http://127.0.0.1:8000",
             None,
             &mut announced,
-            &mut opened,
+            &opened,
             options,
+            None,
         );
         assert_eq!(announced.as_deref(), Some("http://127.0.0.1:8000"));
-        assert!(opened);
+        assert!(opened.load(Ordering::SeqCst));
 
         announce_reported_url(
             "http://127.0.0.1:8000",
             None,
             &mut announced,
-            &mut opened,
+            &opened,
             options,
+            None,
         );
         assert_eq!(announced.as_deref(), Some("http://127.0.0.1:8000"));
-        assert!(opened);
+        assert!(opened.load(Ordering::SeqCst));
     }
 
     #[test]
     fn late_sniffed_url_replaces_probe_announcement() {
+        use std::sync::{
+            Arc,
+            atomic::{AtomicBool, Ordering},
+        };
+
         let mut announced = Some("http://127.0.0.1:8123".to_string());
-        let mut opened = true;
+        let opened = Arc::new(AtomicBool::new(true));
         let options = quiet_options();
 
         announce_reported_url(
             "http://127.0.0.1:9123/app?x=1#f",
             Some(8123),
             &mut announced,
-            &mut opened,
+            &opened,
             options,
+            None,
         );
         assert_eq!(
             announced.as_deref(),
             Some("http://127.0.0.1:9123/app?x=1#f")
         );
-        assert!(opened);
+        assert!(opened.load(Ordering::SeqCst));
 
         announce_reported_url(
             "http://127.0.0.1:9123/app?x=1#f",
             Some(8123),
             &mut announced,
-            &mut opened,
+            &opened,
             options,
+            None,
         );
         assert_eq!(
             announced.as_deref(),
             Some("http://127.0.0.1:9123/app?x=1#f")
         );
-        assert!(opened);
+        assert!(opened.load(Ordering::SeqCst));
     }
 }

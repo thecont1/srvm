@@ -8,9 +8,9 @@ use clap::Parser;
 
 use crate::{
     detect::{PathResolver, PortInjection, ServeSpec, ToolResolver, detect},
-    ports,
+    launch, ports,
     runtime::{self, RuntimeKind},
-    supervise::{self, SupervisorOptions},
+    supervise::{self, LaunchItem, SupervisorOptions},
 };
 
 #[derive(Debug, Parser)]
@@ -43,17 +43,13 @@ struct Cli {
     #[arg(long)]
     no_color: bool,
 
-    #[arg(long)]
+    #[arg(long, conflicts_with = "select")]
     all: bool,
 }
 
 pub fn run() -> Result<()> {
     let cli = Cli::parse();
     let root = cli.dir.canonicalize()?;
-
-    if cli.all {
-        bail!("--all is reserved for multi-stack launch and is not yet supported");
-    }
 
     let specs = detect(&root)?;
 
@@ -65,22 +61,65 @@ pub fn run() -> Result<()> {
         bail!("no servable app detected in {}", root.display());
     }
 
-    let selected = select_spec(&specs, cli.select.as_deref())?;
-    print_intro(&root.display().to_string(), selected);
-    let path_prepend = prepare_runtimes(&root, selected, cli.quiet)?;
-    supervise::run(
-        &root,
-        selected,
-        SupervisorOptions {
-            no_open: cli.no_open,
-            no_install: cli.no_install,
-            verbose: cli.verbose,
-            quiet: cli.quiet,
-            no_color: cli.no_color,
-            port: cli.port,
-        },
-        &path_prepend,
-    )
+    let options = SupervisorOptions {
+        no_open: cli.no_open,
+        no_install: cli.no_install,
+        verbose: cli.verbose,
+        quiet: cli.quiet,
+        no_color: cli.no_color,
+        port: cli.port,
+    };
+
+    let set = if cli.all {
+        launch::launch_set(&specs)
+    } else {
+        vec![select_index(&specs, cli.select.as_deref())?]
+    };
+
+    if set.len() == 1 {
+        let spec = &specs[set[0]];
+        print_intro(&root.display().to_string(), spec);
+        let path_prepend = prepare_runtimes(&root, spec, cli.quiet)?;
+        return supervise::run(&root, spec, options, &path_prepend);
+    }
+
+    println!("  srvm {}", env!("CARGO_PKG_VERSION"));
+    println!("  workspace  {}", root.display());
+
+    let labels = labels_for(&set, &specs);
+    for (label, &idx) in labels.iter().zip(&set) {
+        println!("  serve      [{label}] {}", specs[idx].summary());
+    }
+
+    // Runtime fetches stage under a shared cache path per version, so
+    // preparation stays sequential even though supervision runs in parallel.
+    let mut items = Vec::with_capacity(set.len());
+    for (label, &idx) in labels.iter().zip(&set) {
+        let spec = &specs[idx];
+        let path_prepend = prepare_runtimes(&root, spec, cli.quiet)?;
+        items.push(LaunchItem {
+            label: label.clone(),
+            spec,
+            path_prepend,
+        });
+    }
+    supervise::run_many(&root, &items, options)
+}
+
+fn labels_for(set: &[usize], specs: &[ServeSpec]) -> Vec<String> {
+    let mut counts = std::collections::HashMap::new();
+    set.iter()
+        .map(|&idx| {
+            let name = &specs[idx].name;
+            let count = counts.entry(name).or_insert(0);
+            *count += 1;
+            if *count > 1 {
+                format!("{name}#{count}")
+            } else {
+                name.clone()
+            }
+        })
+        .collect()
 }
 
 fn print_intro(root: &str, spec: &ServeSpec) {
@@ -130,6 +169,13 @@ fn print_dry_run(root: &Path, specs: &[ServeSpec], port: Option<u16>) -> Result<
                     println!("  override   {}", override_description(spec));
                 }
             }
+        }
+    }
+
+    let set = launch::launch_set(specs);
+    if set.len() >= 2 {
+        for (i, &idx) in set.iter().enumerate() {
+            println!("  launch     {}. {}", i + 1, specs[idx].name);
         }
     }
     Ok(())
@@ -248,18 +294,18 @@ fn override_description(spec: &ServeSpec) -> String {
     }
 }
 
-fn select_spec<'a>(specs: &'a [ServeSpec], select: Option<&str>) -> Result<&'a ServeSpec> {
+fn select_index(specs: &[ServeSpec], select: Option<&str>) -> Result<usize> {
     match select {
-        None => Ok(&specs[0]),
+        None => Ok(0),
         Some(raw) => {
             if let Ok(n) = raw.parse::<usize>()
                 && (1..=specs.len()).contains(&n)
             {
-                return Ok(&specs[n - 1]);
+                return Ok(n - 1);
             }
             specs
                 .iter()
-                .find(|spec| spec.name == raw || spec.tool == raw)
+                .position(|spec| spec.name == raw || spec.tool == raw)
                 .ok_or_else(|| anyhow::anyhow!("no detected stack matches --select {raw:?}"))
         }
     }

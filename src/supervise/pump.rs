@@ -11,6 +11,7 @@ pub struct PumpOptions {
     pub quiet: bool,
     pub detect_urls: bool,
     pub no_color: bool,
+    pub label: Option<String>,
 }
 
 pub fn spawn_pump<R>(
@@ -54,9 +55,15 @@ where
 
             if !options.quiet {
                 if options.verbose {
-                    println!("{}", format_child_line(line, options.no_color));
+                    println!(
+                        "{}",
+                        format_child_line(line, options.no_color, options.label.as_deref())
+                    );
                 } else if let Some(line) = collapse.accept(line) {
-                    println!("{}", format_child_line(&line, options.no_color));
+                    println!(
+                        "{}",
+                        format_child_line(&line, options.no_color, options.label.as_deref())
+                    );
                 }
             }
         }
@@ -65,16 +72,23 @@ where
             && !options.verbose
             && let Some(line) = collapse.flush()
         {
-            println!("{}", format_child_line(&line, options.no_color));
+            println!(
+                "{}",
+                format_child_line(&line, options.no_color, options.label.as_deref())
+            );
         }
     })
 }
 
-fn format_child_line(line: &str, no_color: bool) -> String {
+fn format_child_line(line: &str, no_color: bool, label: Option<&str>) -> String {
+    let line = match label {
+        Some(label) => format!("    [{label}] {line}"),
+        None => format!("    {line}"),
+    };
     if no_color || std::env::var_os("NO_COLOR").is_some() {
-        format!("    {line}")
+        line
     } else {
-        format!("\x1b[2m    {line}\x1b[0m")
+        format!("\x1b[2m{line}\x1b[0m")
     }
 }
 
@@ -84,7 +98,14 @@ mod tests {
 
     #[test]
     fn child_lines_can_be_plain_or_dimmed() {
-        assert_eq!(format_child_line("hello", true), "    hello");
-        assert_eq!(format_child_line("hello", false), "\x1b[2m    hello\x1b[0m");
+        assert_eq!(format_child_line("hello", true, None), "    hello");
+        assert_eq!(
+            format_child_line("hello", false, None),
+            "\x1b[2m    hello\x1b[0m"
+        );
+        assert_eq!(
+            format_child_line("hello", true, Some("django")),
+            "    [django] hello"
+        );
     }
 }

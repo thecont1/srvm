@@ -115,7 +115,7 @@ fn dry_run_rejects_invalid_inherited_port() {
 }
 
 #[test]
-fn all_flag_is_reserved() {
+fn all_flag_in_empty_repo_fails_on_detection() {
     let repo = tempdir().unwrap();
     let bin = tempdir().unwrap();
 
@@ -124,7 +124,7 @@ fn all_flag_is_reserved() {
         .arg(repo.path())
         .assert()
         .failure()
-        .stderr(predicate::str::contains("--all is reserved"));
+        .stderr(predicate::str::contains("no servable app detected"));
 }
 
 fn srvm(bin: &Path) -> Command {
