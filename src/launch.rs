@@ -1,6 +1,6 @@
 use std::collections::HashSet;
 
-use crate::detect::ServeSpec;
+use crate::{detect::ServeSpec, workspace::Candidate};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Family {
@@ -50,37 +50,172 @@ fn tool_family(tool: &str) -> Family {
     }
 }
 
-pub fn launch_set(specs: &[ServeSpec]) -> Vec<usize> {
+pub fn plan_default(candidates: &[Candidate]) -> LaunchPlan {
+    // A recognized orchestrator at the workspace root supersedes the apps it
+    // already starts; those stay visible in `--dry-run` and reachable through
+    // `--select`.
+    if let Some(index) = candidates.iter().position(|candidate| {
+        candidate.rel.as_os_str().is_empty() && family(&candidate.spec) == Family::Orchestrator
+    }) {
+        return LaunchPlan {
+            set: vec![index],
+            orchestrated: true,
+            suppressed: suppressed(candidates.len(), &[index]),
+        };
+    }
+
     let mut apps = Vec::new();
     let mut seen = HashSet::new();
     let mut orchestrators = Vec::new();
     let mut statics = Vec::new();
 
-    for (idx, spec) in specs.iter().enumerate() {
-        match family(spec) {
-            Family::Orchestrator => orchestrators.push(idx),
-            Family::Static => statics.push(idx),
+    for (index, candidate) in candidates.iter().enumerate() {
+        match family(&candidate.spec) {
+            Family::Orchestrator => orchestrators.push(index),
+            Family::Static => statics.push(index),
             fam => {
-                if seen.insert(fam) {
-                    apps.push(idx);
+                if seen.insert((candidate.root.clone(), fam)) {
+                    apps.push(index);
                 }
             }
         }
     }
 
-    if !apps.is_empty() {
-        return apps;
+    let (set, orchestrated) = if !apps.is_empty() {
+        (apps, false)
+    } else if let Some(&first) = orchestrators.first() {
+        (vec![first], true)
+    } else {
+        (statics.into_iter().take(1).collect::<Vec<_>>(), false)
+    };
+
+    LaunchPlan {
+        suppressed: suppressed(candidates.len(), &set),
+        set,
+        orchestrated,
     }
-    if let Some(first) = orchestrators.first() {
-        return vec![*first];
-    }
-    statics.into_iter().take(1).collect()
+}
+
+/// What bare `srvm` (and its `--all` alias) actually launches.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LaunchPlan {
+    /// Indices into the workspace candidates, in launch order.
+    pub set: Vec<usize>,
+    /// The set is a single orchestrator that takes precedence over sub-apps.
+    pub orchestrated: bool,
+    /// Visible candidates the default set deliberately does not launch.
+    pub suppressed: Vec<usize>,
+}
+
+fn suppressed(total: usize, set: &[usize]) -> Vec<usize> {
+    (0..total).filter(|index| !set.contains(index)).collect()
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{Family, family, launch_set};
+    use super::{Family, family, plan_default};
     use crate::detect::{CommandSpec, PortInjection, ServeSpec};
+    use crate::workspace::Candidate;
+
+    fn candidate(rel: &str, name: &str, tool: &str) -> Candidate {
+        let root = std::path::PathBuf::from("/ws");
+        Candidate {
+            root: if rel.is_empty() {
+                root.clone()
+            } else {
+                root.join(rel)
+            },
+            rel: std::path::PathBuf::from(rel),
+            spec: if name == "static" {
+                static_spec()
+            } else {
+                spec(name, tool)
+            },
+        }
+    }
+
+    #[test]
+    fn default_set_dedups_by_app_root_and_family() {
+        let candidates = vec![
+            candidate("", "package:dev", "npm"),
+            candidate("", "vite", "npm"),
+            candidate("frontend", "package:dev", "npm"),
+            candidate("backend", "django", "python3"),
+            candidate("backend", "flask", "flask"),
+        ];
+
+        let plan = plan_default(&candidates);
+
+        assert_eq!(plan.set, vec![0, 2, 3]);
+        assert_eq!(plan.suppressed, vec![1, 4]);
+        assert!(!plan.orchestrated);
+    }
+
+    #[test]
+    fn two_js_apps_in_different_roots_both_launch() {
+        let candidates = vec![
+            candidate("apps/web", "package:dev", "npm"),
+            candidate("apps/admin", "package:dev", "npm"),
+        ];
+
+        assert_eq!(plan_default(&candidates).set, vec![0, 1]);
+    }
+
+    #[test]
+    fn root_orchestrator_runs_alone() {
+        let candidates = vec![
+            candidate("", "make:dev", "make"),
+            candidate("frontend", "package:dev", "npm"),
+            candidate("backend", "django", "python3"),
+        ];
+
+        let plan = plan_default(&candidates);
+
+        assert_eq!(plan.set, vec![0]);
+        assert!(plan.orchestrated);
+        assert_eq!(plan.suppressed, vec![1, 2]);
+    }
+
+    #[test]
+    fn orchestrators_and_statics_drop_when_apps_exist() {
+        let candidates = vec![
+            candidate("frontend", "package:dev", "npm"),
+            candidate("frontend", "make:dev", "make"),
+            candidate("", "static", "srvm"),
+        ];
+
+        let plan = plan_default(&candidates);
+
+        assert_eq!(plan.set, vec![0]);
+        assert!(!plan.orchestrated);
+    }
+
+    #[test]
+    fn sub_root_orchestrator_runs_alone_when_no_app_survives() {
+        let candidates = vec![
+            candidate("apps/web", "make:dev", "make"),
+            candidate("apps/api", "compose", "docker"),
+        ];
+
+        let plan = plan_default(&candidates);
+
+        assert_eq!(plan.set, vec![0]);
+        assert!(plan.orchestrated);
+    }
+
+    #[test]
+    fn static_runs_only_when_nothing_else_matches() {
+        let candidates = vec![candidate("public", "static", "srvm")];
+        assert_eq!(plan_default(&candidates).set, vec![0]);
+
+        let candidates = vec![
+            candidate("public", "static", "srvm"),
+            candidate("site", "static", "srvm"),
+        ];
+        assert_eq!(plan_default(&candidates).set, vec![0]);
+
+        assert!(plan_default(&[]).set.is_empty());
+    }
 
     fn spec(name: &str, tool: &str) -> ServeSpec {
         ServeSpec::new(
@@ -145,46 +280,5 @@ mod tests {
             assert_eq!(family(&spec(name, tool)), expected, "{name} via {tool}");
         }
         assert_eq!(family(&static_spec()), Family::Static);
-    }
-
-    #[test]
-    fn keeps_first_candidate_per_family() {
-        let specs = vec![
-            spec("package:dev", "npm"),
-            spec("vite", "npm"),
-            spec("django", "python3"),
-            spec("flask", "python3"),
-            spec("rails", "bundle"),
-        ];
-
-        assert_eq!(launch_set(&specs), vec![0, 2, 4]);
-    }
-
-    #[test]
-    fn orchestrators_and_static_drop_when_apps_exist() {
-        let specs = vec![
-            spec("package:dev", "npm"),
-            spec("make:dev", "make"),
-            spec("compose", "docker"),
-            static_spec(),
-        ];
-
-        assert_eq!(launch_set(&specs), vec![0]);
-    }
-
-    #[test]
-    fn orchestrator_alone_launches_first_only() {
-        let specs = vec![spec("make:dev", "make"), spec("compose", "docker")];
-
-        assert_eq!(launch_set(&specs), vec![0]);
-    }
-
-    #[test]
-    fn static_alone_is_kept() {
-        let specs = vec![static_spec()];
-        assert_eq!(launch_set(&specs), vec![0]);
-
-        let specs = vec![static_spec(), static_spec()];
-        assert_eq!(launch_set(&specs), vec![0]);
     }
 }
