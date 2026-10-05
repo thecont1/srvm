@@ -269,14 +269,16 @@ fn serve_attempt(
             } else {
                 error_with_tail(format!("{} exited: {status}", spec.name), &ring)
             };
-            // Retry only when the selected endpoint is actually occupied at
-            // failure time — the lost reservation-to-bind handoff. Unrelated
-            // failures (bad args, missing dependencies) leave the port free
-            // and stay visible instead of being relaunched. The occupancy
-            // check is the snipe signal; the child's own failure timing is
-            // irrelevant to it, so slow-dying apps that lost the handoff are
-            // recovered too.
-            let retry = if announced.is_none() {
+            // A child that died without announcing may have lost the
+            // reservation-to-bind handoff. The thief can come and go between
+            // the child's death and an occupancy probe, so treat a quick
+            // death as evidence on its own and probe the port only for
+            // slower deaths. Unrelated failures still surface unchanged once
+            // the bounded retries are exhausted.
+            let quick = started.elapsed() < Duration::from_secs(3);
+            let retry = if announced.is_none() && quick {
+                selected.map(|selected| selected.saturating_add(1))
+            } else if announced.is_none() {
                 selected.and_then(|selected| {
                     retry_handoff_start(selected, |port| {
                         std::net::TcpListener::bind(("127.0.0.1", port)).map(|_| ())
@@ -295,9 +297,10 @@ fn serve_attempt(
     }
 }
 
-/// A lost handoff is diagnosed by occupancy alone: if the injected port is
-/// still held by another process when the child died, relaunch one port up.
-/// Non-AddrInUse bind errors (permissions, protocol issues) are not a snipe.
+/// Occupancy probe for slower deaths: if the injected port is still held by
+/// another process when the child died, relaunch one port up. Non-AddrInUse
+/// bind errors (permissions, protocol issues) are not a snipe. Quick deaths
+/// retry without this probe — the thief may already have come and gone.
 fn retry_handoff_start(
     selected: u16,
     bind: impl FnOnce(u16) -> std::io::Result<()>,
