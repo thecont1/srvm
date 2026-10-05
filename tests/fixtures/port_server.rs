@@ -68,6 +68,7 @@ fn main() {
     }
 
     listener.set_nonblocking(true).unwrap();
+    let done = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     let deadline = Instant::now() + Duration::from_secs(20);
     while Instant::now() < deadline {
         match listener.accept() {
@@ -75,6 +76,7 @@ fn main() {
                 // Handle each connection on its own thread: stray connections
                 // from parallel tests can block for seconds on read, and a
                 // sequential loop would starve the real request behind them.
+                let done = std::sync::Arc::clone(&done);
                 std::thread::spawn(move || {
                     let _ = stream.set_read_timeout(Some(Duration::from_secs(2)));
                     let _ = stream.set_write_timeout(Some(Duration::from_secs(2)));
@@ -100,14 +102,22 @@ fn main() {
                         })
                         .and_then(|host| host.rsplit(':').next())
                         .and_then(|port| port.parse::<u16>().ok());
-                    if (method == "GET" && host_port == Some(actual)) || path == "/shutdown" {
-                        std::process::exit(0);
+                    let stop = (method == "GET" && host_port == Some(actual)) || path == "/shutdown";
+                    // Close the stream gracefully first so the response is
+                    // delivered with FIN (Windows resets sockets that are
+                    // still open when the process dies), then signal main.
+                    drop(stream);
+                    if stop {
+                        done.store(true, std::sync::atomic::Ordering::SeqCst);
                     }
                 });
             }
             // Transient accept errors (ECONNABORTED under load) must not
             // kill the server; keep serving until the deadline or a GET.
             Err(_) => std::thread::sleep(Duration::from_millis(10)),
+        }
+        if done.load(std::sync::atomic::Ordering::SeqCst) {
+            break;
         }
     }
 }
