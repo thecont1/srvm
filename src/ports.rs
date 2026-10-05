@@ -87,25 +87,13 @@ fn bind_available_with<T>(start: u16, mut bind: impl FnMut(u16) -> io::Result<T>
 
 /// Bind failures that mean "this port is unusable" rather than "srvm is
 /// broken": another process holds it, or the platform reserves it (Windows
-/// excluded port ranges, privileged low ports). Walking on is the right
-/// response to all of them.
+/// excluded port ranges fail binds with a permission error, as do privileged
+/// low ports on Unix). Walking on is the right response to all of them.
 fn is_skippable_bind_error(err: &io::Error) -> bool {
-    #[cfg(windows)]
-    {
-        matches!(
-            err.kind(),
-            io::ErrorKind::AddrInUse
-                | io::ErrorKind::PermissionDenied
-                | io::ErrorKind::AccessDenied
-        )
-    }
-    #[cfg(not(windows))]
-    {
-        matches!(
-            err.kind(),
-            io::ErrorKind::AddrInUse | io::ErrorKind::PermissionDenied
-        )
-    }
+    matches!(
+        err.kind(),
+        io::ErrorKind::AddrInUse | io::ErrorKind::PermissionDenied
+    )
 }
 
 #[cfg(test)]
