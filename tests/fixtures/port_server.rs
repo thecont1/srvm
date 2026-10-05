@@ -28,9 +28,24 @@ fn main() {
     }
 
     let mode = env::var("PORT_FIXTURE_MODE").unwrap_or_else(|_| "env-port".into());
+    if matches!(mode.as_str(), "sniped-argv-port" | "fail-after-hold") {
+        println!("fixture waiting before bind");
+        let release = env::var_os("PORT_FIXTURE_RELEASE").expect("missing fixture release path");
+        let deadline = Instant::now() + Duration::from_secs(15);
+        while fs::metadata(&release).is_err() {
+            assert!(Instant::now() < deadline, "timed out waiting to bind");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+
+    if mode == "fail-after-hold" {
+        eprintln!("boom");
+        std::process::exit(7);
+    }
+
     let port = match mode.as_str() {
         "ignore-port" => 0,
-        "argv-port" => argv_port(&args).unwrap_or(0),
+        "argv-port" | "sniped-argv-port" => argv_port(&args).unwrap_or(0),
         _ => env::var("PORT")
             .ok()
             .and_then(|value| value.parse().ok())

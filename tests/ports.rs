@@ -60,6 +60,153 @@ fn occupied_start_shifts_env_port_and_install_sees_no_port() {
 }
 
 #[test]
+fn supervisor_retries_when_reserved_port_is_claimed_before_bind() {
+    let repo = tempdir().unwrap();
+    fs::write(repo.path().join("wrangler.toml"), "name = 'worker'\n").unwrap();
+    let bin = tempdir().unwrap();
+    stub_exec(bin.path(), "wrangler");
+    let log = repo.path().join("fixture.log");
+    let release = repo.path().join("release-bind");
+
+    let mut cmd = srvm(bin.path(), "sniped-argv-port", &log);
+    cmd.env("PORT_FIXTURE_RELEASE", &release);
+    cmd.arg("--port").arg("0").arg(repo.path());
+    let mut child = ChildGuard::new(&mut cmd);
+    let out = line_reader(child.0.stdout.take().unwrap());
+    let _err = line_reader(child.0.stderr.take().unwrap());
+
+    // Port zero avoids a setup race: srvm reports the OS-assigned reservation
+    // before dropping it, and this test claims that exact port in the gap.
+    let first_port_line = wait_line(&out, "port       selected ", Duration::from_secs(15));
+    let first_selected: u16 = first_port_line
+        .split_whitespace()
+        .last()
+        .unwrap()
+        .parse()
+        .unwrap();
+    assert_ne!(first_selected, 0);
+
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let _sniped = loop {
+        match TcpListener::bind(("127.0.0.1", first_selected)) {
+            Ok(listener) => break listener,
+            Err(error)
+                if error.kind() == std::io::ErrorKind::AddrInUse && Instant::now() < deadline =>
+            {
+                thread::sleep(Duration::from_millis(1));
+            }
+            Err(error) => panic!("could not claim released port {first_selected}: {error}"),
+        }
+    };
+    assert!(
+        Instant::now() < deadline,
+        "fixture did not reach its delayed bind before the deadline"
+    );
+
+    wait_line(&out, "fixture waiting before bind", Duration::from_secs(5));
+    fs::write(&release, "bind").unwrap();
+    wait_line(
+        &out,
+        "port was claimed before the app bound it; retrying",
+        Duration::from_secs(10),
+    );
+    let retry_port_line = wait_line(&out, "port       selected ", Duration::from_secs(10));
+    let selected: u16 = retry_port_line
+        .split_whitespace()
+        .last()
+        .unwrap()
+        .parse()
+        .unwrap();
+    assert_ne!(selected, 0);
+    assert_ne!(selected, first_selected);
+
+    let app_line = wait_line(
+        &out,
+        "app        http://127.0.0.1:",
+        Duration::from_secs(15),
+    );
+    assert_eq!(app_line_port(&app_line), selected);
+    assert!(http_get(selected).starts_with("HTTP/1.1 200"));
+    assert!(wait_exit(&mut child.0, Duration::from_secs(15)).success());
+
+    let log = fs::read_to_string(&log).unwrap();
+    assert!(
+        log.contains(&format!("ARGS=dev --port {selected}")),
+        "fixture argv missing retried port: {log}"
+    );
+}
+
+#[test]
+fn unrelated_early_failure_is_surfaced_even_when_the_port_is_claimed() {
+    let repo = tempdir().unwrap();
+    fs::write(repo.path().join("wrangler.toml"), "name = 'worker'\n").unwrap();
+    let bin = tempdir().unwrap();
+    stub_exec(bin.path(), "wrangler");
+    let log = repo.path().join("fixture.log");
+    let release = repo.path().join("release-bind");
+
+    let mut cmd = srvm(bin.path(), "fail-after-hold", &log);
+    cmd.env("PORT_FIXTURE_RELEASE", &release);
+    cmd.arg("--port").arg("0").arg(repo.path());
+    let mut child = ChildGuard::new(&mut cmd);
+    let out = line_reader(child.0.stdout.take().unwrap());
+    let err = line_reader(child.0.stderr.take().unwrap());
+
+    let first_port_line = wait_line(&out, "port       selected ", Duration::from_secs(15));
+    let first_selected: u16 = first_port_line
+        .split_whitespace()
+        .last()
+        .unwrap()
+        .parse()
+        .unwrap();
+
+    // Occupy the port the child will fail on — the supervisor sees the
+    // occupied endpoint and relaunches one port up, so the app's real failure
+    // must still surface on that next attempt instead of being masked.
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let _sniped = loop {
+        match TcpListener::bind(("127.0.0.1", first_selected)) {
+            Ok(listener) => break listener,
+            Err(error)
+                if error.kind() == std::io::ErrorKind::AddrInUse && Instant::now() < deadline =>
+            {
+                thread::sleep(Duration::from_millis(1));
+            }
+            Err(error) => panic!("could not claim released port {first_selected}: {error}"),
+        }
+    };
+
+    wait_line(&out, "fixture waiting before bind", Duration::from_secs(5));
+    fs::write(&release, "fail").unwrap();
+
+    // A launch that never announced must exit non-zero with the app's own
+    // failure tail — the supervisor must never report a failed launch as
+    // success, however many port handoffs it attempted.
+    let status = wait_exit(&mut child.0, Duration::from_secs(15));
+    assert!(
+        !status.success(),
+        "failed launch reported success: {status}"
+    );
+
+    let stderr = drain(&err, Duration::from_secs(2)).join("\n");
+    // The exact wording depends on whether the exit is classified before the
+    // three-second early-failure window (a timing detail unit-tested
+    // elsewhere), so assert the outcome: the failure is surfaced with the
+    // app's own tail, never silently dropped.
+    assert!(
+        stderr.contains("exit status: 7") && stderr.contains("boom"),
+        "{stderr}"
+    );
+
+    // No announcement may be printed: there was nothing to serve.
+    let stdout = drain(&out, Duration::from_secs(2)).join("\n");
+    assert!(
+        !stdout.contains("app        http://127.0.0.1:"),
+        "failed launch must not announce a URL:\n{stdout}"
+    );
+}
+
+#[test]
 fn port_zero_injects_os_assigned_port_via_args() {
     let repo = tempdir().unwrap();
     let bin = tempdir().unwrap();
@@ -476,13 +623,34 @@ fn line_reader(stream: impl Read + Send + 'static) -> mpsc::Receiver<String> {
 }
 
 fn wait_line(rx: &mpsc::Receiver<String>, needle: &str, timeout: Duration) -> String {
+    let mut seen = Vec::new();
     let deadline = Instant::now() + timeout;
     loop {
         let remaining = deadline.saturating_duration_since(Instant::now());
         match rx.recv_timeout(remaining) {
             Ok(line) if line.contains(needle) => return line,
-            Ok(_) => {}
-            Err(_) => panic!("timed out waiting for output containing {needle:?}"),
+            Ok(line) => seen.push(line),
+            Err(_) => panic!(
+                "timed out waiting for output containing {needle:?}; saw:\n{}",
+                seen.join("\n")
+            ),
+        }
+    }
+}
+
+/// Drains whatever the reader thread still has buffered once the child is
+/// gone, so post-exit assertions see every line the process produced.
+fn drain(rx: &mpsc::Receiver<String>, timeout: Duration) -> Vec<String> {
+    let mut lines = Vec::new();
+    let deadline = Instant::now() + timeout;
+    loop {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return lines;
+        }
+        match rx.recv_timeout(remaining) {
+            Ok(line) => lines.push(line),
+            Err(_) => return lines,
         }
     }
 }

@@ -259,34 +259,54 @@ fn serve_attempt(
             }
             if status.success() {
                 if announced.is_some() {
-                    println!("  exited     {}", status);
+                    println!("  exited     {status}");
                 }
                 return Ok(Attempt::Done);
             }
 
-            if started.elapsed() < Duration::from_secs(3) {
-                let err = error_with_tail(format!("{} failed early: {status}", spec.name), &ring);
-                // An early exit before any announcement can mean the selected
-                // port was sniped between release and bind — retry on a fresh
-                // port instead of surfacing a cryptic failure.
-                if announced.is_none()
-                    && let Some(selected) = selected
-                {
-                    return Ok(Attempt::Retry {
-                        next_start: selected.saturating_add(1),
-                        err,
-                    });
-                }
-                return Err(err);
+            let err = if started.elapsed() < Duration::from_secs(3) {
+                error_with_tail(format!("{} failed early: {status}", spec.name), &ring)
+            } else {
+                error_with_tail(format!("{} exited: {status}", spec.name), &ring)
+            };
+            // Retry only when the selected endpoint is actually occupied at
+            // failure time — the lost reservation-to-bind handoff. Unrelated
+            // failures (bad args, missing dependencies) leave the port free
+            // and stay visible instead of being relaunched. The occupancy
+            // check is the snipe signal; the child's own failure timing is
+            // irrelevant to it, so slow-dying apps that lost the handoff are
+            // recovered too.
+            let retry = if announced.is_none() {
+                selected.and_then(|selected| {
+                    retry_handoff_start(selected, |port| {
+                        std::net::TcpListener::bind(("127.0.0.1", port)).map(|_| ())
+                    })
+                })
+            } else {
+                None
+            };
+            if let Some(next_start) = retry {
+                return Ok(Attempt::Retry { next_start, err });
             }
-
-            return Err(error_with_tail(
-                format!("{} exited: {status}", spec.name),
-                &ring,
-            ));
+            return Err(err);
         }
 
         thread::sleep(Duration::from_millis(100));
+    }
+}
+
+/// A lost handoff is diagnosed by occupancy alone: if the injected port is
+/// still held by another process when the child died, relaunch one port up.
+/// Non-AddrInUse bind errors (permissions, protocol issues) are not a snipe.
+fn retry_handoff_start(
+    selected: u16,
+    bind: impl FnOnce(u16) -> std::io::Result<()>,
+) -> Option<u16> {
+    match bind(selected) {
+        Err(error) if error.kind() == std::io::ErrorKind::AddrInUse => {
+            Some(selected.saturating_add(1))
+        }
+        _ => None,
     }
 }
 
@@ -510,7 +530,7 @@ fn join_pumps(joins: &mut Vec<thread::JoinHandle<()>>) {
 
 #[cfg(test)]
 mod tests {
-    use super::{SupervisorOptions, announce_reported_url, probe_hint};
+    use super::{SupervisorOptions, announce_reported_url, probe_hint, retry_handoff_start};
     use std::{
         io::{Read, Write},
         net::{TcpListener, TcpStream},
@@ -549,6 +569,57 @@ mod tests {
 
         assert_eq!(probe_hint(port), Some(format!("http://127.0.0.1:{port}")));
         handle.join().unwrap();
+    }
+
+    #[test]
+    fn retries_when_the_selected_port_was_claimed() {
+        let port = 5000;
+        let mut calls = Vec::new();
+
+        assert_eq!(
+            retry_handoff_start(port, |candidate| {
+                calls.push(candidate);
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::AddrInUse,
+                    "claimed",
+                ))
+            }),
+            Some(port.saturating_add(1))
+        );
+        assert_eq!(calls, vec![port]);
+    }
+
+    #[test]
+    fn does_not_retry_on_bind_errors_other_than_addr_in_use() {
+        let port = 5000;
+        let mut calls = Vec::new();
+
+        assert_eq!(
+            retry_handoff_start(port, |candidate| {
+                calls.push(candidate);
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::PermissionDenied,
+                    "not a snipe",
+                ))
+            }),
+            None
+        );
+        assert_eq!(calls, vec![port]);
+    }
+
+    #[test]
+    fn does_not_retry_when_the_selected_port_is_free() {
+        let port = 5000;
+        let mut calls = Vec::new();
+
+        assert_eq!(
+            retry_handoff_start(port, |candidate| {
+                calls.push(candidate);
+                Ok(())
+            }),
+            None
+        );
+        assert_eq!(calls, vec![port]);
     }
 
     #[test]
