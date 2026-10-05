@@ -86,10 +86,16 @@ fn py_command(
         if let Some(path) = venv_bin(root, "python") {
             return Some(CommandSpec::new(path.to_string_lossy(), args));
         }
-        for candidate in ["python3", "python"] {
-            if resolver.resolve(candidate, root).is_some() {
-                return Some(CommandSpec::new(candidate, args));
-            }
+        // "python3" always wins when resolvable (including via a fetchable
+        // runtime). Only Windows falls back to a bare "python": there it is
+        // the canonical launcher name, while on Unix it often means a legacy
+        // python2 interpreter that would break modern frameworks.
+        if resolver.resolve("python3", root).is_some() {
+            return Some(CommandSpec::new("python3", args));
+        }
+        #[cfg(windows)]
+        if resolver.resolve("python", root).is_some() {
+            return Some(CommandSpec::new("python", args));
         }
         return None;
     }
