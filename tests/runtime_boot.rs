@@ -299,6 +299,7 @@ fn archive(files: &[(&str, &[u8])]) -> Vec<u8> {
     }
 }
 
+#[cfg(not(windows))]
 fn tar_gz(files: &[(&str, &[u8])]) -> Vec<u8> {
     let mut raw = Vec::new();
     {
