@@ -4,15 +4,20 @@ use std::{
     net::{SocketAddr, TcpListener, TcpStream},
     path::{Path, PathBuf},
     process::{Child, Command, ExitStatus, Stdio},
-    sync::{OnceLock, mpsc},
+    sync::{Mutex, OnceLock, mpsc},
     thread,
     time::{Duration, Instant},
 };
 
 use tempfile::{TempDir, tempdir};
 
+// Launching tests run serialized: `--port 0` hands sibling tests' fixtures
+// the same ephemeral ports faster than the bounded handoff retry absorbs.
+static SERIAL: Mutex<()> = Mutex::new(());
+
 #[test]
 fn all_launches_two_apps_with_distinct_labeled_urls() {
+    let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
     let repo = two_app_repo();
     let bin = tempdir().unwrap();
     stub_exec_mode(bin.path(), "npm", Some("env-port"));
@@ -24,20 +29,17 @@ fn all_launches_two_apps_with_distinct_labeled_urls() {
     let out = line_reader(child.0.stdout.take().unwrap());
     let err = line_reader(child.0.stderr.take().unwrap());
 
-    let js_line = wait_for(
+    let lines = wait_for_all(
         &out,
         &err,
-        "app        [package:dev] http://127.0.0.1:",
+        &[
+            "app        [package:dev] http://127.0.0.1:",
+            "app        [django] http://127.0.0.1:",
+        ],
         Duration::from_secs(30),
     );
-    let py_line = wait_for(
-        &out,
-        &err,
-        "app        [django] http://127.0.0.1:",
-        Duration::from_secs(30),
-    );
-    let js_port = app_line_port(&js_line);
-    let py_port = app_line_port(&py_line);
+    let js_port = app_line_port(&lines[0]);
+    let py_port = app_line_port(&lines[1]);
     assert_ne!(js_port, py_port);
 
     assert!(http_get(js_port).starts_with("HTTP/1.1 200"));
@@ -93,6 +95,7 @@ fn all_conflicts_with_select() {
 
 #[test]
 fn all_with_one_app_runs_single_path() {
+    let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
     let repo = package_only_repo();
     let bin = tempdir().unwrap();
     stub_exec_mode(bin.path(), "npm", Some("env-port"));
@@ -119,6 +122,7 @@ fn all_with_one_app_runs_single_path() {
 
 #[test]
 fn all_sibling_failure_tears_down_the_rest() {
+    let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
     let repo = two_app_repo();
     let bin = tempdir().unwrap();
     stub_exec_mode(bin.path(), "npm", Some("env-port"));
@@ -166,6 +170,7 @@ fn all_sibling_failure_tears_down_the_rest() {
 #[cfg(unix)]
 #[test]
 fn all_ctrl_c_stops_every_child() {
+    let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
     let repo = two_app_repo();
     let bin = tempdir().unwrap();
     stub_exec_mode(bin.path(), "npm", Some("env-port"));
@@ -177,19 +182,16 @@ fn all_ctrl_c_stops_every_child() {
     let out = line_reader(child.0.stdout.take().unwrap());
     let err = line_reader(child.0.stderr.take().unwrap());
 
-    let js_line = wait_for(
+    let lines = wait_for_all(
         &out,
         &err,
-        "app        [package:dev] http://127.0.0.1:",
+        &[
+            "app        [package:dev] http://127.0.0.1:",
+            "app        [django] http://127.0.0.1:",
+        ],
         Duration::from_secs(30),
     );
-    let py_line = wait_for(
-        &out,
-        &err,
-        "app        [django] http://127.0.0.1:",
-        Duration::from_secs(30),
-    );
-    let ports = [app_line_port(&js_line), app_line_port(&py_line)];
+    let ports = [app_line_port(&lines[0]), app_line_port(&lines[1])];
 
     unsafe {
         libc::kill(child.0.id() as libc::pid_t, libc::SIGINT);
@@ -217,6 +219,7 @@ fn all_ctrl_c_stops_every_child() {
 
 #[test]
 fn all_port_start_allocates_distinct_ascending_ports() {
+    let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
     let repo = two_app_repo();
     let bin = tempdir().unwrap();
     stub_exec_mode(bin.path(), "npm", Some("env-port"));
@@ -232,20 +235,17 @@ fn all_port_start_allocates_distinct_ascending_ports() {
     let out = line_reader(child.0.stdout.take().unwrap());
     let err = line_reader(child.0.stderr.take().unwrap());
 
-    let js_line = wait_for(
+    let lines = wait_for_all(
         &out,
         &err,
-        "app        [package:dev] http://127.0.0.1:",
+        &[
+            "app        [package:dev] http://127.0.0.1:",
+            "app        [django] http://127.0.0.1:",
+        ],
         Duration::from_secs(30),
     );
-    let py_line = wait_for(
-        &out,
-        &err,
-        "app        [django] http://127.0.0.1:",
-        Duration::from_secs(30),
-    );
-    let js_port = app_line_port(&js_line);
-    let py_port = app_line_port(&py_line);
+    let js_port = app_line_port(&lines[0]);
+    let py_port = app_line_port(&lines[1]);
 
     assert!(js_port >= start, "{js_port} below requested {start}");
     assert!(py_port > js_port, "{py_port} must follow {js_port}");
@@ -395,6 +395,44 @@ fn drain(rx: &mpsc::Receiver<String>, timeout: Duration) -> Vec<String> {
         match rx.recv_timeout(remaining) {
             Ok(line) => lines.push(line),
             Err(_) => return lines,
+        }
+    }
+}
+
+/// Waits until every needle has matched a distinct line, returning the
+/// matching line per needle in input order. Announcements can arrive in any
+/// order, so sequential `wait_for` calls would lose a later needle's line to
+/// the first call's buffer.
+fn wait_for_all(
+    rx: &mpsc::Receiver<String>,
+    err: &mpsc::Receiver<String>,
+    needles: &[&str],
+    timeout: Duration,
+) -> Vec<String> {
+    let mut seen = Vec::new();
+    let mut matched = vec![None; needles.len()];
+    let deadline = Instant::now() + timeout;
+    loop {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        match rx.recv_timeout(remaining) {
+            Ok(line) => {
+                for (idx, needle) in needles.iter().enumerate() {
+                    if matched[idx].is_none() && line.contains(needle) {
+                        matched[idx] = Some(line.clone());
+                    }
+                }
+                seen.push(line);
+                if matched.iter().all(Option::is_some) {
+                    return matched.into_iter().map(Option::unwrap).collect();
+                }
+            }
+            Err(_) => {
+                let stderr = drain(err, Duration::from_secs(2)).join("\n");
+                panic!(
+                    "timed out waiting for all of {needles:?}; srvm stdout:\n{}\nsrvm stderr:\n{stderr}",
+                    seen.join("\n")
+                );
+            }
         }
     }
 }
