@@ -2,6 +2,7 @@ use std::{
     collections::HashMap,
     io::{Read, Write},
     net::TcpListener,
+    path::Path,
     thread,
     time::Duration,
 };
@@ -49,13 +50,7 @@ fn path_scrubbed_fetch_boots_node_app() {
     let home = tempdir().unwrap();
     let path = tempdir().unwrap();
 
-    Command::cargo_bin("srvm")
-        .unwrap()
-        .env("PATH", path.path())
-        .env("HOME", home.path())
-        .env("USERPROFILE", home.path())
-        .env_remove("PORT")
-        .env("SRVM_CACHE_DIR", cache.path())
+    scrubbed(path.path(), home.path(), cache.path())
         .env("SRVM_NODE_INDEX_URL", format!("{base}/index.json"))
         .arg("--dry-run")
         .arg(repo.path())
@@ -67,13 +62,7 @@ fn path_scrubbed_fetch_boots_node_app() {
         ));
     assert!(cache.path().read_dir().unwrap().next().is_none());
 
-    Command::cargo_bin("srvm")
-        .unwrap()
-        .env("PATH", path.path())
-        .env("HOME", home.path())
-        .env("USERPROFILE", home.path())
-        .env_remove("PORT")
-        .env("SRVM_CACHE_DIR", cache.path())
+    scrubbed(path.path(), home.path(), cache.path())
         .env("SRVM_NODE_INDEX_URL", format!("{base}/index.json"))
         .arg("--no-open")
         .arg("--no-install")
@@ -112,13 +101,7 @@ fn path_scrubbed_fetch_boots_python_app() {
     let home = tempdir().unwrap();
     let path = tempdir().unwrap();
 
-    Command::cargo_bin("srvm")
-        .unwrap()
-        .env("PATH", path.path())
-        .env("HOME", home.path())
-        .env("USERPROFILE", home.path())
-        .env_remove("PORT")
-        .env("SRVM_CACHE_DIR", cache.path())
+    scrubbed(path.path(), home.path(), cache.path())
         .env("SRVM_PYTHON_RELEASE_URL", format!("{base}/python.json"))
         .arg("--no-open")
         .arg("--no-install")
@@ -242,19 +225,29 @@ fn launch_scrubbed(repo: &tempfile::TempDir, extra: &[(&str, &str)]) -> assert_c
     let cache = tempdir().unwrap();
     let home = tempdir().unwrap();
     let path = tempdir().unwrap();
-    let mut cmd = Command::cargo_bin("srvm").unwrap();
-    cmd.env("PATH", path.path())
-        .env("HOME", home.path())
-        .env("USERPROFILE", home.path())
-        .env_remove("PORT")
-        .env("SRVM_CACHE_DIR", cache.path())
-        .arg("--no-open")
-        .arg("--no-install")
-        .arg(repo.path());
+    let mut cmd = scrubbed(path.path(), home.path(), cache.path());
+    cmd.arg("--no-open").arg("--no-install").arg(repo.path());
     for (key, value) in extra {
         cmd.env(key, value);
     }
     cmd.assert().success()
+}
+
+/// srvm with PATH, HOME and the cache pointed at empty tempdirs. On Windows
+/// the well-known-dir lookup (%ProgramFiles%\nodejs, %LOCALAPPDATA%\pnpm) is
+/// scrubbed too, or a CI runner's real toolchain leaks in and nothing fetches.
+fn scrubbed(path: &Path, home: &Path, cache: &Path) -> Command {
+    let mut cmd = Command::cargo_bin("srvm").unwrap();
+    cmd.env("PATH", path)
+        .env("HOME", home)
+        .env("USERPROFILE", home)
+        .env("ProgramFiles", home)
+        .env("ProgramFiles(x86)", home)
+        .env("ProgramW6432", home)
+        .env("LOCALAPPDATA", home)
+        .env_remove("PORT")
+        .env("SRVM_CACHE_DIR", cache);
+    cmd
 }
 
 fn fixture_node(version: &str, target: &str) -> (String, String, String, String) {
