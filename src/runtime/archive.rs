@@ -97,6 +97,14 @@ fn find_tool_in(root: &Path, wanted: &[String], preferred_only: bool) -> Option<
                 }
                 continue;
             }
+            // Windows tools are real files; reading through tar-created
+            // symlinks can fail there, and CreateProcess would not follow
+            // them to launchable content anyway. Unix keeps them — node's
+            // bin/npm is a symlink and is the canonical match.
+            #[cfg(windows)]
+            if file_type.is_symlink() {
+                continue;
+            }
             let file_name = path.file_name()?.to_string_lossy();
             if wanted.iter().any(|name| file_name == *name)
                 && (!preferred_only || is_preferred_location(&path, root))
