@@ -204,7 +204,7 @@ fn print_dry_run(
         println!("  match      {}. {}", index + 1, candidate.spec.name);
         println!("  root       {}", display_rel(candidate));
         println!("  command    {}", candidate.spec.command_line());
-        if let Some(install) = &candidate.spec.install {
+        for install in &candidate.spec.installs {
             println!("  install    {}", install.command_line());
         }
         let env_file = dotenv::load(&candidate.root);
@@ -378,9 +378,7 @@ fn prepare_runtimes(
 
 fn programs_of(spec: &ServeSpec) -> Vec<&str> {
     let mut programs = vec![spec.command.program.as_str()];
-    if let Some(install) = &spec.install {
-        programs.push(install.program.as_str());
-    }
+    programs.extend(spec.installs.iter().map(|install| install.program.as_str()));
     programs
 }
 

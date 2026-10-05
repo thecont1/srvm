@@ -65,14 +65,8 @@ pub fn run(
         return run_static(root, requested, options, stop);
     }
 
-    if !options.no_install
-        && let Some(install) = &spec.install
-    {
-        println!(
-            "  step       installing dependencies — {}",
-            install.command_line()
-        );
-        run_install(root, install, options, path_prepend, None, app_env)?;
+    if !options.no_install && !spec.installs.is_empty() {
+        run_bootstrap(root, spec, options, path_prepend, None, app_env)?;
     }
 
     let opened = Arc::new(AtomicBool::new(false));
@@ -142,17 +136,10 @@ pub fn run_many(items: &[LaunchItem], options: SupervisorOptions) -> Result<()> 
     }
 
     for item in items {
-        if !options.no_install
-            && let Some(install) = &item.candidate.spec.install
-        {
-            println!(
-                "  step       {}installing dependencies — {}",
-                labeled(Some(&item.label)),
-                install.command_line()
-            );
-            run_install(
+        if !options.no_install && !item.candidate.spec.installs.is_empty() {
+            run_bootstrap(
                 &item.candidate.root,
-                install,
+                &item.candidate.spec,
                 options,
                 &item.path_prepend,
                 Some(&item.label),
@@ -275,6 +262,31 @@ fn plan_port(
     }
 
     Ok(requested)
+}
+
+/// Runs every bootstrap install step in order and then records the stamp that
+/// makes the next run cheap. A failing step aborts before anything is stamped,
+/// so a partial bootstrap is never mistaken for a complete one.
+fn run_bootstrap(
+    root: &Path,
+    spec: &ServeSpec,
+    options: SupervisorOptions,
+    path_prepend: &[PathBuf],
+    label: Option<&str>,
+    app_env: &[(String, String)],
+) -> Result<()> {
+    for install in &spec.installs {
+        println!(
+            "  step       {}installing dependencies — {}",
+            labeled(label),
+            install.command_line()
+        );
+        run_install(root, install, options, path_prepend, label, app_env)?;
+    }
+    if let Some(stamp) = &spec.stamp {
+        crate::bootstrap::record(root, stamp)?;
+    }
+    Ok(())
 }
 
 fn run_install(

@@ -47,7 +47,10 @@ pub struct ServeSpec {
     pub name: String,
     pub tool: String,
     pub command: CommandSpec,
-    pub install: Option<CommandSpec>,
+    /// Ordered bootstrap install steps, run before the app starts.
+    pub installs: Vec<CommandSpec>,
+    /// Stamped after a successful bootstrap, so repeat runs stay cheap.
+    pub stamp: Option<crate::bootstrap::Stamp>,
     pub url_hint: Option<u16>,
     pub is_static: bool,
     pub port: PortInjection,
@@ -65,7 +68,8 @@ impl ServeSpec {
             name: name.into(),
             tool: tool.into(),
             command,
-            install: None,
+            installs: Vec::new(),
+            stamp: None,
             url_hint,
             is_static: false,
             port,
@@ -77,11 +81,22 @@ impl ServeSpec {
             name: "static".into(),
             tool: "srvm".into(),
             command,
-            install: None,
+            installs: Vec::new(),
+            stamp: None,
             url_hint: Some(url_hint),
             is_static: true,
             port: PortInjection::Listener,
         }
+    }
+
+    pub fn with_install(mut self, command: CommandSpec) -> Self {
+        self.installs.push(command);
+        self
+    }
+
+    pub fn with_stamp(mut self, stamp: crate::bootstrap::Stamp) -> Self {
+        self.stamp = Some(stamp);
+        self
     }
 
     pub fn command_line(&self) -> String {

@@ -61,12 +61,15 @@ fn rule_rails(root: &Path, resolver: &dyn ToolResolver) -> Option<ServeSpec> {
     if probe::file_exists(root, "config/application.rb")
         && resolver.resolve("bundle", root).is_some()
     {
-        return Some(ServeSpec::new(
-            "rails",
-            "bundle",
-            CommandSpec::new("bundle", ["exec", "rails", "server"]),
-            Some(3000),
-            PortInjection::Args(vec!["-p".into(), "{port}".into()]),
+        return Some(with_bundle_install(
+            root,
+            ServeSpec::new(
+                "rails",
+                "bundle",
+                CommandSpec::new("bundle", ["exec", "rails", "server"]),
+                Some(3000),
+                PortInjection::Args(vec!["-p".into(), "{port}".into()]),
+            ),
         ));
     }
 
@@ -78,12 +81,15 @@ fn rule_jekyll(root: &Path, resolver: &dyn ToolResolver) -> Option<ServeSpec> {
         && probe::file_contains(root, "Gemfile", "jekyll")
         && resolver.resolve("bundle", root).is_some()
     {
-        return Some(ServeSpec::new(
-            "jekyll",
-            "bundle",
-            CommandSpec::new("bundle", ["exec", "jekyll", "serve"]),
-            Some(4000),
-            PortInjection::Args(vec!["-P".into(), "{port}".into()]),
+        return Some(with_bundle_install(
+            root,
+            ServeSpec::new(
+                "jekyll",
+                "bundle",
+                CommandSpec::new("bundle", ["exec", "jekyll", "serve"]),
+                Some(4000),
+                PortInjection::Args(vec!["-P".into(), "{port}".into()]),
+            ),
         ));
     }
     None
@@ -94,12 +100,15 @@ fn rule_rackup(root: &Path, resolver: &dyn ToolResolver) -> Option<ServeSpec> {
         && probe::file_contains(root, "Gemfile", "rack")
         && resolver.resolve("bundle", root).is_some()
     {
-        return Some(ServeSpec::new(
-            "rackup",
-            "bundle",
-            CommandSpec::new("bundle", ["exec", "rackup"]),
-            Some(9292),
-            PortInjection::Args(vec!["-p".into(), "{port}".into()]),
+        return Some(with_bundle_install(
+            root,
+            ServeSpec::new(
+                "rackup",
+                "bundle",
+                CommandSpec::new("bundle", ["exec", "rackup"]),
+                Some(9292),
+                PortInjection::Args(vec!["-p".into(), "{port}".into()]),
+            ),
         ));
     }
     None
@@ -145,13 +154,17 @@ fn rule_mkdocs(root: &Path, resolver: &dyn ToolResolver) -> Option<ServeSpec> {
 fn rule_phoenix(root: &Path, resolver: &dyn ToolResolver) -> Option<ServeSpec> {
     if probe::file_contains(root, "mix.exs", "phoenix") {
         return command_if_resolved(resolver, root, "mix", ["phx.server"]).map(|command| {
-            ServeSpec::new(
+            let mut spec = ServeSpec::new(
                 "phoenix",
                 "mix",
                 command,
                 Some(4000),
                 PortInjection::Env("PORT".into()),
-            )
+            );
+            if !probe::dir_exists(root, "deps") {
+                spec = spec.with_install(CommandSpec::new("mix", ["deps.get"]));
+            }
+            spec
         });
     }
     None
@@ -160,16 +173,29 @@ fn rule_phoenix(root: &Path, resolver: &dyn ToolResolver) -> Option<ServeSpec> {
 fn rule_laravel(root: &Path, resolver: &dyn ToolResolver) -> Option<ServeSpec> {
     if probe::file_exists(root, "composer.json") && probe::file_exists(root, "artisan") {
         return command_if_resolved(resolver, root, "php", ["artisan", "serve"]).map(|command| {
-            ServeSpec::new(
+            let mut spec = ServeSpec::new(
                 "laravel",
                 "php",
                 command,
                 Some(8000),
                 PortInjection::Args(vec!["--port={port}".into()]),
-            )
+            );
+            if !probe::dir_exists(root, "vendor") {
+                spec = spec.with_install(CommandSpec::new("composer", ["install"]));
+            }
+            spec
         });
     }
     None
+}
+
+/// Bundler is idempotent, but a repository that already vendored its gems does
+/// not need it: `vendor/bundle` or `.bundle` means the work is done.
+fn with_bundle_install(root: &Path, spec: ServeSpec) -> ServeSpec {
+    if probe::dir_exists(root, "vendor/bundle") || probe::dir_exists(root, ".bundle") {
+        return spec;
+    }
+    spec.with_install(CommandSpec::new("bundle", ["install"]))
 }
 
 fn rule_trunk(root: &Path, resolver: &dyn ToolResolver) -> Option<ServeSpec> {
