@@ -220,7 +220,19 @@ mod tests {
         assert!(held.is_err());
 
         drop(listener);
-        assert!(TcpListener::bind(("127.0.0.1", port)).is_ok());
+        // Windows does not release a bound port synchronously — poll briefly
+        // instead of asserting instant availability.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            match TcpListener::bind(("127.0.0.1", port)) {
+                Ok(_) => break,
+                Err(err) if std::time::Instant::now() < deadline => {
+                    let _ = err;
+                    std::thread::sleep(std::time::Duration::from_millis(50));
+                }
+                Err(err) => panic!("port not released after reservation drop: {err}"),
+            }
+        }
     }
 
     #[test]
