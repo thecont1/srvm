@@ -28,7 +28,7 @@ fn occupied_start_shifts_env_port_and_install_sees_no_port() {
     // A parallel test may claim the successor port before srvm reserves or
     // binds it; srvm walks or retries internally, so the authoritative port
     // is the last "busy ->" line before the announcement.
-    let (seen, app_line) = wait_announcement(&out, Duration::from_secs(25));
+    let (seen, app_line) = wait_announcement(&out, &_err, Duration::from_secs(25));
     let announced = app_line_port(&app_line);
     let selected: u16 = seen
         .iter()
@@ -225,7 +225,7 @@ fn port_zero_injects_os_assigned_port_via_args() {
     let out = line_reader(child.0.stdout.take().unwrap());
     let _err = line_reader(child.0.stderr.take().unwrap());
 
-    let (seen, app_line) = wait_announcement(&out, Duration::from_secs(20));
+    let (seen, app_line) = wait_announcement(&out, &_err, Duration::from_secs(20));
     let selected: u16 = seen
         .iter()
         .rev()
@@ -481,7 +481,7 @@ fn silent_server_is_found_by_probing_the_shifted_port() {
 
     // srvm may retry internally if the reserved port is sniped mid-handoff;
     // the announced port just has to be a real shifted port, not the decoy's.
-    let (_seen, app_line) = wait_announcement(&out, Duration::from_secs(30));
+    let (_seen, app_line) = wait_announcement(&out, &_err, Duration::from_secs(30));
     let announced = app_line_port(&app_line);
     assert_ne!(
         announced, decoy_port,
@@ -664,8 +664,14 @@ fn drain(rx: &mpsc::Receiver<String>, timeout: Duration) -> Vec<String> {
 
 /// Collects srvm's stdout until the `app` announcement, returning every line
 /// seen plus the announcement itself. Callers inspect the earlier lines when
-/// an internal retry may have printed more than one port report.
-fn wait_announcement(rx: &mpsc::Receiver<String>, timeout: Duration) -> (Vec<String>, String) {
+/// an internal retry may have printed more than one port report. On failure
+/// the panic carries both the stdout seen so far and srvm's stderr, so a CI
+/// log explains why the launch died instead of leaving a bare timeout.
+fn wait_announcement(
+    rx: &mpsc::Receiver<String>,
+    err: &mpsc::Receiver<String>,
+    timeout: Duration,
+) -> (Vec<String>, String) {
     let mut seen = Vec::new();
     let deadline = Instant::now() + timeout;
     loop {
@@ -678,7 +684,13 @@ fn wait_announcement(rx: &mpsc::Receiver<String>, timeout: Duration) -> (Vec<Str
                     return (seen, line);
                 }
             }
-            Err(_) => panic!("timed out waiting for the app announcement"),
+            Err(_) => {
+                let stderr = drain(err, Duration::from_secs(2)).join("\n");
+                panic!(
+                    "timed out waiting for the app announcement; srvm stdout:\n{}\nsrvm stderr:\n{stderr}",
+                    seen.join("\n")
+                );
+            }
         }
     }
 }
