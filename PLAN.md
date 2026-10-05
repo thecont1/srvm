@@ -293,7 +293,7 @@ Sequencing rationale: M1+M2 is the product's spine and is directly port-verifiab
 | `.cmd`/`.bat` shims on Windows can't take signals | Kill the tree, never just the shim PID |
 | Monorepo false positives (root package.json but real app is deeper) | `--select` + `--dry-run` escape hatches; `turbo.json`/`nx.json` rules help; recursive subdir detection is a possible M6+ exploration — **not** v0.1 |
 | Repos with several matching rules where first is wrong | `detect()` returns all; `--dry-run` shows the full ranked list so `--select` is discoverable |
-| Port race between probe and bind | The reservation is held until just before spawn, then dropped. A racer can still steal the port and make the app fail; when the app successfully binds elsewhere and prints a URL, srvm reports that actual URL. It does not automatically rerun commands. |
+| Port race between probe and bind | The reservation is held until just before spawn, then dropped. If a racer claims the port and the child dies on bind before announcing, srvm re-reserves from the next port and retries (bounded, twice). When the app binds elsewhere and prints a URL, srvm reports that actual URL. |
 | AI-generated repos often lack lockfiles/scripts entirely | `framework_bins` dep table + static fallback catch most; M5 covers missing PMs themselves |
 
 ## 8. Explicit non-goals (v1)

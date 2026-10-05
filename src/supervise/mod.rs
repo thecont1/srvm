@@ -164,6 +164,16 @@ fn run_install(
     }
 }
 
+/// How many times to relaunch when a port was injected but the child dies
+/// before announcing — the reservation is released before spawn, so another
+/// process can claim the port in the gap and the child fails on bind.
+const HANDOFF_RETRIES: usize = 2;
+
+enum Attempt {
+    Done,
+    Retry { next_start: u16, err: anyhow::Error },
+}
+
 fn run_server(
     root: &Path,
     spec: &ServeSpec,
@@ -171,10 +181,32 @@ fn run_server(
     options: SupervisorOptions,
     path_prepend: &[PathBuf],
 ) -> Result<()> {
+    let mut start = requested;
+    for attempt in 0..=HANDOFF_RETRIES {
+        match serve_attempt(root, spec, requested, start, options, path_prepend)? {
+            Attempt::Done => return Ok(()),
+            Attempt::Retry { next_start, .. } if attempt < HANDOFF_RETRIES => {
+                println!("  step       port was claimed before the app bound it; retrying");
+                start = Some(next_start);
+            }
+            Attempt::Retry { err, .. } => return Err(err),
+        }
+    }
+    unreachable!()
+}
+
+fn serve_attempt(
+    root: &Path,
+    spec: &ServeSpec,
+    report_start: Option<u16>,
+    start: Option<u16>,
+    options: SupervisorOptions,
+    path_prepend: &[PathBuf],
+) -> Result<Attempt> {
     let ring = Arc::new(Mutex::new(Ring::default()));
 
     let mut reservation = None;
-    let (command, env, selected) = match requested {
+    let (command, env, selected) = match start {
         Some(start) => {
             let listener = ports::reserve(start)
                 .with_context(|| format!("could not find a free port starting at {start}"))?;
@@ -186,7 +218,7 @@ fn run_server(
         None => (spec.command.clone(), Vec::new(), None),
     };
 
-    if let (Some(start), Some(selected)) = (requested, selected) {
+    if let (Some(start), Some(selected)) = (report_start, selected) {
         report_port(start, selected, options);
     }
 
@@ -229,14 +261,23 @@ fn run_server(
                 if announced.is_some() {
                     println!("  exited     {}", status);
                 }
-                return Ok(());
+                return Ok(Attempt::Done);
             }
 
             if started.elapsed() < Duration::from_secs(3) {
-                return Err(error_with_tail(
-                    format!("{} failed early: {status}", spec.name),
-                    &ring,
-                ));
+                let err = error_with_tail(format!("{} failed early: {status}", spec.name), &ring);
+                // An early exit before any announcement can mean the selected
+                // port was sniped between release and bind — retry on a fresh
+                // port instead of surfacing a cryptic failure.
+                if announced.is_none()
+                    && let Some(selected) = selected
+                {
+                    return Ok(Attempt::Retry {
+                        next_start: selected.saturating_add(1),
+                        err,
+                    });
+                }
+                return Err(err);
             }
 
             return Err(error_with_tail(
