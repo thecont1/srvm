@@ -334,7 +334,9 @@ Rust downloads the official **rustc, cargo, and rust-std** component archives ra
 
 **Verified CI:** [run 37335467566](https://github.com/thecont1/srvm/actions/runs/37335467566) reports successful macOS, Ubuntu, and Windows jobs for `f9e1a24`. `.github/workflows/ci.yml` runs `cargo fmt --check`, `cargo clippy --locked --all-targets -- -D warnings`, and `cargo test --locked`; it does not test release packaging, six-native-target execution, or live upstream runtime boots.
 
-**Next:** M6.1 discovery/bootstrap, then the release-readiness gate (runtime cache/Rust prefix, lifecycle ownership, MSRV), then M7 distribution with its six-target release pipeline and the `v0.1.0-rc.1` approval gate. No release workflow or published GitHub releases exist yet. Keep the validation carryovers below visible while moving forward.
+**M6.1 on `dev/chetna` (not yet merged):** conventional discovery, the default launch set, per-app roots, parse-only `.env`, and bootstrap installs with stamps are implemented with unit and integration regressions (`workspace.rs`, `launch.rs`, `dotenv.rs`, `bootstrap.rs`, `tests/discovery.rs`, `tests/bootstrap.rs`). The Python bootstrap test builds a real virtualenv and proves the stamp skips the second run's install. Still open before M6.1 can close: per-app `--no-install`/`--port` overrides, static-alongside-apps, `--json` dry-run output, and a review pass over the acceptance list in §5.2. `tests/multi.rs::all_port_start_allocates_distinct_ascending_ports` failed once under parallel load and passed on rerun; treat it as flaky until it is reproduced in isolation.
+
+**Next:** the release-readiness gate (runtime cache/Rust prefix, lifecycle ownership, MSRV), then M7 distribution with its six-target release pipeline and the `v0.1.0-rc.1` approval gate. No release workflow or published GitHub releases exist yet. Keep the validation carryovers below visible while moving forward.
 
 ### 5.1 Validation carryovers from implemented milestones (open until milestone R closes them)
 
