@@ -8,7 +8,7 @@ use std::{
 use anyhow::{Context, Result, bail};
 
 use super::{
-    archive::{extract_verified, find_tool},
+    archive::{extract_verified, extract_verified_flat, find_tool},
     go, hint, node, python, rust,
 };
 
@@ -302,11 +302,16 @@ fn ensure_rust(
         println!("  step       fetching rust {version}");
     }
     let triple = rust_triple()?;
-    let (rustc_name, cargo_name) = rust::component_filenames(&version, triple);
+    let (rustc_name, cargo_name, std_name) = rust::component_filenames(&version, triple);
     let rustc = fetch_hashed(client, dist, &rustc_name)?;
     let cargo = fetch_hashed(client, dist, &cargo_name)?;
-    install_archives(
-        &[(&rustc.0, &rustc.1), (&cargo.0, &cargo.1)],
+    let std = fetch_hashed(client, dist, &std_name)?;
+    // rustc, cargo and rust-std ship as separate component archives whose
+    // contents must share one prefix — rustc locates the standard library in
+    // lib/rustlib next to its own binary, so a plain extraction that keeps
+    // each component under its own root would leave std unfindable.
+    install_archives_flat(
+        &[(&rustc.0, &rustc.1), (&cargo.0, &cargo.1), (&std.0, &std.1)],
         &dest,
         &[&["cargo"], &["rustc"]],
     )
@@ -496,6 +501,25 @@ fn install_archives(
     dest: &Path,
     groups: &[&[&str]],
 ) -> Result<Vec<PathBuf>> {
+    install_archives_mode(archives, dest, groups, false)
+}
+
+/// Variant for component-based toolchains (Rust): each archive's top-level
+/// directory is merged into the shared toolchain prefix.
+fn install_archives_flat(
+    archives: &[(&[u8], &[u8; 32])],
+    dest: &Path,
+    groups: &[&[&str]],
+) -> Result<Vec<PathBuf>> {
+    install_archives_mode(archives, dest, groups, true)
+}
+
+fn install_archives_mode(
+    archives: &[(&[u8], &[u8; 32])],
+    dest: &Path,
+    groups: &[&[&str]],
+    flat: bool,
+) -> Result<Vec<PathBuf>> {
     let partial = dest.with_file_name(format!(
         "{}.partial",
         dest.file_name().unwrap_or_default().to_string_lossy()
@@ -506,7 +530,11 @@ fn install_archives(
     let installed: Result<()> = (|| {
         fs::create_dir_all(&partial)?;
         for (bytes, expected) in archives {
-            extract_verified(bytes, expected, &partial)?;
+            if flat {
+                extract_verified_flat(bytes, expected, &partial)?;
+            } else {
+                extract_verified(bytes, expected, &partial)?;
+            }
         }
         fs::write(partial.join(".srvm-ok"), b"ok")?;
         if dest.exists() {
@@ -734,7 +762,15 @@ mod tests {
         let dir = cache.join("runtimes").join(kind).join(version);
         fs::create_dir_all(dir.join("bin")).unwrap();
         for tool in tools {
-            fs::write(dir.join("bin").join(tool), b"stub").unwrap();
+            let tool = dir.join("bin").join(tool);
+            fs::write(&tool, b"stub").unwrap();
+            // Extraction preserves mode 0755; make the seeded stub executable
+            // so find_tool accepts it like a real install would.
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                let _ = fs::set_permissions(&tool, fs::Permissions::from_mode(0o755));
+            }
         }
         fs::write(dir.join(".srvm-ok"), b"ok").unwrap();
     }

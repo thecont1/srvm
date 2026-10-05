@@ -164,9 +164,10 @@ fn path_scrubbed_fetch_boots_go_app() {
 fn path_scrubbed_fetch_boots_rust_app() {
     let triple = srvm::runtime::rust_triple().unwrap();
     let version = "1.81.0";
-    let (rustc_name, cargo_name) = (
+    let (rustc_name, cargo_name, std_name) = (
         format!("rustc-{version}-{triple}.tar.gz"),
         format!("cargo-{version}-{triple}.tar.gz"),
+        format!("rust-std-{version}-{triple}.tar.gz"),
     );
     let rustc_rel = format!("rustc-{version}-{triple}/rustc/bin/rustc");
     let cargo_rel = format!("cargo-{version}-{triple}/cargo/bin/cargo");
@@ -174,6 +175,15 @@ fn path_scrubbed_fetch_boots_rust_app() {
     let cargo = hashed_tool(
         &cargo_rel,
         "#!/bin/sh\necho http://127.0.0.1:${PORT:-4321}\n",
+    );
+    // rust-std ships as its own component and must merge into the toolchain
+    // prefix; the fixture archive carries a single rlib under lib/rustlib.
+    let std_rel = format!("rust-std-{version}-{triple}/lib/rustlib/{triple}/lib/libstd.rlib");
+    let std_archive = tar_gz(&[(&std_rel, &b"stdlib"[..])]);
+    let std_sums = format!(
+        "{}  {}\n",
+        hex_sha256(&std_archive),
+        std_rel.rsplit('/').next().unwrap_or("libstd.rlib")
     );
     let mut routes = HashMap::new();
     routes.insert(
@@ -184,6 +194,8 @@ fn path_scrubbed_fetch_boots_rust_app() {
     routes.insert(format!("/dist/{rustc_name}.sha256"), rustc.1);
     routes.insert(format!("/dist/{cargo_name}"), cargo.0);
     routes.insert(format!("/dist/{cargo_name}.sha256"), cargo.1);
+    routes.insert(format!("/dist/{std_name}"), std_archive);
+    routes.insert(format!("/dist/{std_name}.sha256"), std_sums.into_bytes());
     let base = serve(routes);
     let repo = tempdir().unwrap();
     std::fs::create_dir(repo.path().join("src")).unwrap();

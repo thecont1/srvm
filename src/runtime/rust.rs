@@ -8,10 +8,11 @@ pub fn channel_filename(channel: Option<&str>) -> Result<String> {
     Ok(format!("channel-rust-{channel}.toml"))
 }
 
-pub fn component_filenames(version: &str, triple: &str) -> (String, String) {
+pub fn component_filenames(version: &str, triple: &str) -> (String, String, String) {
     (
         format!("rustc-{version}-{triple}.tar.gz"),
         format!("cargo-{version}-{triple}.tar.gz"),
+        format!("rust-std-{version}-{triple}.tar.gz"),
     )
 }
 
@@ -66,7 +67,8 @@ mod tests {
             component_filenames("1.81.0", "aarch64-apple-darwin"),
             (
                 "rustc-1.81.0-aarch64-apple-darwin.tar.gz".into(),
-                "cargo-1.81.0-aarch64-apple-darwin.tar.gz".into()
+                "cargo-1.81.0-aarch64-apple-darwin.tar.gz".into(),
+                "rust-std-1.81.0-aarch64-apple-darwin.tar.gz".into()
             )
         );
     }
