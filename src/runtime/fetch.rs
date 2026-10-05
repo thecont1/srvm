@@ -163,7 +163,18 @@ fn ensure_node(
     quiet: bool,
 ) -> Result<Vec<PathBuf>> {
     let index_url = &endpoints.node_index_url;
-    let index = String::from_utf8(get(client, index_url)?).context("node index is not utf-8")?;
+    let index = match get(client, index_url) {
+        Ok(bytes) => String::from_utf8(bytes).context("node index is not utf-8")?,
+        Err(err) => {
+            return cached_fallback(
+                cache,
+                "node",
+                &[&["node"]],
+                |version| node_matches_cached(version, hint::node_want(root).as_ref()),
+                err,
+            );
+        }
+    };
     let choice = node::select_node(
         &index,
         hint::node_want(root).as_ref(),
@@ -194,8 +205,18 @@ fn ensure_python(
     endpoints: &Endpoints,
     quiet: bool,
 ) -> Result<Vec<PathBuf>> {
-    let release = String::from_utf8(get(client, &endpoints.python_release_url)?)
-        .context("python release JSON is not utf-8")?;
+    let release = match get(client, &endpoints.python_release_url) {
+        Ok(bytes) => String::from_utf8(bytes).context("python release JSON is not utf-8")?,
+        Err(err) => {
+            return cached_fallback(
+                cache,
+                "python",
+                &[&["python3", "python"]],
+                |version| python_matches_cached(version, hint::python_want(root).as_deref()),
+                err,
+            );
+        }
+    };
     let choice = python::select_python(
         &release,
         hint::python_want(root).as_deref(),
@@ -225,8 +246,18 @@ fn ensure_go(
     quiet: bool,
 ) -> Result<Vec<PathBuf>> {
     let index_url = &endpoints.go_index_url;
-    let index =
-        String::from_utf8(get(client, index_url)?).context("go release index is not utf-8")?;
+    let index = match get(client, index_url) {
+        Ok(bytes) => String::from_utf8(bytes).context("go release index is not utf-8")?,
+        Err(err) => {
+            return cached_fallback(
+                cache,
+                "go",
+                &[&["go"]],
+                |version| go_matches_cached(version, hint::go_want(root).as_ref()),
+                err,
+            );
+        }
+    };
     let choice = go::select_go(&index, hint::go_want(root).as_ref(), go_os()?, go_arch()?)?;
     let dest = cache.join("runtimes").join("go").join(&choice.version);
     if let Some(bins) = cached_bins(&dest, &[&["go"]]) {
@@ -248,9 +279,20 @@ fn ensure_rust(
     quiet: bool,
 ) -> Result<Vec<PathBuf>> {
     let dist = endpoints.rust_dist_url.trim_end_matches('/');
-    let channel = rust::channel_filename(hint::rust_channel(root).as_deref())?;
-    let manifest = String::from_utf8(get(client, &format!("{dist}/{channel}"))?)
-        .context("rust channel manifest is not utf-8")?;
+    let wanted = hint::rust_channel(root);
+    let channel = rust::channel_filename(wanted.as_deref())?;
+    let manifest = match get(client, &format!("{dist}/{channel}")) {
+        Ok(bytes) => String::from_utf8(bytes).context("rust channel manifest is not utf-8")?,
+        Err(err) => {
+            return cached_fallback(
+                cache,
+                "rust",
+                &[&["cargo"], &["rustc"]],
+                |version| rust_matches_cached(version, wanted.as_deref()),
+                err,
+            );
+        }
+    };
     let version = rust::version_from_channel_toml(&manifest)?;
     let dest = cache.join("runtimes").join("rust").join(&version);
     if let Some(bins) = cached_bins(&dest, &[&["cargo"], &["rustc"]]) {
@@ -353,6 +395,100 @@ fn cached_bins(dest: &Path, groups: &[&[&str]]) -> Option<Vec<PathBuf>> {
         }
     }
     Some(dirs)
+}
+
+/// Fallback for a failed index/channel fetch: reuse the newest cached runtime
+/// that matches the project's version hint, so offline launches keep working.
+/// When nothing cached matches, the original network error is surfaced.
+fn cached_fallback(
+    cache: &Path,
+    kind: &str,
+    groups: &[&[&str]],
+    matches: impl Fn(&str) -> bool,
+    index_error: anyhow::Error,
+) -> Result<Vec<PathBuf>> {
+    let dir = cache.join("runtimes").join(kind);
+    let mut candidates = Vec::new();
+    if let Ok(entries) = fs::read_dir(&dir) {
+        for entry in entries.flatten() {
+            let name = entry.file_name().to_string_lossy().into_owned();
+            if matches(&name) {
+                candidates.push(name);
+            }
+        }
+    }
+    candidates.sort_by(|left, right| cmp_versions(right, left));
+    for version in candidates {
+        if let Some(bins) = cached_bins(&dir.join(&version), groups) {
+            return Ok(bins);
+        }
+    }
+    Err(index_error)
+}
+
+fn node_matches_cached(version: &str, want: Option<&hint::NodeWant>) -> bool {
+    match want {
+        None | Some(hint::NodeWant::Lts(_)) | Some(hint::NodeWant::Latest) => true,
+        Some(hint::NodeWant::Exact(wanted)) => version == wanted,
+        Some(hint::NodeWant::Prefix(prefix)) => dotted_prefix(
+            version.trim_start_matches('v'),
+            prefix.trim_start_matches('v'),
+        ),
+    }
+}
+
+fn python_matches_cached(version: &str, want: Option<&str>) -> bool {
+    match want {
+        None => true,
+        Some(prefix) => dotted_prefix(version, prefix),
+    }
+}
+
+fn go_matches_cached(version: &str, want: Option<&hint::GoWant>) -> bool {
+    let version = version.trim_start_matches("go");
+    match want {
+        None => true,
+        Some(hint::GoWant::Exact(wanted)) => version == wanted,
+        Some(hint::GoWant::Prefix(prefix)) => dotted_prefix(version, prefix),
+    }
+}
+
+fn rust_matches_cached(version: &str, channel: Option<&str>) -> bool {
+    match channel {
+        None | Some("stable") => true,
+        Some(channel) => dotted_prefix(version, channel),
+    }
+}
+
+fn dotted_prefix(version: &str, prefix: &str) -> bool {
+    version == prefix
+        || version
+            .strip_prefix(prefix)
+            .is_some_and(|rest| rest.starts_with('.'))
+}
+
+fn cmp_versions(left: &str, right: &str) -> std::cmp::Ordering {
+    match version_tuple(left).cmp(&version_tuple(right)) {
+        std::cmp::Ordering::Equal => match (left.contains('-'), right.contains('-')) {
+            (true, false) => std::cmp::Ordering::Less,
+            (false, true) => std::cmp::Ordering::Greater,
+            _ => std::cmp::Ordering::Equal,
+        },
+        other => other,
+    }
+}
+
+fn version_tuple(version: &str) -> (u32, u32, u32) {
+    let parts = version
+        .split(|c: char| !c.is_ascii_digit())
+        .filter(|part| !part.is_empty())
+        .map(|part| part.parse().unwrap_or(0))
+        .collect::<Vec<_>>();
+    (
+        parts.first().copied().unwrap_or(0),
+        parts.get(1).copied().unwrap_or(0),
+        parts.get(2).copied().unwrap_or(0),
+    )
 }
 
 fn install_archives(
@@ -592,5 +728,216 @@ mod tests {
             writer.finish().unwrap();
         }
         cursor.into_inner()
+    }
+
+    fn seed_cached(cache: &Path, kind: &str, version: &str, tools: &[&str]) {
+        let dir = cache.join("runtimes").join(kind).join(version);
+        fs::create_dir_all(dir.join("bin")).unwrap();
+        for tool in tools {
+            fs::write(dir.join("bin").join(tool), b"stub").unwrap();
+        }
+        fs::write(dir.join(".srvm-ok"), b"ok").unwrap();
+    }
+
+    fn offline_client() -> MapClient {
+        MapClient {
+            files: HashMap::new(),
+            hits: Mutex::new(Vec::new()),
+        }
+    }
+
+    fn endpoints() -> Endpoints {
+        Endpoints {
+            node_index_url: "https://nodejs.org/dist/index.json".into(),
+            python_release_url:
+                "https://api.github.com/repos/astral-sh/python-build-standalone/releases/latest"
+                    .into(),
+            go_index_url: "https://go.dev/dl/?mode=json".into(),
+            rust_dist_url: "https://static.rust-lang.org/dist".into(),
+        }
+    }
+
+    #[test]
+    fn offline_fallback_reuses_newest_hint_matching_cached_node() {
+        let tool = if cfg!(windows) { "node.exe" } else { "node" };
+        let cache = tempfile::tempdir().unwrap();
+        seed_cached(cache.path(), "node", "v20.18.1", &[tool]);
+        seed_cached(cache.path(), "node", "v22.21.0", &[tool]);
+        let root = tempfile::tempdir().unwrap();
+        fs::write(root.path().join(".nvmrc"), b"22\n").unwrap();
+        let client = offline_client();
+
+        let bins = ensure(
+            RuntimeKind::Node,
+            root.path(),
+            cache.path(),
+            &client,
+            &endpoints(),
+            true,
+        )
+        .unwrap();
+        assert!(bins[0].join(tool).is_file());
+        assert!(
+            bins[0].to_string_lossy().contains("v22.21.0"),
+            "picked {bins:?} instead of the newest 22.x"
+        );
+        let hits = client.hits.lock().unwrap();
+        assert_eq!(
+            hits.len(),
+            1,
+            "offline fallback must not download anything: {hits:?}"
+        );
+    }
+
+    #[test]
+    fn offline_fallback_prefers_the_hinted_version() {
+        let tool = if cfg!(windows) { "node.exe" } else { "node" };
+        let cache = tempfile::tempdir().unwrap();
+        seed_cached(cache.path(), "node", "v20.18.1", &[tool]);
+        seed_cached(cache.path(), "node", "v22.21.0", &[tool]);
+        let root = tempfile::tempdir().unwrap();
+        fs::write(root.path().join(".nvmrc"), b"20\n").unwrap();
+
+        let bins = ensure(
+            RuntimeKind::Node,
+            root.path(),
+            cache.path(),
+            &offline_client(),
+            &endpoints(),
+            true,
+        )
+        .unwrap();
+        assert!(
+            bins[0].to_string_lossy().contains("v20.18.1"),
+            "picked {bins:?} instead of the hinted 20.x"
+        );
+    }
+
+    #[test]
+    fn offline_fallback_surfaces_the_index_error_when_nothing_cached() {
+        let cache = tempfile::tempdir().unwrap();
+        let root = tempfile::tempdir().unwrap();
+        let err = ensure(
+            RuntimeKind::Node,
+            root.path(),
+            cache.path(),
+            &offline_client(),
+            &endpoints(),
+            true,
+        )
+        .unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("GET https://nodejs.org/dist/index.json"),
+            "expected the original index error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn offline_fallback_covers_go_python_and_rust() {
+        let cache = tempfile::tempdir().unwrap();
+        seed_cached(
+            cache.path(),
+            "go",
+            "go1.23.2",
+            &[if cfg!(windows) { "go.exe" } else { "go" }],
+        );
+        seed_cached(
+            cache.path(),
+            "python",
+            "3.12.7",
+            &[if cfg!(windows) {
+                "python.exe"
+            } else {
+                "python3"
+            }],
+        );
+        seed_cached(
+            cache.path(),
+            "rust",
+            "1.85.0",
+            &[
+                if cfg!(windows) { "cargo.exe" } else { "cargo" },
+                if cfg!(windows) { "rustc.exe" } else { "rustc" },
+            ],
+        );
+        let root = tempfile::tempdir().unwrap();
+        fs::write(root.path().join("go.mod"), b"module x\n\ngo 1.23\n").unwrap();
+        fs::write(root.path().join(".python-version"), b"3.12\n").unwrap();
+        fs::write(
+            root.path().join("rust-toolchain.toml"),
+            b"[toolchain]\nchannel = \"stable\"\n",
+        )
+        .unwrap();
+
+        let go_bins = ensure(
+            RuntimeKind::Go,
+            root.path(),
+            cache.path(),
+            &offline_client(),
+            &endpoints(),
+            true,
+        )
+        .unwrap();
+        assert!(
+            go_bins[0].to_string_lossy().contains("go1.23.2"),
+            "{go_bins:?}"
+        );
+
+        let py_bins = ensure(
+            RuntimeKind::Python,
+            root.path(),
+            cache.path(),
+            &offline_client(),
+            &endpoints(),
+            true,
+        )
+        .unwrap();
+        assert!(
+            py_bins[0].to_string_lossy().contains("3.12.7"),
+            "{py_bins:?}"
+        );
+
+        let rust_bins = ensure(
+            RuntimeKind::Rust,
+            root.path(),
+            cache.path(),
+            &offline_client(),
+            &endpoints(),
+            true,
+        )
+        .unwrap();
+        assert!(
+            rust_bins
+                .iter()
+                .all(|bin| bin.to_string_lossy().contains("1.85.0")),
+            "{rust_bins:?}"
+        );
+    }
+
+    #[test]
+    fn offline_fallback_skips_cache_dirs_without_verified_marker() {
+        let tool = if cfg!(windows) { "node.exe" } else { "node" };
+        let cache = tempfile::tempdir().unwrap();
+        // A partial/incomplete install: binaries but no .srvm-ok marker.
+        let partial = cache.path().join("runtimes").join("node").join("v22.21.0");
+        fs::create_dir_all(partial.join("bin")).unwrap();
+        fs::write(partial.join("bin").join(tool), b"stub").unwrap();
+        seed_cached(cache.path(), "node", "v20.18.1", &[tool]);
+        let root = tempfile::tempdir().unwrap();
+
+        let bins = ensure(
+            RuntimeKind::Node,
+            root.path(),
+            cache.path(),
+            &offline_client(),
+            &endpoints(),
+            true,
+        )
+        .unwrap();
+        assert!(
+            bins[0].to_string_lossy().contains("v20.18.1"),
+            "an unverified cache dir must not satisfy the fallback: {bins:?}"
+        );
     }
 }
