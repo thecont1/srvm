@@ -1195,6 +1195,7 @@ fn cli_signal_exits_130(signal: libc::c_int) {
     }
 }
 
+#[cfg(unix)]
 fn wait_exit(child: &mut Child, timeout: Duration) -> ExitStatus {
     let deadline = Instant::now() + timeout;
     while Instant::now() < deadline {
