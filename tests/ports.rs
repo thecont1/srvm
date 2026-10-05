@@ -105,28 +105,40 @@ fn supervisor_retries_when_reserved_port_is_claimed_before_bind() {
 
     wait_line(&out, "fixture waiting before bind", Duration::from_secs(5));
     fs::write(&release, "bind").unwrap();
-    wait_line(
-        &out,
-        "port was claimed before the app bound it; retrying",
-        Duration::from_secs(10),
+
+    // Parallel tests can snipe the retry port too, forcing a second handoff.
+    // The authoritative port is the last "port selected" report before the
+    // announcement, and at least one handoff must have happened.
+    let (seen, app_line) = wait_announcement(&out, &_err, Duration::from_secs(25));
+    assert!(
+        seen.iter()
+            .any(|line| line.contains("port was claimed before the app bound it; retrying")),
+        "no handoff happened:\n{}",
+        seen.join("\n")
     );
-    let retry_port_line = wait_line(&out, "port       selected ", Duration::from_secs(10));
-    let selected: u16 = retry_port_line
-        .split_whitespace()
-        .last()
-        .unwrap()
-        .parse()
-        .unwrap();
+    let selected: u16 = seen
+        .iter()
+        .rev()
+        .find_map(|line| {
+            line.trim_start()
+                .strip_prefix("port       selected ")
+                .and_then(|rest| rest.trim().parse().ok())
+        })
+        .expect("srvm never reported a selected port");
     assert_ne!(selected, 0);
     assert_ne!(selected, first_selected);
 
-    let app_line = wait_line(
-        &out,
-        "app        http://127.0.0.1:",
-        Duration::from_secs(15),
-    );
     assert_eq!(app_line_port(&app_line), selected);
-    assert!(http_get(selected).starts_with("HTTP/1.1 200"));
+    match std::panic::catch_unwind(|| http_get(selected)) {
+        Ok(response) => assert!(response.starts_with("HTTP/1.1 200"), "{response}"),
+        Err(payload) => {
+            let stderr = drain(&_err, Duration::from_secs(2)).join("\n");
+            panic!(
+                "http_get({selected}) failed: {payload:?}\nsrvm stdout:\n{}\nsrvm stderr:\n{stderr}",
+                seen.join("\n")
+            );
+        }
+    }
     assert!(wait_exit(&mut child.0, Duration::from_secs(15)).success());
 
     let log = fs::read_to_string(&log).unwrap();
@@ -714,7 +726,10 @@ fn http_get(port: u16) -> String {
         .set_write_timeout(Some(Duration::from_secs(2)))
         .unwrap();
     stream
-        .write_all(b"GET / HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n")
+        .write_all(
+            format!("GET / HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nConnection: close\r\n\r\n")
+                .as_bytes(),
+        )
         .unwrap();
     let mut response = String::new();
     stream.read_to_string(&mut response).unwrap();

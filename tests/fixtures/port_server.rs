@@ -72,25 +72,42 @@ fn main() {
     while Instant::now() < deadline {
         match listener.accept() {
             Ok((mut stream, _)) => {
-                let _ = stream.set_read_timeout(Some(Duration::from_secs(2)));
-                let _ = stream.set_write_timeout(Some(Duration::from_secs(2)));
-                let mut buf = [0u8; 1024];
-                let n = stream.read(&mut buf).unwrap_or(0);
-                let request = String::from_utf8_lossy(&buf[..n]);
-                let mut parts = request.split_whitespace();
-                let method = parts.next().unwrap_or("");
-                let path = parts.next().unwrap_or("/");
-                let _ = stream.write_all(
-                    b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok",
-                );
-                if method == "GET" || path == "/shutdown" {
-                    return;
-                }
+                // Handle each connection on its own thread: stray connections
+                // from parallel tests can block for seconds on read, and a
+                // sequential loop would starve the real request behind them.
+                std::thread::spawn(move || {
+                    let _ = stream.set_read_timeout(Some(Duration::from_secs(2)));
+                    let _ = stream.set_write_timeout(Some(Duration::from_secs(2)));
+                    let mut buf = [0u8; 1024];
+                    let n = stream.read(&mut buf).unwrap_or(0);
+                    let request = String::from_utf8_lossy(&buf[..n]);
+                    let mut parts = request.split_whitespace();
+                    let method = parts.next().unwrap_or("");
+                    let path = parts.next().unwrap_or("/");
+                    let _ = stream.write_all(
+                        b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok",
+                    );
+                    // Parallel tests reuse OS-assigned ports, so a stray GET
+                    // can land here. Only exit for a GET that was addressed
+                    // to this fixture (the Host header carries the port) or
+                    // an explicit shutdown path; everything else is served
+                    // and ignored.
+                    let host_port = request
+                        .lines()
+                        .find_map(|line| {
+                            let (name, value) = line.split_once(':')?;
+                            name.eq_ignore_ascii_case("host").then(|| value.trim())
+                        })
+                        .and_then(|host| host.rsplit(':').next())
+                        .and_then(|port| port.parse::<u16>().ok());
+                    if (method == "GET" && host_port == Some(actual)) || path == "/shutdown" {
+                        std::process::exit(0);
+                    }
+                });
             }
-            Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {
-                std::thread::sleep(Duration::from_millis(10));
-            }
-            Err(_) => break,
+            // Transient accept errors (ECONNABORTED under load) must not
+            // kill the server; keep serving until the deadline or a GET.
+            Err(_) => std::thread::sleep(Duration::from_millis(10)),
         }
     }
 }
