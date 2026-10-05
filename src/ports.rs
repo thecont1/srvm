@@ -78,11 +78,34 @@ fn bind_available_with<T>(start: u16, mut bind: impl FnMut(u16) -> io::Result<T>
     for port in start..=start.saturating_add(100) {
         match bind(port) {
             Ok(listener) => return Ok(listener),
-            Err(err) if err.kind() == io::ErrorKind::AddrInUse => {}
+            Err(err) if is_skippable_bind_error(&err) => {}
             Err(err) => return Err(err),
         }
     }
     bind(0)
+}
+
+/// Bind failures that mean "this port is unusable" rather than "srvm is
+/// broken": another process holds it, or the platform reserves it (Windows
+/// excluded port ranges, privileged low ports). Walking on is the right
+/// response to all of them.
+fn is_skippable_bind_error(err: &io::Error) -> bool {
+    #[cfg(windows)]
+    {
+        matches!(
+            err.kind(),
+            io::ErrorKind::AddrInUse
+                | io::ErrorKind::PermissionDenied
+                | io::ErrorKind::AccessDenied
+        )
+    }
+    #[cfg(not(windows))]
+    {
+        matches!(
+            err.kind(),
+            io::ErrorKind::AddrInUse | io::ErrorKind::PermissionDenied
+        )
+    }
 }
 
 #[cfg(test)]
@@ -206,6 +229,26 @@ mod tests {
     }
 
     #[test]
+    fn bind_available_with_walks_past_platform_reserved_ports() {
+        // Windows excluded port ranges fail binds with a permission-style
+        // error, not AddrInUse; a walk that treats that as fatal dies inside
+        // the block instead of moving past it.
+        let attempts = RefCell::new(Vec::new());
+        let bound = bind_available_with(5000, |port| {
+            attempts.borrow_mut().push(port);
+            match port {
+                5000 => Err(io::Error::new(ErrorKind::AddrInUse, "held")),
+                5001 => Err(io::Error::new(ErrorKind::PermissionDenied, "reserved")),
+                _ => Ok(port),
+            }
+        })
+        .unwrap();
+
+        assert_eq!(bound, 5002);
+        assert_eq!(*attempts.borrow(), vec![5000, 5001, 5002]);
+    }
+
+    #[test]
     fn reserve_zero_picks_os_assigned_nonzero_port() {
         let listener = reserve(0).unwrap();
         assert_ne!(listener.local_addr().unwrap().port(), 0);
@@ -274,15 +317,18 @@ mod tests {
     }
 
     #[test]
-    fn bind_available_with_aborts_non_busy_errors() {
+    fn bind_available_with_aborts_on_genuine_bind_failures() {
+        // Permission-style errors mean the platform reserves the port and are
+        // walked past; anything else (e.g. a broken bind closure) is a real
+        // failure and must abort the walk.
         let attempts = RefCell::new(Vec::new());
         let err = bind_available_with(5000, |port| {
             attempts.borrow_mut().push(port);
-            Err::<u16, _>(io::Error::new(ErrorKind::PermissionDenied, "denied"))
+            Err::<u16, _>(io::Error::new(ErrorKind::InvalidInput, "bad port"))
         })
         .unwrap_err();
 
-        assert_eq!(err.kind(), ErrorKind::PermissionDenied);
+        assert_eq!(err.kind(), ErrorKind::InvalidInput);
         assert_eq!(*attempts.borrow(), vec![5000]);
     }
 
