@@ -120,6 +120,30 @@ impl ToolResolver for AvailabilityResolver {
     }
 }
 
+/// Lookup for an app discovered inside a known workspace: the app's own and
+/// every ancestor `node_modules/.bin` up to — never above — the workspace root,
+/// then the fetchable-runtime fallback. This is what makes a hoisted dependency
+/// in a JavaScript workspace visible to `apps/web` without escaping the
+/// workspace.
+pub struct WorkspaceResolver {
+    workspace: PathBuf,
+}
+
+impl WorkspaceResolver {
+    pub fn new(workspace: &Path) -> Self {
+        Self {
+            workspace: workspace.to_path_buf(),
+        }
+    }
+}
+
+impl ToolResolver for WorkspaceResolver {
+    fn resolve(&self, tool: &str, root: &Path) -> Option<PathBuf> {
+        binpath::look_path_within(tool, root, Some(&self.workspace))
+            .or_else(|| crate::runtime::can_fetch(tool).then(|| PathBuf::from(tool)))
+    }
+}
+
 pub fn detect(root: &Path) -> Result<Vec<ServeSpec>> {
     detect_with(root, &AvailabilityResolver)
 }

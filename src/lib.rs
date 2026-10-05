@@ -5,3 +5,4 @@ pub mod ports;
 pub mod runtime;
 pub mod staticsrv;
 pub mod supervise;
+pub mod workspace;

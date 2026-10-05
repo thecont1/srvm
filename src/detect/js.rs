@@ -1,6 +1,6 @@
 use std::{collections::BTreeMap, path::Path};
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use serde::Deserialize;
 use serde_json::Value;
 
@@ -28,7 +28,8 @@ pub fn rule_deno(root: &Path, resolver: &dyn ToolResolver) -> Result<Option<Serv
         return Ok(None);
     }
 
-    let value = probe::read_jsonc(root, rel)?;
+    let value = probe::read_jsonc(root, rel)
+        .with_context(|| format!("malformed {rel} in {}", root.display()))?;
     let Some(tasks) = value.get("tasks").and_then(Value::as_object) else {
         return Ok(None);
     };
@@ -53,7 +54,8 @@ pub fn rule_package_json(root: &Path, resolver: &dyn ToolResolver) -> Result<Vec
         return Ok(Vec::new());
     }
 
-    let pkg: PackageJson = serde_json::from_str(&probe::read_to_string(root, "package.json")?)?;
+    let pkg: PackageJson = serde_json::from_str(&probe::read_to_string(root, "package.json")?)
+        .with_context(|| format!("malformed package.json in {}", root.display()))?;
     let Some(pm) = pick_pm(root, resolver, pkg.package_manager.as_deref()) else {
         return Ok(Vec::new());
     };

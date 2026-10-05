@@ -4,7 +4,15 @@ use std::{
 };
 
 pub fn look_path(tool: &str, root: &Path) -> Option<PathBuf> {
-    bin_dirs(root)
+    look_path_within(tool, root, None)
+}
+
+/// `look_path`, with `node_modules/.bin` lookup walking from `root` up to —
+/// never past — `ceiling`. Without a ceiling only `root`'s own
+/// `node_modules/.bin` is searched, which keeps detection inside the selected
+/// root.
+pub fn look_path_within(tool: &str, root: &Path, ceiling: Option<&Path>) -> Option<PathBuf> {
+    bin_dirs(root, ceiling)
         .into_iter()
         .find_map(|dir| executable_in(&dir, tool))
 }
@@ -85,7 +93,7 @@ fn is_executable(path: &Path) -> bool {
     }
 }
 
-fn bin_dirs(root: &Path) -> Vec<PathBuf> {
+fn bin_dirs(root: &Path, ceiling: Option<&Path>) -> Vec<PathBuf> {
     let mut dirs = Vec::new();
 
     if let Some(path) = env::var_os("PATH") {
@@ -117,7 +125,25 @@ fn bin_dirs(root: &Path) -> Vec<PathBuf> {
         }
     }
 
-    dirs.push(root.join("node_modules/.bin"));
+    dirs.extend(node_modules_bins(root, ceiling));
+    dirs
+}
+
+/// `node_modules/.bin` for the app root and, when a workspace ceiling is
+/// given, each ancestor up to and including it — hoisted dependencies are
+/// visible, nothing above the workspace is.
+fn node_modules_bins(root: &Path, ceiling: Option<&Path>) -> Vec<PathBuf> {
+    let mut dirs = Vec::new();
+    let mut current = Some(root);
+
+    while let Some(dir) = current {
+        dirs.push(dir.join("node_modules/.bin"));
+        if ceiling.is_none() || ceiling == Some(dir) {
+            break;
+        }
+        current = dir.parent();
+    }
+
     dirs
 }
 
