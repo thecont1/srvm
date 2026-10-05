@@ -54,7 +54,11 @@ $ srvm --dry-run    # show what would be launched, don't launch it
 $ srvm --no-open    # don't open the app in a browser
 $ srvm --port 4000  # start the free-port search at 4000
 $ srvm --port 0     # let the OS pick any free port
+$ srvm --select 2   # launch the 2nd candidate from --dry-run (or by name/tool)
+$ srvm --all        # launch every independent app (e.g. frontend + backend)
 ```
+
+`--all` launches one app per ecosystem detected at the root — a `package.json` frontend next to a Django backend gets two labeled URLs on distinct ports. Alternative launchers for the same app (a Makefile target, `docker compose`, the static fallback) are not started alongside it. If any app fails, everything is shut down and srvm exits non-zero.
 
 Port notes: `--port` sets where the free-port *search* starts, not a hard requirement — a busy port just shifts the app forward. `--dry-run` reports the planned start and injection without probing or binding anything. srvm's port reservations and fallback HTTP probes use IPv4 loopback (`127.0.0.1`); the app still controls its own bind address. There is a small race between srvm releasing its probe listener and the app binding: a non-cooperative app can still lose that race and fail, and when the app instead binds somewhere else successfully the URL it actually prints is adopted and reported — verification reconciles the outcome, it can't eliminate the race.
 

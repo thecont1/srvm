@@ -19,7 +19,7 @@ A **launcher**, full stop. srvm's entire job is the run lifecycle: detect → pr
 | "LaunchPad (`lp`)" branding | **`srvm`** everywhere | Consistent binary/repo name; cache dirs derive from it |
 | `~/.launchpad/runtimes/` cache | **Platform cache dir** (`dirs::cache_dir()/srvm`, override `SRVM_CACHE_DIR`) | Runtime archives are cached here since M5; the launcher remains stateless outside provisioning |
 | "Never install runtimes; embed a version manager day 1" | **Phased** — PATH + shim resolution first; archive fetching implemented in M5 | Detection stays read-only; launch-time provisioning follows the seam in §4.4 |
-| Both frontend + backend launched in one repo | **Single best match now; multi-stack next** | `detect()` returns ranked `Vec<ServeSpec>` candidates, but supervision still owns one active child; M6 requires a lifecycle refactor before `--all` |
+| Both frontend + backend launched in one repo | **Single best match by default; `--all` launches the independent set** | `detect()` returns ranked candidates; `launch::launch_set` picks one per family and `supervise::run_many` runs them under one lifecycle (M6, §4.3/§4.5) |
 | Language "Go or Rust" | **Rust** | User's call; the design maps cleanly onto Rust threads + channels (§4.3) |
 | Comparison table using the old product name | **Independent launcher positioning** | No viewer or Docker daemon required for ordinary launch paths; supported missing runtimes can be fetched |
 
@@ -69,13 +69,13 @@ Deviation from the brief's mock: key-value narration uses aligned lowercase labe
 | `srvm -v/--verbose` | child output unfiltered (skip flood-collapse) |
 | `srvm --quiet`, `--no-color` | narration controls (`--quiet` suppresses narration; `--no-color`/`NO_COLOR` disables ANSI) |
 | `srvm --version` | print and exit |
-| `srvm --all` | **reserved for M6** — accept the flag, error "not yet supported" |
+| `srvm --all` | launch every independent app in the launch set (§4.5) with `[label]`-prefixed output; conflicts with `--select`; one-entry sets behave like the default |
 
 No subcommands in v0.1 — the bare invocation IS the product. (If a `doctor`/`runtimes` management subcommand is wanted later, `clap` subcommands bolt on cleanly.)
 
 ### 2.3 Output contract
 
-- Lifecycle phases per launch: install if needed → start → wait/announce URL → exit/fail. These are control flow today, not an explicit per-child state machine; that is M6 work.
+- Lifecycle phases per launch: install if needed → start → wait/announce URL → exit/fail. These are control flow in `serve_attempt`, shared by the single and multi-app paths; there is no explicit per-child state machine.
 - The first sniffed child URL wins; a later sniffed URL may replace an earlier probe-hint announcement. `0.0.0.0`/`::1` normalize to `127.0.0.1`.
 - On adoption: print `app  <url>` and `open` it unless `--no-open`.
 - `failed` prints spec name + error + last ~12 log lines (ANSI-stripped).
@@ -129,7 +129,7 @@ Supporting machinery (implemented; names match `src/detect/`):
 
 ### 3.1 Detection result
 
-`detect(root) -> Vec<ServeSpec>` collects ranked matches at the selected root; ordinary launch uses `specs[0]` or the `--select` pick. An empty vector produces a launch error; dry-run instead prints the no-match explanation and rule-family list. `--dry-run` currently prints all candidates before selection and does not apply `--select`. Multiple matches can be alternative launch routes for the same app (for example, a package script, a wrapper target, and static fallback); M6 must define its independent launch set rather than simply spawning this vector. The Go rule's special `cmd/*/main.go` lookup is not general subdirectory discovery.
+`detect(root) -> Vec<ServeSpec>` collects ranked matches at the selected root; ordinary launch uses `specs[0]` or the `--select` pick. An empty vector produces a launch error; dry-run instead prints the no-match explanation and rule-family list. `--dry-run` currently prints all candidates before selection and does not apply `--select`. Multiple matches can be alternative launch routes for the same app (for example, a package script, a wrapper target, and static fallback); `--all` therefore spawns `launch::launch_set` (§4.5), never the raw vector. The Go rule's special `cmd/*/main.go` lookup is not general subdirectory discovery.
 
 ### 3.2 Port override matrix (implemented in M3)
 
@@ -172,8 +172,9 @@ Script-body recognition is deliberately conservative: an exact `framework-bin + 
 ```text
 src/
   main.rs        delegates to cli::run()
-  lib.rs         exports cli, detect, ports, runtime, staticsrv, supervise
+  lib.rs         exports cli, detect, launch, ports, runtime, staticsrv, supervise
   cli.rs         clap, dry-run, candidate selection, runtime preparation, launch
+  launch.rs      Family classification and launch_set policy for --all
   detect/
     mod.rs       ServeSpec/CommandSpec/PortInjection; ToolResolver, PathResolver,
                  AvailabilityResolver; ranked detect()/detect_with()
@@ -227,13 +228,17 @@ Lean — every dep must justify itself:
 
 **Deliberately avoided**: `tokio` (threads + channels suffice; async buys nothing here and doubles conceptual weight), `mise`/`asdf` linking (M5 is a downloader, not an embedded manager).
 
-### 4.3 Supervisor model: current single-spec runner and M6 target
+### 4.3 Supervisor model (M2 + M6)
 
-**Implemented now:** `supervise::run(root, spec, options, path_prepend)` runs one spec. It installs dependencies, then supervises one server process, or blocks in the embedded static server. Each child stream has a pump thread; the supervising thread polls exit/URL events and performs the hint probe. Process tracking uses `CURRENT_CHILD: OnceLock<Arc<Mutex<Option<u32>>>>`; static shutdown uses a separate `STATIC_STOP`. There is no `Supervisor { children: Vec<Child> }` or explicit per-child state machine yet.
+**Single spec:** `supervise::run(root, spec, options, path_prepend)` installs dependencies, then supervises one server process, or blocks in the embedded static server. Each child stream has a pump thread; the supervising thread polls exit/URL events and performs the hint probe.
 
-**Current shutdown:** the signal handler sends Unix SIGTERM to the recorded process group or runs Windows `taskkill /T /F`, then exits 130. Static mode first sets its stop flag for graceful shutdown. The install-timeout path uses a separate helper with up to 1.5s grace and Unix SIGKILL escalation. The signal path does not currently share that bounded wait/escalation, and no stop-token recheck closes the spawn-to-PID-registration window. Arbitrary nested and TERM-resistant descendant cleanup is not established by existing tests.
+**Multi-stack (M6):** `supervise::run_many(root, &[LaunchItem], options)` takes the launch set from `launch::launch_set` (§4.5). It allocates ports first — every reservation is held while the rest are selected, so siblings never receive the same port — then runs installs sequentially (runtime cache staging is not concurrency-safe), then spawns one supervising thread per app sharing `run_server`/`serve_attempt` with the single path. Output lines carry a `[label]` prefix (`label = spec.name`, `#N` on collisions); the browser opens and `ctrl-c to stop` prints once, for the first announcement. Policy: an app exiting 0 leaves the others running; any failure sets `SHUTDOWN`, every worker terminates its tree, and srvm exits non-zero once the siblings are reaped (5s bound). Static specs never reach `run_many`.
 
-**M6 target, not implemented:** introduce a supervisor owning all per-app process/static handles, lifecycle state, selected port, runtime PATH, URL/probe state, tail buffer, and pump joins. Register one signal handler and coordinate cancellation, bounded teardown, and reaping across every app, including installs and partially started launches. Do not invoke the current `run()` concurrently: its singleton PID slot, signal registration, and process-wide exit calls assume one launch. See §5.2 for sequencing and decisions still required.
+**Shutdown:** live PIDs sit in `CURRENT_CHILDREN: Vec<u32>`; the signal handler sets `SHUTDOWN`, sends Unix SIGTERM to every recorded process group or runs Windows `taskkill /T /F`, then exits 130. Static mode first sets its stop flag for graceful shutdown. The install-timeout path uses up to 1.5s grace and Unix SIGKILL escalation; the signal path does not share that bounded wait/escalation, and no stop-token recheck closes the spawn-to-PID-registration window. Arbitrary nested and TERM-resistant descendant cleanup is still not established by tests.
+
+### 4.5 Launch-set policy (`src/launch.rs`)
+
+`launch_set(&[ServeSpec]) -> Vec<usize>` is consulted only by `--all` and dry-run. Each candidate is classified into a `Family` (Js, Python, Ruby, Docs, Elixir, Php, Rust, Go, Orchestrator, Static) by name prefix (`package:`, `go:`, `make:`, `just:`, `task:`) then exact name, falling back on the tool. Rules: keep the first candidate per app family (later ones are alternative launchers for the same app); if any app survives, drop every orchestrator (`procfile`, `make`, `just`, `task`, `turbo`, `nx`, `compose`) and the static fallback; otherwise launch the first orchestrator alone; otherwise static alone. A one-entry set runs the ordinary single path. Discovery is still root-only — subdirectory apps are not found.
 
 ### 4.4 Implemented runtime-resolution and provisioning flow (M5)
 
@@ -269,7 +274,7 @@ Rust downloads the official **rustc, cargo, and rust-std** component archives ra
 | **M3** Port arbitration | Implemented / merged | `ports.rs`: requested/explicit/inherited/hint resolution, bounded probe-walk listener reservation, `{port}` template + env injection, sniffed-URL verify + "ignored" note, hardened HTTP probe hint | Occupied-port integration tests assert a real listener lands on the shifted port and the announced URL matches reality (see `tests/ports.rs`; 12s probe fallback exercised once) |
 | **M4** Static fallback | Implemented / merged | `staticsrv.rs`: in-process loopback HTTP server on the M3-reserved `TcpListener` (no drop/rebind), httparse + cap-std confinement, 4 bounded workers, GET/HEAD only | `srvm` in a bare-HTML dir serves it with an empty `PATH`; `tests/staticsrv.rs` covers MIME, traversal/symlink/dotfile denial (real sibling secrets), Host validation, request limits + 408 deadline, index-gated redirects, streaming/range semantics, read-only roots, `--no-open` positive/negative control, and signal shutdown |
 | **M5** Runtime fetch | Implemented / merged | Node, Python, Go, and rustc+cargo+rust-std archives; checksum-before-extract, cache/offline fallback, PATH prepend | Four PATH-scrubbed fixture boots pass in CI; real upstream toolchain and sequential Rust layout validation remain open (§5.1). No rustup-init |
-| **M6** Multi-stack | Next — not implemented | define independent launch set, refactor single-child supervision, wire `--all`, per-child labels/URLs/ports; retain existing `--select` | Two independent services launch with distinct labeled URLs; all-child failure/shutdown behavior is tested. `--all` currently errors. Scope/semantics gates are in §5.2 |
+| **M6** Multi-stack | Implemented (`dev/bipasha`, awaiting CI/review) | `launch.rs` launch-set policy, `run_many` with live-PID registry + shared shutdown, `--all` (conflicts with `--select`), per-app labels/URLs/ports, dry-run `launch` listing | `tests/multi.rs`: two labeled apps on distinct ports, `--port N` ascending allocation, sibling-failure teardown, Ctrl+C reaps both (unix), one-app and dry-run paths; single-stack output unchanged. Decisions recorded in §5.2 |
 | **M7** Distribution | Not started | release CI matrix via `cargo-dist` (or manual goreleaser-style), install.sh, brew/scoop/winget taps, shell completions, man page | One-command install on all three OSes. No release workflow or GitHub releases exist at the verified baseline |
 
 ### Current status snapshot (verified baseline: `main` at `8852bc9`)
@@ -278,24 +283,28 @@ Rust downloads the official **rustc, cargo, and rust-std** component archives ra
 
 **Verified CI:** [run 37318739459](https://github.com/thecont1/srvm/actions/runs/37318739459), latest attempt 2, reports successful macOS, Ubuntu, and Windows jobs for `8852bc9`. The workflow runs `cargo fmt --check`, `cargo clippy --all-targets -- -D warnings`, and `cargo test`; it does not test release packaging or live upstream runtime boots. No local suite was rerun for this documentation-only assessment. These results establish the existing fixture-based baseline, not every production claim.
 
-**Next feature milestone:** M6 multi-stack (`--all`). **After that:** M7 distribution, which has no release workflow or published GitHub releases yet. Keep the validation carryovers below visible while moving forward.
+**M6 implemented on `dev/bipasha`** (three commits after the plan reconciliation; 172 tests locally: 111 lib + 6 cli + 7 multi + 12 ports + 4 runtime_boot + 32 staticsrv; fmt/clippy clean). Three-OS CI runs on the PR. **Next:** M7 distribution, which has no release workflow or published GitHub releases yet. Keep the validation carryovers below visible while moving forward.
 
 ### 5.1 Validation carryovers from implemented milestones
 
-- **M2 lifecycle:** real-framework boots and arbitrary nested/TERM-resistant descendant cleanup are not automated. `dropping_guard_reaps_server_tree` checks a fixture listener is released; on Windows its test guard itself calls `taskkill`, so it is not proof of srvm's own signal-driven tree cleanup. Carry stronger lifecycle tests into the M6 refactor.
+- **M2 lifecycle:** real-framework boots and arbitrary nested/TERM-resistant descendant cleanup are not automated. `dropping_guard_reaps_server_tree` checks a fixture listener is released; on Windows its test guard itself calls `taskkill`, so it is not proof of srvm's own signal-driven tree cleanup. M6 added sibling-failure and unix Ctrl+C teardown tests for two apps, but nested/TERM-resistant trees and Windows signal-driven cleanup remain open.
 - **M5 real toolchains:** `tests/runtime_boot.rs` uses locally served fixture archives and stub executables, not live distributions or real compiler/framework boots. Several CLI/runtime tests lack process-level timeouts; use bounded waits for new coverage.
 - **M5 Rust component layout:** `ensure_rust` installs three archives sequentially, and `extract_verified_flat` scans every top-level directory in the shared destination on each call, including previously installed directories. The flat-extraction unit test covers one combined synthetic archive; the boot fixture only runs a stub cargo and uses a simplified standard-library path. This is a concrete validation concern, not a reproduced live-upstream failure. Add a realistic sequential three-archive regression asserting stable `bin/rustc`, `bin/cargo`, and `lib/rustlib/<target>/lib`, then an opt-in fetched-toolchain compile/run smoke test. Check this before expanding runtime concurrency.
 
-### 5.2 M6 execution sequence and decision gates
+### 5.2 M6 decisions as implemented
 
-1. **M6a — define the launch set.** Decide how to select independent apps from overlapping ranked candidates, including wrapper/orchestrator and static-fallback precedence. Settle selected-root-only versus bounded subdirectory discovery before promising frontend/backend directory support. Do not blindly launch every detector match or launch apps twice through a root orchestrator.
-2. **M6b — own the whole lifecycle.** Refactor `src/supervise/mod.rs` and `kill.rs` to own all install/server/static handles and coordinate cancellation, bounded teardown, pump joins, and reaping. Cover signals during install/startup/running, the spawn-registration window, and descendants that ignore graceful shutdown. Preserve single-stack behavior first.
-3. **M6c — wire the multi-stack UX.** Update `src/cli.rs` and `supervise/pump.rs` for `--all`, stable per-child labels, separate URL/probe/tail state, port allocation, and child-specific runtime PATHs. Serialize or deduplicate provisioning initially: the current shared `<version>.partial` staging path is not safe for concurrent installation of the same target. Preserve dry-run's no-download/no-bind/no-spawn contract.
-4. **M6d — prove concurrent behavior.** Add deterministic Next+FastAPI-style fixtures with two independently served URLs, correct labels, collision handling, child PATH isolation, install/startup failure, coordinated shutdown, and static coexistence where the launch policy permits it. Keep the single/default/`--select`/dry-run paths covered and pass the existing three-OS CI matrix. Distinguish stub integration fixtures from optional real-framework smoke tests.
+| Gate | Decision |
+|---|---|
+| Discovery depth | Root only. Subdirectory/monorepo discovery is deferred; orchestrators (turbo/nx/Procfile/compose) remain the way to launch several directories |
+| Dedup / orchestrator precedence | §4.5: first per family; orchestrators and static dropped when an app exists, else first orchestrator, else static |
+| `--all` + `--select` | clap `conflicts_with`; `--all` with a one-entry set behaves exactly like the default path |
+| `--port N` across apps | App 1 starts at N, each later app starts one past the previous selection; `--port 0` is OS-assigned per app; without `--port`, each app's own hint/inherited port, with held reservations resolving duplicates |
+| Sibling failure / aggregate exit | Exit 0 keeps siblings running; any failure shuts every app down and srvm exits non-zero. Exit 0 only when every app exited 0 |
+| Browser | Opens once, for the first announced URL; `--no-open` honored |
+| Provisioning | `prepare_runtimes` and installs run sequentially before any server starts |
+| Static coexistence | Not supported; static only serves when nothing else is detected |
 
-**Decisions required before M6 implementation:** discovery depth; candidate deduplication and orchestrator precedence; `--all`/`--select` interaction; `--port` allocation across apps; sibling-failure and aggregate-exit policy; browser-opening policy. These are not silently settled by enabling the reserved flag. Recursive monorepo discovery remains unimplemented and is not automatically included in M6.
-
-Sequencing rationale: the merged M0–M5 baseline now has cross-platform fixture coverage. M6 is a lifecycle and launch-policy milestone, not just flag wiring; M7 packages the resulting launcher after its behavior is established.
+**Deferred from M6:** bounded subdirectory discovery; per-app `--no-install`/`--port` overrides; static alongside apps; stronger spawn-registration-window and TERM-resistant descendant tests (§5.1). Windows Ctrl+C multi-app teardown relies on `taskkill /T /F` per registered PID and is only exercised by the unix-gated test.
 
 ---
 
@@ -304,7 +313,7 @@ Sequencing rationale: the merged M0–M5 baseline now has cross-platform fixture
 - **Unit**: `file_targets` parser, `pick_script`/`pick_pm`, `strip_jsonc`, URL regexes against real captured lines (Vite/Next/Django/Uvicorn/Phoenix/ANSI), `noise_key` collapse, port-walk logic against a held socket.
 - **Fixture**: `tempdir` + marker files + stub binaries (shell scripts on unix, `.bat`/tiny `.exe` on Windows) injected via a private `bin_dirs`/`ToolResolver` override — detection never depends on the host toolchain.
 - **Integration (implemented)**: CLI subprocess fixtures, a rustc-built HTTP fixture for port arbitration/handoff retries, confined static-server tests, and PATH-scrubbed local-archive boots for all four runtime kinds. Live frameworks/upstream downloads are not part of the default suite.
-- **Follow-up coverage**: bounded real-framework smoke tests, realistic sequential Rust component extraction plus fetched compilation, and all-child/descendant cancellation tests for M6 (§5.1–§5.2).
+- **Follow-up coverage**: bounded real-framework smoke tests, realistic sequential Rust component extraction plus fetched compilation, and deeper descendant-cancellation tests (§5.1).
 - **Verification for code changes**: focused regressions first, then `cargo fmt --check`, `cargo clippy --all-targets -- -D warnings`, `cargo test`, and a local `cargo build --release` gate when appropriate. CI currently runs the first three on macOS/Linux/Windows. Documentation-only edits require diff review and `git diff --check`, not a Rust suite rerun.
 
 ---
@@ -313,14 +322,14 @@ Sequencing rationale: the merged M0–M5 baseline now has cross-platform fixture
 
 | Risk | Mitigation |
 |---|---|
-| Windows process-tree kill is weaker than Unix pgid | Current implementation uses `taskkill /F /T`, not Job Objects. M6 must verify coordinated cleanup of all children and descendants; stronger Windows ownership remains a design choice |
+| Windows process-tree kill is weaker than Unix pgid | Current implementation uses `taskkill /F /T` per registered PID, not Job Objects. Multi-app Ctrl+C teardown is only tested on unix; stronger Windows ownership remains a design choice |
 | `PORT` ignored by a framework | Per-spec args injection where available; post-inject verification against sniffed URL + honest "override ignored" note |
 | Runtime fetch trust (M5) | HTTPS distributions/checksum metadata (loopback HTTP allowed for fixtures), SHA-256 before extraction, staged cache publication; upstream-supplied checksums are integrity checks, not independent publisher authentication |
 | `.cmd`/`.bat` shims on Windows can't take signals | Kill the tree, never just the shim PID |
-| Monorepo false positives or apps below the selected root | `--select` chooses among detected root candidates; it does not discover deeper apps. Turbo/Nx may already orchestrate several services. Discovery depth and overlap policy must be decided for M6 |
+| Monorepo false positives or apps below the selected root | `--select` chooses among detected root candidates; it does not discover deeper apps. Turbo/Nx may already orchestrate several services, so the launch set drops orchestrators when a concrete app exists and otherwise runs the first orchestrator alone (§4.5). Discovery stays root-only |
 | Repos with several matching rules where first is wrong | `detect()` returns all; `--dry-run` shows the full ranked list so `--select` is discoverable |
 | Port race between reservation and child bind | At most two startup retries after an injected-port, unannounced nonzero exit; quick failures use a heuristic, slower ones require an occupied endpoint (§3.2). Report the actual sniffed URL when the app binds elsewhere |
-| Concurrent provisioning into one cache version | Current staging names are shared and unguarded; serialize/deduplicate within M6 or add explicit locking before concurrent writes |
+| Concurrent provisioning into one cache version | Current staging names are shared and unguarded; `--all` prepares runtimes and installs sequentially, so add explicit locking before any concurrent provisioning |
 | Rust component layout differs from synthetic fixtures | Sequential extraction must preserve one usable compiler/sysroot prefix; track the validation follow-up in §5.1 rather than treating a stub cargo boot as proof |
 | AI-generated repos lack lockfiles/scripts or tools | Framework-dependency detection and static fallback cover some cases; M5 fetches the supported runtime names in §4.4, not every package manager or framework dependency |
 
@@ -339,4 +348,4 @@ Sequencing rationale: the merged M0–M5 baseline now has cross-platform fixture
 2. **Static server binding**: settled — loopback `127.0.0.1` only, no `--host` flag in v0.1; expose it only if requested.
 3. **Name collision check**: `srvm` is short for "serve 'em"; verify crates.io/`brew` name availability before M7 publish — have `srv`/`srve`/`srvup` as backups.
 4. **Minimum Rust version**: edition 2024 is configured, but Cargo.toml has no `rust-version` and CI tracks stable. Choose and verify an explicit MSRV before M7 rather than treating a moving stable channel as a fixed minimum.
-5. **M6 policy gates**: the launch-set, deduplication, `--all`/`--select`, port allocation, sibling-failure, and browser-opening decisions in §5.2 must be settled before multi-stack implementation begins.
+5. **Subdirectory discovery**: `--all` is root-only by design (§5.2). Decide whether bounded `apps/*`/`packages/*` discovery is wanted before M7 freezes the CLI surface.
