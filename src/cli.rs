@@ -1,4 +1,5 @@
 use std::{
+    collections::HashMap,
     env,
     path::{Path, PathBuf},
 };
@@ -7,10 +8,11 @@ use anyhow::{Result, bail};
 use clap::Parser;
 
 use crate::{
-    detect::{PathResolver, PortInjection, ServeSpec, ToolResolver, detect},
+    detect::{PortInjection, ServeSpec, binpath},
     launch, ports,
-    runtime::{self, RuntimeKind},
+    runtime::{self, RuntimeKind, hint::Scope},
     supervise::{self, LaunchItem, SupervisorOptions},
+    workspace::{self, Candidate},
 };
 
 #[derive(Debug, Parser)]
@@ -28,7 +30,7 @@ struct Cli {
     #[arg(long, help = "Start port search at N (0 chooses a free port)")]
     port: Option<u16>,
 
-    #[arg(long)]
+    #[arg(long, help = "Run one app: index, qualified id, or a unique name")]
     select: Option<String>,
 
     #[arg(long)]
@@ -43,22 +45,24 @@ struct Cli {
     #[arg(long)]
     no_color: bool,
 
-    #[arg(long, conflicts_with = "select")]
+    #[arg(long, conflicts_with = "select", help = "Alias for the default set")]
     all: bool,
 }
 
 pub fn run() -> Result<()> {
     let cli = Cli::parse();
-    let root = cli.dir.canonicalize()?;
+    let workspace = workspace::discover(&cli.dir)?;
 
-    let specs = detect(&root)?;
-
-    if cli.dry_run {
-        return print_dry_run(&root, &specs, cli.port);
+    for note in &workspace.notes {
+        eprintln!("  note       {note}");
     }
 
-    if specs.is_empty() {
-        bail!("no servable app detected in {}", root.display());
+    if cli.dry_run {
+        return print_dry_run(&workspace, cli.port, cli.select.as_deref());
+    }
+
+    if workspace.candidates.is_empty() {
+        bail!("no servable app detected in {}", workspace.root.display());
     }
 
     let options = SupervisorOptions {
@@ -70,125 +74,214 @@ pub fn run() -> Result<()> {
         port: cli.port,
     };
 
-    let set = if cli.all {
-        launch::launch_set(&specs)
-    } else {
-        vec![select_index(&specs, cli.select.as_deref())?]
+    let plan = launch::plan_default(&workspace.candidates);
+    let (set, defaulted) = match cli.select.as_deref() {
+        Some(select) => (vec![select_index(&workspace.candidates, select)?], false),
+        None => (plan.set.clone(), true),
     };
 
+    if defaulted && plan.orchestrated {
+        note_orchestration(&workspace.candidates, &plan);
+    }
+
     if set.len() == 1 {
-        let spec = &specs[set[0]];
-        print_intro(&root.display().to_string(), spec);
-        let path_prepend = prepare_runtimes(&root, spec, cli.quiet)?;
-        return supervise::run(&root, spec, options, &path_prepend);
+        let candidate = &workspace.candidates[set[0]];
+        print_intro(&workspace.root, candidate);
+        let path_prepend = prepare_runtimes(candidate, &workspace.root, cli.quiet)?;
+        return supervise::run(&candidate.root, &candidate.spec, options, &path_prepend);
     }
 
     println!("  srvm {}", env!("CARGO_PKG_VERSION"));
-    println!("  workspace  {}", root.display());
+    println!("  workspace  {}", workspace.root.display());
 
-    let labels = labels_for(&set, &specs);
-    for (label, &idx) in labels.iter().zip(&set) {
-        println!("  serve      [{label}] {}", specs[idx].summary());
+    let labels = labels_for(&set, &workspace.candidates);
+    for (label, &index) in labels.iter().zip(&set) {
+        println!(
+            "  serve      [{label}] {}",
+            workspace.candidates[index].spec.summary()
+        );
     }
 
     // Runtime fetches stage under a shared cache path per version, so
     // preparation stays sequential even though supervision runs in parallel.
     let mut items = Vec::with_capacity(set.len());
-    for (label, &idx) in labels.iter().zip(&set) {
-        let spec = &specs[idx];
-        let path_prepend = prepare_runtimes(&root, spec, cli.quiet)?;
+    for (label, &index) in labels.iter().zip(&set) {
+        let candidate = &workspace.candidates[index];
+        let path_prepend = prepare_runtimes(candidate, &workspace.root, cli.quiet)?;
         items.push(LaunchItem {
             label: label.clone(),
-            spec,
+            candidate,
             path_prepend,
         });
     }
-    supervise::run_many(&root, &items, options)
+    supervise::run_many(&items, options)
 }
 
-fn labels_for(set: &[usize], specs: &[ServeSpec]) -> Vec<String> {
-    let mut counts = std::collections::HashMap::new();
+/// One line when a root orchestrator hides visible sub-apps, so the default
+/// set never looks like it silently dropped work.
+fn note_orchestration(candidates: &[Candidate], plan: &launch::LaunchPlan) {
+    let Some(&first) = plan.set.first() else {
+        return;
+    };
+    let Some(&suppressed) = plan.suppressed.first() else {
+        return;
+    };
+    println!(
+        "  note       orchestrated by {}; --select {} for one app",
+        candidates[first].id(),
+        candidates[suppressed].id()
+    );
+}
+
+fn labels_for(set: &[usize], candidates: &[Candidate]) -> Vec<String> {
+    let mut counts: HashMap<String, usize> = HashMap::new();
+    for &index in set {
+        *counts
+            .entry(candidates[index].spec.name.clone())
+            .or_insert(0) += 1;
+    }
+
+    let mut seen: HashMap<String, usize> = HashMap::new();
     set.iter()
-        .map(|&idx| {
-            let name = &specs[idx].name;
-            let count = counts.entry(name).or_insert(0);
-            *count += 1;
-            if *count > 1 {
-                format!("{name}#{count}")
-            } else {
-                name.clone()
+        .map(|&index| {
+            let candidate = &candidates[index];
+            if counts.get(&candidate.spec.name) == Some(&1) {
+                return candidate.spec.name.clone();
             }
+            if !candidate.rel.as_os_str().is_empty() {
+                return candidate.id();
+            }
+            let count = seen.entry(candidate.spec.name.clone()).or_insert(0);
+            *count += 1;
+            format!("{}#{count}", candidate.spec.name)
         })
         .collect()
 }
 
-fn print_intro(root: &str, spec: &ServeSpec) {
+fn print_intro(workspace_root: &Path, candidate: &Candidate) {
     println!("  srvm {}", env!("CARGO_PKG_VERSION"));
-    println!("  workspace  {root}");
-    println!("  serve      {}", spec.summary());
+    println!("  workspace  {}", workspace_root.display());
+    if candidate.rel.as_os_str().is_empty() {
+        println!("  serve      {}", candidate.spec.summary());
+    } else {
+        println!(
+            "  serve      [{}] {}",
+            candidate.rel.display(),
+            candidate.spec.summary()
+        );
+    }
 }
 
-fn print_dry_run(root: &Path, specs: &[ServeSpec], port: Option<u16>) -> Result<()> {
+fn print_dry_run(
+    workspace: &workspace::Workspace,
+    port: Option<u16>,
+    select: Option<&str>,
+) -> Result<()> {
     println!("  srvm {}", env!("CARGO_PKG_VERSION"));
-    println!("  workspace  {}", root.display());
+    println!("  workspace  {}", workspace.root.display());
 
-    if specs.is_empty() {
+    if workspace.candidates.is_empty() {
         println!("  detect     no servable app detected");
         println!(
-            "  looked     deno, package.json, wrangler, Procfile, make, just, task, python, ruby, docs, elixir, php, rust, go, compose, static"
+            "  looked     {}, {}/{{{}}}, {{{}}}",
+            workspace::APP_DIRS.join(", "),
+            workspace::APP_PARENTS.join(", "),
+            workspace::APP_DIRS.join(","),
+            workspace::ASSET_DIRS.join(",")
         );
         return Ok(());
     }
 
-    for (idx, spec) in specs.iter().enumerate() {
-        println!("  match      {}. {}", idx + 1, spec.name);
-        println!("  command    {}", spec.command_line());
-        if let Some(install) = &spec.install {
+    for (index, candidate) in workspace.candidates.iter().enumerate() {
+        println!("  match      {}. {}", index + 1, candidate.spec.name);
+        println!("  root       {}", display_rel(candidate));
+        println!("  command    {}", candidate.spec.command_line());
+        if let Some(install) = &candidate.spec.install {
             println!("  install    {}", install.command_line());
         }
-        print_runtime_note(root, spec);
+        print_runtime_note(&workspace.root, candidate);
 
-        let inherited = match &spec.port {
-            PortInjection::Env(key) => std::env::var(key).ok(),
+        let inherited = match &candidate.spec.port {
+            PortInjection::Env(key) => env::var(key).ok(),
             _ => None,
         };
-        match ports::requested_port(spec, port, inherited.as_deref())? {
+        match ports::requested_port(&candidate.spec, port, inherited.as_deref())? {
             Some(start) => {
                 if start == 0 {
                     println!("  port       0 (OS-assigned free port chosen at launch)");
                 } else {
                     println!("  port       {start} (start; availability checked at launch)");
                 }
-                println!("  override   {}", override_description(spec));
+                println!("  override   {}", override_description(&candidate.spec));
             }
             None => {
-                if let Some(hint) = spec.url_hint {
+                if let Some(hint) = candidate.spec.url_hint {
                     println!("  port       {hint}");
                 }
-                if port.is_some() && matches!(spec.port, PortInjection::None) {
-                    println!("  override   {}", override_description(spec));
+                if port.is_some() && matches!(candidate.spec.port, PortInjection::None) {
+                    println!("  override   {}", override_description(&candidate.spec));
                 }
             }
         }
     }
 
-    let set = launch::launch_set(specs);
-    if set.len() >= 2 {
-        for (i, &idx) in set.iter().enumerate() {
-            println!("  launch     {}. {}", i + 1, specs[idx].name);
-        }
+    // `--select` is what would run, so the report must not pretend otherwise.
+    if let Some(select) = select {
+        let index = select_index(&workspace.candidates, select)?;
+        println!(
+            "  launch     1. {}  [{}]",
+            workspace.candidates[index].id(),
+            display_rel(&workspace.candidates[index])
+        );
+        return Ok(());
+    }
+
+    let plan = launch::plan_default(&workspace.candidates);
+    for (position, &index) in plan.set.iter().enumerate() {
+        println!(
+            "  launch     {}. {}  [{}]",
+            position + 1,
+            workspace.candidates[index].id(),
+            display_rel(&workspace.candidates[index])
+        );
+    }
+    if plan.orchestrated {
+        note_orchestration(&workspace.candidates, &plan);
+    }
+    if !plan.suppressed.is_empty() {
+        let ids = plan
+            .suppressed
+            .iter()
+            .map(|&index| {
+                format!(
+                    "{} ({})",
+                    workspace.candidates[index].id(),
+                    display_rel(&workspace.candidates[index])
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(", ");
+        println!("  idle       {ids}");
     }
     Ok(())
 }
 
-fn print_runtime_note(root: &Path, spec: &ServeSpec) {
+fn display_rel(candidate: &Candidate) -> String {
+    if candidate.rel.as_os_str().is_empty() {
+        ".".into()
+    } else {
+        candidate.rel.to_string_lossy().into_owned()
+    }
+}
+
+fn print_runtime_note(workspace_root: &Path, candidate: &Candidate) {
     let mut seen = Vec::new();
-    for program in programs_of(spec) {
-        if program_file(root, program).is_some() {
+    for program in programs_of(&candidate.spec) {
+        if program_file(&candidate.root, program).is_some() {
             continue;
         }
         let tool = bare_tool(program);
-        if PathResolver.resolve(&tool, root).is_some() {
+        if binpath::look_path_within(&tool, &candidate.root, Some(workspace_root)).is_some() {
             continue;
         }
         let Some(kind) = runtime::kind_for(&tool) else {
@@ -208,10 +301,15 @@ fn print_runtime_note(root: &Path, spec: &ServeSpec) {
     }
 }
 
-fn prepare_runtimes(root: &Path, spec: &ServeSpec, quiet: bool) -> Result<Vec<PathBuf>> {
+fn prepare_runtimes(
+    candidate: &Candidate,
+    workspace_root: &Path,
+    quiet: bool,
+) -> Result<Vec<PathBuf>> {
+    let root = &candidate.root;
     let mut dirs = Vec::new();
     let mut seen = Vec::new();
-    for program in programs_of(spec) {
+    for program in programs_of(&candidate.spec) {
         if let Some(file) = program_file(root, program) {
             if let Some(dir) = file.parent() {
                 push_unique(&mut dirs, dir.to_path_buf());
@@ -219,7 +317,7 @@ fn prepare_runtimes(root: &Path, spec: &ServeSpec, quiet: bool) -> Result<Vec<Pa
             continue;
         }
         let tool = bare_tool(program);
-        if let Some(resolved) = PathResolver.resolve(&tool, root) {
+        if let Some(resolved) = binpath::look_path_within(&tool, root, Some(workspace_root)) {
             if let Some(dir) = resolved.parent()
                 && !on_path(dir)
             {
@@ -234,7 +332,8 @@ fn prepare_runtimes(root: &Path, spec: &ServeSpec, quiet: bool) -> Result<Vec<Pa
             continue;
         }
         seen.push(kind);
-        dirs.extend(runtime::fetch_if_missing(kind, root, quiet)?);
+        let scope = Scope::within(root, workspace_root);
+        dirs.extend(runtime::fetch_if_missing(kind, &scope, quiet)?);
     }
     Ok(dirs)
 }
@@ -294,20 +393,47 @@ fn override_description(spec: &ServeSpec) -> String {
     }
 }
 
-fn select_index(specs: &[ServeSpec], select: Option<&str>) -> Result<usize> {
-    match select {
-        None => Ok(0),
-        Some(raw) => {
-            if let Ok(n) = raw.parse::<usize>()
-                && (1..=specs.len()).contains(&n)
-            {
-                return Ok(n - 1);
-            }
-            specs
-                .iter()
-                .position(|spec| spec.name == raw || spec.tool == raw)
-                .ok_or_else(|| anyhow::anyhow!("no detected stack matches --select {raw:?}"))
+/// Resolves `--select` against every discovered candidate: a 1-based dry-run
+/// index, an exact qualified id (`apps/web:package:dev`), or a bare name, tool,
+/// or relative directory when exactly one candidate matches it.
+fn select_index(candidates: &[Candidate], select: &str) -> Result<usize> {
+    if let Ok(index) = select.parse::<usize>() {
+        if (1..=candidates.len()).contains(&index) {
+            return Ok(index - 1);
         }
+        bail!(
+            "--select {index} is out of range; this workspace has {} candidate(s)",
+            candidates.len()
+        );
+    }
+
+    if let Some(index) = candidates.iter().position(|c| c.id() == select) {
+        return Ok(index);
+    }
+
+    let matches: Vec<usize> = candidates
+        .iter()
+        .enumerate()
+        .filter(|(_, candidate)| {
+            candidate.spec.name == select
+                || candidate.spec.tool == select
+                || candidate.rel.to_string_lossy() == select
+        })
+        .map(|(index, _)| index)
+        .collect();
+
+    match matches.len() {
+        0 => bail!("no detected app matches --select {select:?}"),
+        1 => Ok(matches[0]),
+        _ => bail!(
+            "--select {select:?} matches {} apps: {}; use one of those qualified ids",
+            matches.len(),
+            matches
+                .iter()
+                .map(|&index| candidates[index].id())
+                .collect::<Vec<_>>()
+                .join(", ")
+        ),
     }
 }
 
@@ -317,14 +443,18 @@ mod tests {
     use crate::detect::CommandSpec;
     use std::fs;
 
-    fn spec_with_program(program: &str) -> ServeSpec {
-        ServeSpec::new(
-            "test",
-            "test",
-            CommandSpec::new(program, Vec::<String>::new()),
-            None,
-            PortInjection::None,
-        )
+    fn candidate(root: &Path, rel: &str, program: &str) -> Candidate {
+        Candidate {
+            root: root.to_path_buf(),
+            rel: PathBuf::from(rel),
+            spec: ServeSpec::new(
+                "test",
+                "test",
+                CommandSpec::new(program, Vec::<String>::new()),
+                None,
+                PortInjection::None,
+            ),
+        }
     }
 
     #[test]
@@ -333,9 +463,10 @@ mod tests {
         let bin = root.path().join(".venv").join("bin");
         fs::create_dir_all(&bin).unwrap();
         fs::write(bin.join("python"), "#!/bin/sh\n").unwrap();
+        let candidate = candidate(root.path(), "", ".venv/bin/python");
 
-        let spec = spec_with_program(".venv/bin/python");
-        let dirs = prepare_runtimes(root.path(), &spec, true).unwrap();
+        let dirs = prepare_runtimes(&candidate, root.path(), true).unwrap();
+
         assert_eq!(dirs, vec![bin]);
     }
 
@@ -343,10 +474,59 @@ mod tests {
     fn bare_named_file_in_repo_is_not_a_program_path() {
         let root = tempfile::tempdir().unwrap();
         fs::write(root.path().join("npm"), "echo nope\n").unwrap();
+
         assert!(program_file(root.path(), "npm").is_none());
         assert!(
             program_file(root.path(), "./npm").is_some(),
             "relative ./npm resolves inside the repo"
         );
+    }
+
+    #[test]
+    fn select_resolves_ids_names_dirs_and_rejects_ambiguity() {
+        let root = tempfile::tempdir().unwrap();
+        let mut candidates = vec![
+            candidate(root.path(), "", "npm"),
+            candidate(&root.path().join("frontend"), "frontend", "npm"),
+            candidate(&root.path().join("backend"), "backend", "python3"),
+        ];
+
+        assert_eq!(select_index(&candidates, "2").unwrap(), 1);
+        assert_eq!(select_index(&candidates, "backend").unwrap(), 2);
+
+        candidates[0].spec.name = "package:dev".into();
+        candidates[1].spec.name = "package:dev".into();
+        candidates[0].spec.tool = "npm".into();
+        candidates[1].spec.tool = "npm".into();
+        assert_eq!(
+            select_index(&candidates, "package:dev").unwrap(),
+            0,
+            "an exact qualified id wins even when another app shares the name"
+        );
+
+        let err = select_index(&candidates, "npm").unwrap_err();
+        assert!(err.to_string().contains("frontend:package:dev"), "{err}");
+        assert_eq!(
+            select_index(&candidates, "frontend:package:dev").unwrap(),
+            1
+        );
+        assert_eq!(select_index(&candidates, "frontend").unwrap(), 1);
+        assert!(select_index(&candidates, "9").is_err());
+        assert!(select_index(&candidates, "nope").is_err());
+    }
+
+    #[test]
+    fn labels_qualify_only_when_needed() {
+        let root = tempfile::tempdir().unwrap();
+        let candidates = vec![
+            candidate(&root.path().join("apps/web"), "apps/web", "npm"),
+            candidate(&root.path().join("apps/admin"), "apps/admin", "npm"),
+        ];
+
+        assert_eq!(
+            labels_for(&[0, 1], &candidates),
+            vec!["apps/web:test", "apps/admin:test"]
+        );
+        assert_eq!(labels_for(&[0], &candidates), vec!["test"]);
     }
 }

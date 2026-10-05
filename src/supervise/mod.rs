@@ -18,6 +18,7 @@ use anyhow::{Context, Result, bail};
 use crate::{
     detect::{CommandSpec, PortInjection, ServeSpec},
     ports, staticsrv,
+    workspace::Candidate,
 };
 
 mod collapse;
@@ -105,7 +106,7 @@ fn run_static(
 
 pub struct LaunchItem<'a> {
     pub label: String,
-    pub spec: &'a ServeSpec,
+    pub candidate: &'a Candidate,
     pub path_prepend: Vec<PathBuf>,
 }
 
@@ -113,8 +114,8 @@ pub struct LaunchItem<'a> {
 /// so every app gets a distinct one, installs still run sequentially, and one
 /// worker thread supervises each child. Any app failing shuts the rest down
 /// and propagates the error; apps that exit 0 keep the others running.
-pub fn run_many(root: &Path, items: &[LaunchItem], options: SupervisorOptions) -> Result<()> {
-    if items.iter().any(|item| item.spec.is_static) {
+pub fn run_many(items: &[LaunchItem], options: SupervisorOptions) -> Result<()> {
+    if items.iter().any(|item| item.candidate.spec.is_static) {
         bail!("static serving does not participate in multi-app launch");
     }
     if items.len() < 2 {
@@ -125,12 +126,12 @@ pub fn run_many(root: &Path, items: &[LaunchItem], options: SupervisorOptions) -
 
     let mut requested = Vec::with_capacity(items.len());
     for item in items {
-        requested.push(plan_port(item.spec, options, Some(&item.label))?);
+        requested.push(plan_port(&item.candidate.spec, options, Some(&item.label))?);
     }
 
     for item in items {
         if !options.no_install
-            && let Some(install) = &item.spec.install
+            && let Some(install) = &item.candidate.spec.install
         {
             println!(
                 "  step       {}installing dependencies — {}",
@@ -138,7 +139,7 @@ pub fn run_many(root: &Path, items: &[LaunchItem], options: SupervisorOptions) -
                 install.command_line()
             );
             run_install(
-                root,
+                &item.candidate.root,
                 install,
                 options,
                 &item.path_prepend,
@@ -189,8 +190,8 @@ pub fn run_many(root: &Path, items: &[LaunchItem], options: SupervisorOptions) -
             let start = selected[idx];
             scope.spawn(move || {
                 let result = run_server(
-                    root,
-                    item.spec,
+                    &item.candidate.root,
+                    &item.candidate.spec,
                     start,
                     options,
                     &item.path_prepend,

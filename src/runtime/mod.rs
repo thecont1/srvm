@@ -1,7 +1,7 @@
 mod archive;
 mod fetch;
 mod go;
-mod hint;
+pub mod hint;
 mod node;
 mod python;
 mod rust;
