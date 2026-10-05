@@ -446,7 +446,7 @@ fn install_signal_handler() -> Result<()> {
         {
             return;
         }
-        let pid = *child.lock().expect("signal child lock poisoned");
+        let pid = *child.lock().unwrap_or_else(|err| err.into_inner());
         if let Some(pid) = pid {
             kill::terminate_tree_by_pid(pid);
         }
@@ -457,7 +457,7 @@ fn install_signal_handler() -> Result<()> {
 
 fn set_current_child(pid: Option<u32>) {
     if let Some(slot) = CURRENT_CHILD.get() {
-        *slot.lock().expect("signal child lock poisoned") = pid;
+        *slot.lock().unwrap_or_else(|err| err.into_inner()) = pid;
     }
 }
 

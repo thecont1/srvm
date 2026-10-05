@@ -25,10 +25,21 @@ where
 {
     thread::spawn(move || {
         let mut collapse = Collapser::default();
-        let reader = BufReader::new(reader);
+        let mut reader = BufReader::new(reader);
+        let mut buf = Vec::new();
 
-        for line in reader.lines().map_while(Result::ok) {
-            let clean = scan::strip_ansi(&line);
+        // lines() would stop the pump at the first invalid-UTF-8 line, letting
+        // the pipe fill and the child block on write. Split on bytes and
+        // decode lossily instead.
+        loop {
+            buf.clear();
+            match reader.read_until(b'\n', &mut buf) {
+                Ok(0) | Err(_) => break,
+                Ok(_) => {}
+            }
+            let line = String::from_utf8_lossy(&buf);
+            let line = line.trim_end_matches(['\r', '\n']);
+            let clean = scan::strip_ansi(line);
             ring.lock().expect("ring lock poisoned").push(clean.clone());
 
             if options.detect_urls
@@ -43,8 +54,8 @@ where
 
             if !options.quiet {
                 if options.verbose {
-                    println!("{}", format_child_line(&line, options.no_color));
-                } else if let Some(line) = collapse.accept(&line) {
+                    println!("{}", format_child_line(line, options.no_color));
+                } else if let Some(line) = collapse.accept(line) {
                     println!("{}", format_child_line(&line, options.no_color));
                 }
             }

@@ -23,7 +23,7 @@ pub fn rule_django(root: &Path, resolver: &dyn ToolResolver) -> Result<Option<Se
 }
 
 pub fn rule_uvicorn(root: &Path, resolver: &dyn ToolResolver) -> Result<Option<ServeSpec>> {
-    if !py_deps_contain(root, &["uvicorn", "fastapi"])? {
+    if !py_deps_contain(root, &["uvicorn", "fastapi"]) {
         return Ok(None);
     }
 
@@ -49,7 +49,7 @@ pub fn rule_uvicorn(root: &Path, resolver: &dyn ToolResolver) -> Result<Option<S
 }
 
 pub fn rule_flask(root: &Path, resolver: &dyn ToolResolver) -> Result<Option<ServeSpec>> {
-    if !py_deps_contain(root, &["flask"])? {
+    if !py_deps_contain(root, &["flask"]) {
         return Ok(None);
     }
 
@@ -142,21 +142,22 @@ fn venv_bin(root: &Path, bin: &str) -> Option<PathBuf> {
     None
 }
 
-fn py_deps_contain(root: &Path, needles: &[&str]) -> Result<bool> {
+fn py_deps_contain(root: &Path, needles: &[&str]) -> bool {
     for rel in [
         "pyproject.toml",
         "requirements.txt",
         "requirements-dev.txt",
         "Pipfile",
     ] {
-        if probe::file_exists(root, rel) {
-            let text = probe::read_to_string(root, rel)?.to_lowercase();
-            if needles.iter().any(|needle| text.contains(needle)) {
-                return Ok(true);
-            }
+        if let Some(text) = probe::read_lossy(root, rel)
+            && needles
+                .iter()
+                .any(|needle| text.to_lowercase().contains(needle))
+        {
+            return true;
         }
     }
-    Ok(false)
+    false
 }
 
 fn py_app_module(root: &Path, modules: &[&str]) -> Option<String> {

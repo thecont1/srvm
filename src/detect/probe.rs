@@ -23,6 +23,12 @@ pub fn read_to_string(root: &Path, rel: &str) -> Result<String> {
     Ok(fs::read_to_string(root.join(rel))?)
 }
 
+/// Capped, lossy file read for marker scanning — returns None when the file
+/// cannot be read instead of failing the whole detection pass.
+pub fn read_lossy(root: &Path, rel: &str) -> Option<String> {
+    read_capped(&root.join(rel)).ok()
+}
+
 pub fn read_jsonc(root: &Path, rel: &str) -> Result<Value> {
     let text = read_to_string(root, rel)?;
     Ok(serde_json::from_str(&strip_jsonc(&text))?)

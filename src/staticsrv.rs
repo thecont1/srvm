@@ -92,10 +92,15 @@ fn accept_loop(
 ) -> Result<()> {
     while !stop.load(Ordering::SeqCst) {
         match listener.accept() {
-            Ok((stream, _)) => match tx.try_send(stream) {
-                Ok(()) | Err(mpsc::TrySendError::Full(_)) => {}
-                Err(mpsc::TrySendError::Disconnected(_)) => return Ok(()),
-            },
+            Ok((stream, _)) => {
+                // Accepted sockets inherit non-blocking mode on Windows and
+                // BSD/macOS; blocking mode is required for read/write timeouts.
+                let _ = stream.set_nonblocking(false);
+                match tx.try_send(stream) {
+                    Ok(()) | Err(mpsc::TrySendError::Full(_)) => {}
+                    Err(mpsc::TrySendError::Disconnected(_)) => return Ok(()),
+                }
+            }
             Err(err) if err.kind() == io::ErrorKind::WouldBlock => {
                 thread::sleep(Duration::from_millis(20));
             }

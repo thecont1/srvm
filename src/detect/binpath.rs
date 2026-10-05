@@ -19,6 +19,7 @@ pub fn resolve_for_spawn(tool: &str, root: &Path, extra: &[PathBuf]) -> Option<P
         .iter()
         .find_map(|dir| executable_in(dir, tool))
         .or_else(|| look_path(tool, root))
+        .map(|path| std::path::absolute(&path).unwrap_or(path))
 }
 
 fn executable_in(dir: &Path, tool: &str) -> Option<PathBuf> {
@@ -26,10 +27,11 @@ fn executable_in(dir: &Path, tool: &str) -> Option<PathBuf> {
 
     #[cfg(windows)]
     {
-        // CreateProcess can only run extensions listed in PATHEXT; an
+        // CreateProcess can only launch a fixed set of extensions; an
         // extensionless file (e.g. the `npm` sh script next to npm.cmd)
-        // exists but is not spawnable, so it must not win over npm.cmd.
-        if direct.extension().is_some() && is_executable(&direct) {
+        // exists but is not spawnable, and PATHEXT may list non-launchable
+        // entries like .PS1. Restrict both paths to the launchable set.
+        if launchable(&direct) && is_executable(&direct) {
             return Some(direct);
         }
         let extensions = env::var_os("PATHEXT")
@@ -39,16 +41,34 @@ fn executable_in(dir: &Path, tool: &str) -> Option<PathBuf> {
                     .collect::<Vec<_>>()
             })
             .unwrap_or_else(|| vec![".COM".into(), ".EXE".into(), ".BAT".into(), ".CMD".into()]);
-        extensions.into_iter().find_map(|ext| {
-            let candidate = dir.join(format!("{tool}{ext}"));
-            is_executable(&candidate).then_some(candidate)
-        })
+        extensions
+            .into_iter()
+            .filter(|ext| launchable(Path::new(&format!("x{ext}"))))
+            .find_map(|ext| {
+                let candidate = dir.join(format!("{tool}{ext}"));
+                is_executable(&candidate).then_some(candidate)
+            })
     }
 
     #[cfg(not(windows))]
     {
         is_executable(&direct).then_some(direct)
     }
+}
+
+/// Extensions CreateProcess can launch directly (BAT/CMD get the cmd.exe
+/// dispatch; everything else — .PS1, .TXT, extensionless — is unspawnable).
+#[cfg(windows)]
+fn launchable(path: &Path) -> bool {
+    path.extension()
+        .and_then(|ext| ext.to_str())
+        .map(|ext| {
+            matches!(
+                ext.to_ascii_lowercase().as_str(),
+                "com" | "exe" | "bat" | "cmd"
+            )
+        })
+        .unwrap_or(false)
 }
 
 fn is_executable(path: &Path) -> bool {
