@@ -93,6 +93,32 @@ fn go_tuple(version: &str) -> Vec<u32> {
 mod tests {
     use super::*;
 
+    #[test]
+    fn a_pinned_older_go_resolves_from_the_historical_index() {
+        // The historical list carries releases the default index has long
+        // dropped, which is the whole point of pinning.
+        let (os, arch) = ("darwin", "arm64");
+        let index = format!(
+            r#"[
+              {{"version":"go1.27.1","stable":true,"files":[
+                {{"filename":"go1.27.1.{os}-{arch}.tar.gz","os":"{os}","arch":"{arch}","sha256":"{a}","kind":"archive"}}]}},
+              {{"version":"go1.21.5","stable":true,"files":[
+                {{"filename":"go1.21.5.{os}-{arch}.tar.gz","os":"{os}","arch":"{arch}","sha256":"{b}","kind":"archive"}}]}}
+            ]"#,
+            os = os,
+            arch = arch,
+            a = "a".repeat(64),
+            b = "b".repeat(64),
+        );
+        let choice = select_go(&index, Some(&GoWant::Prefix("1.21".into())), os, arch).unwrap();
+        assert_eq!(choice.version, "go1.21.5");
+        assert_eq!(choice.filename, format!("go1.21.5.{os}-{arch}.tar.gz"));
+
+        // Without a pin the newest stable release still wins.
+        let latest = select_go(&index, None, os, arch).unwrap();
+        assert_eq!(latest.version, "go1.27.1");
+    }
+
     fn index(os: &str, arch: &str) -> String {
         format!(
             r#"[

@@ -80,8 +80,11 @@ impl Endpoints {
                 "https://api.github.com/repos/astral-sh/python-build-standalone/releases/latest"
                     .into()
             }),
+            // The default index lists only the newest releases, so a project
+            // pinning an older minor (go.mod `go 1.21`) would have nothing to
+            // resolve against; the historical list is the same schema.
             go_index_url: env::var("SRVM_GO_INDEX_URL")
-                .unwrap_or_else(|_| "https://go.dev/dl/?mode=json".into()),
+                .unwrap_or_else(|_| "https://go.dev/dl/?mode=json&include=all".into()),
             rust_dist_url: env::var("SRVM_RUST_DIST_URL")
                 .unwrap_or_else(|_| "https://static.rust-lang.org/dist".into()),
         }
@@ -758,6 +761,24 @@ mod tests {
                 .cloned()
                 .with_context(|| format!("missing fixture {url}"))
         }
+    }
+
+    #[test]
+    fn the_default_go_index_carries_the_full_release_history() {
+        // A pinned older Go only resolves against the historical list, so the
+        // default has to ask for it; an explicit override stays untouched.
+        // SAFETY: this test owns the variable and is the only one touching it.
+        unsafe { std::env::remove_var("SRVM_GO_INDEX_URL") };
+        assert!(
+            Endpoints::from_env().go_index_url.contains("include=all"),
+            "the default Go index must request the full release history"
+        );
+        unsafe { std::env::set_var("SRVM_GO_INDEX_URL", "http://127.0.0.1:9/go.json") };
+        assert_eq!(
+            Endpoints::from_env().go_index_url,
+            "http://127.0.0.1:9/go.json"
+        );
+        unsafe { std::env::remove_var("SRVM_GO_INDEX_URL") };
     }
 
     #[test]
