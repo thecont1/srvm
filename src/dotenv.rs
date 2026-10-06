@@ -162,10 +162,10 @@ fn parse_value(raw: &str, notes: &mut Vec<String>, line: usize) -> String {
 
     // An unquoted value ends at a comment introduced by whitespace, so
     // `PORT=3000 # dev` is 3000 while `GREETING=hello world` keeps its space.
-    let value = match raw.find(" #") {
-        Some(index) => &raw[..index],
-        None => raw,
-    };
+    let value = raw
+        .char_indices()
+        .find(|&(index, ch)| ch == '#' && index > 0 && raw[..index].ends_with([' ', '\t']))
+        .map_or(raw, |(index, _)| &raw[..index]);
     value.trim_end().to_string()
 }
 
@@ -202,6 +202,17 @@ mod tests {
 
     fn pairs(text: &str) -> Vec<(String, String)> {
         parse(text).pairs
+    }
+
+    #[test]
+    fn a_tab_before_a_comment_hash_ends_the_value_too() {
+        assert_eq!(
+            pairs("PORT=3000\t# dev\nGREETING=hello world\n"),
+            vec![
+                ("PORT".to_string(), "3000".to_string()),
+                ("GREETING".to_string(), "hello world".to_string()),
+            ]
+        );
     }
 
     #[test]
