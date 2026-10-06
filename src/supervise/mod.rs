@@ -619,12 +619,6 @@ fn spawn(
         .with_context(|| format!("failed to spawn {}", command.command_line()))
 }
 
-/// Bare program names are resolved through the child's search path —
-/// `path_prepend` dirs first, then PATH, shims, and node_modules/.bin — so a
-/// tool detection found is also the tool spawned. On Windows this yields the
-/// spawnable `.cmd`/`.exe` file, which a bare name cannot resolve to.
-/// Programs written with a path (`.venv/bin/python`, `./script.sh`) are left
-/// untouched; `Command` resolves them against the working directory.
 #[cfg(test)]
 mod retry_tests {
     use super::retry_start;
@@ -686,10 +680,25 @@ mod env_tests {
     }
 }
 
+/// Bare program names are resolved through the child's search path —
+/// `path_prepend` dirs first, then PATH, shims, and node_modules/.bin — so a
+/// tool detection found is also the tool spawned. On Windows this yields the
+/// spawnable `.cmd`/`.exe` file, which a bare name cannot resolve to.
+/// Programs written with a path (`.venv/bin/python`, `./script.sh`) are
+/// anchored to the app root, which is the directory the child runs in.
 fn resolve_program(program: &str, root: &Path, path_prepend: &[PathBuf]) -> PathBuf {
     let path = Path::new(program);
     if path.components().count() != 1 {
-        return path.to_path_buf();
+        // A program written as a path is anchored to the app root here rather
+        // than left to the spawner: Windows resolves a relative executable
+        // path against srvm's own working directory, not the child's, so a
+        // planned `.venv\Scripts\python.exe` would not be found even though
+        // the child runs in that root.
+        return if path.is_absolute() {
+            path.to_path_buf()
+        } else {
+            root.join(path)
+        };
     }
     crate::detect::binpath::resolve_for_spawn(program, root, path_prepend)
         .unwrap_or_else(|| path.to_path_buf())
@@ -1111,5 +1120,33 @@ mod tests {
             Some("http://127.0.0.1:9123/app?x=1#f")
         );
         assert!(opened.load(Ordering::SeqCst));
+    }
+}
+
+#[cfg(test)]
+mod program_tests {
+    use super::resolve_program;
+    use std::path::{Path, PathBuf};
+
+    #[test]
+    fn a_relative_program_path_is_anchored_to_the_app_root() {
+        let root = Path::new("/apps/web");
+
+        assert_eq!(
+            resolve_program(".venv/bin/python", root, &[]),
+            root.join(".venv/bin/python")
+        );
+        assert_eq!(
+            resolve_program("./server.sh", root, &[]),
+            root.join("./server.sh")
+        );
+    }
+
+    #[test]
+    fn an_absolute_program_path_is_left_alone() {
+        assert_eq!(
+            resolve_program("/usr/bin/env", Path::new("/apps/web"), &[]),
+            PathBuf::from("/usr/bin/env")
+        );
     }
 }
