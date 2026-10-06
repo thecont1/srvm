@@ -834,9 +834,12 @@ fn terminate_registered_children() {
             .lock()
             .unwrap_or_else(|err| err.into_inner())
             .clone();
-        for pid in pids {
+        for pid in pids.iter().copied() {
             kill::terminate_tree_by_pid(pid);
         }
+        // A descendant that traps TERM ignores the polite request, so the
+        // signal path has to escalate once the grace period is up.
+        kill::force_remaining(&pids);
     }
 }
 
