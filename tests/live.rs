@@ -26,12 +26,10 @@
 
 mod support;
 
-use std::{
-    env, fs,
-    path::{Path, PathBuf},
-    process::Command,
-    time::Duration,
-};
+use std::{env, fs, path::Path, process::Command, time::Duration};
+
+#[cfg(windows)]
+use std::path::PathBuf;
 
 use support::{ChildGuard, SERIAL, app_line_port, http_get, line_reader, wait_for_all};
 use tempfile::{TempDir, tempdir};
@@ -89,6 +87,8 @@ fn build_farm() -> TempDir {
 /// isolated home/cache/temp, no host-runtime visibility.
 fn live_env(cmd: &mut Command, farm: &Path, home: &Path, cache: &Path) {
     cmd.env_clear();
+    cmd.stdout(std::process::Stdio::piped());
+    cmd.stderr(std::process::Stdio::piped());
     cmd.env("PATH", path_var(farm));
     cmd.env("NO_COLOR", "1");
     cmd.env("SRVM_CACHE_DIR", cache);
@@ -105,19 +105,25 @@ fn live_env(cmd: &mut Command, farm: &Path, home: &Path, cache: &Path) {
     }
 }
 
+#[cfg(windows)]
 fn path_var(farm: &Path) -> std::ffi::OsString {
     let mut entries = vec![farm.to_path_buf()];
-    #[cfg(windows)]
     if let Some(root) = env::var_os("SystemRoot") {
         entries.push(PathBuf::from(&root).join("System32"));
     }
     env::join_paths(entries).unwrap()
 }
 
+#[cfg(not(windows))]
+fn path_var(farm: &Path) -> std::ffi::OsString {
+    env::join_paths([farm.to_path_buf()]).unwrap()
+}
+
 /// Everything a live boot needs, kept alive for the whole test: the child,
 /// the announced URLs, and the isolated home/cache/farm directories.
 struct Boot {
-    child: ChildGuard,
+    // Kept alive until the test ends; Drop is the teardown guard.
+    _child: ChildGuard,
     urls: Vec<String>,
     cache: TempDir,
     _home: TempDir,
@@ -138,7 +144,7 @@ fn boot(repo: &Path, timeout: Duration) -> Boot {
     let err = line_reader(child.0.stderr.take().unwrap());
     let urls = wait_for_all(&out, &err, &["http://127.0.0.1:"], timeout);
     Boot {
-        child,
+        _child: child,
         urls,
         cache,
         _home: home,
