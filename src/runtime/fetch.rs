@@ -736,11 +736,11 @@ mod tests {
             let mut builder = tar::Builder::new(&mut raw);
             for (path, body) in files {
                 let mut header = tar::Header::new_gnu();
-                header.set_path(path).unwrap();
                 header.set_size(body.len() as u64);
                 header.set_mode(0o755);
-                header.set_cksum();
-                builder.append(&header, *body).unwrap();
+                // `set_path` rejects a path over 100 bytes, and real component
+                // archives nest deeply; let the builder emit a long-name entry.
+                builder.append_data(&mut header, path, *body).unwrap();
             }
             builder.finish().unwrap();
         }
