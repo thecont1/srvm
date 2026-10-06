@@ -138,10 +138,13 @@ fn node_modules_bins(root: &Path, ceiling: Option<&Path>) -> Vec<PathBuf> {
 
     while let Some(dir) = current {
         dirs.push(dir.join("node_modules/.bin"));
-        if ceiling.is_none() || ceiling == Some(dir) {
-            break;
+        // Stop at the ceiling. A ceiling that is not an ancestor of `root`,
+        // or a differently canonicalized path, must stop the walk at the
+        // root's own bin directory rather than climb outside the workspace.
+        match ceiling {
+            Some(ceiling) if dir != ceiling && dir.starts_with(ceiling) => current = dir.parent(),
+            _ => break,
         }
-        current = dir.parent();
     }
 
     dirs
@@ -151,4 +154,35 @@ fn home_dir() -> Option<PathBuf> {
     env::var_os("HOME")
         .map(PathBuf::from)
         .or_else(|| env::var_os("USERPROFILE").map(PathBuf::from))
+}
+
+#[cfg(test)]
+mod ceiling_tests {
+    use super::node_modules_bins;
+    use std::path::Path;
+
+    #[test]
+    fn the_walk_stops_at_the_workspace_ceiling() {
+        let root = Path::new("/workspace/apps/web");
+        let ceiling = Path::new("/workspace");
+
+        assert_eq!(
+            node_modules_bins(root, Some(ceiling)),
+            vec![
+                root.join("node_modules/.bin"),
+                Path::new("/workspace/apps").join("node_modules/.bin"),
+                ceiling.join("node_modules/.bin"),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_ceiling_that_is_not_an_ancestor_stops_the_walk_at_the_root() {
+        let root = Path::new("/workspace/apps/web");
+
+        assert_eq!(
+            node_modules_bins(root, Some(Path::new("/elsewhere"))),
+            vec![root.join("node_modules/.bin")]
+        );
+    }
 }
