@@ -131,7 +131,10 @@ jobs:
         run: |
           if [ "${RUNNER_ARCH:-}" = "ARM64" ] && [ "${RUNNER_OS:-}" = "Windows" ]; then
             rustup toolchain install 1.97.1-aarch64-pc-windows-msvc --profile minimal
-            echo "RUSTUP_TOOLCHAIN=1.97.1-aarch64-pc-windows-msvc" >> "$GITHUB_ENV"
+            rustup default 1.97.1-aarch64-pc-windows-msvc
+            # The repo rust-toolchain.toml would resolve through the x64 shim and
+            # rebuild on x86_64; drop it for this job only.
+            rm -f rust-toolchain.toml
           fi
         shell: "bash"
       - uses: swatinem/rust-cache@v2
