@@ -257,7 +257,7 @@ def index():
 
 fn go_repo() -> TempDir {
     let repo = tempdir().unwrap();
-    write(repo.path(), "go.mod", "module live\n\ngo 1.21\n");
+    write(repo.path(), "go.mod", "module live\n\ngo 1.24\n");
     write(
         repo.path(),
         "main.go",
