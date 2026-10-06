@@ -76,7 +76,7 @@ Port notes: `--port` sets where the free-port *search* starts, not a hard requir
 
 ## Status
 
-Early development — see [`PLAN.md`](PLAN.md) for the product development plan and milestone roadmap. M6.1 ("just run it") and the release-readiness gate are in progress; distribution (M7) has not started.
+M0–M6.1 and release-readiness milestone R are implemented and merged; M7 distribution is next/in progress on the feature branch. The M7 native-execution gate still needs six-host MSRV, live upstream runtime/archive smokes, and Windows console-event teardown before an RC can be approved. No release is published yet — see [`PLAN.md`](PLAN.md) for the gates and approval sequence.
 
 ## Acknowledgements
 
