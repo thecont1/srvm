@@ -432,11 +432,20 @@ fn override_description(spec: &ServeSpec) -> String {
 /// Resolves `--select` against every discovered candidate: a 1-based dry-run
 /// index, an exact qualified id (`apps/web:package:dev`), or a bare name, tool,
 /// or relative directory when exactly one candidate matches it.
-/// Whether a candidate field matches `select`, treating `/` and the host
-/// separator as the same character: a Windows app root reported as `apps\web`
-/// is still selected by `--select apps/web`, and vice versa.
+/// Whether a candidate field matches `select`. An exact match always counts.
+/// On Windows the two path separators are interchangeable, because an app root
+/// is reported as `apps\web` while a user may type `apps/web`; on unix a
+/// backslash is an ordinary filename character and nothing is normalized, so a
+/// literal `apps\web` selector cannot accidentally select `apps/web`.
 fn separator_eq(candidate: &str, select: &str) -> bool {
-    candidate == select || candidate.replace('\\', "/") == select.replace('\\', "/")
+    if candidate == select {
+        return true;
+    }
+    #[cfg(windows)]
+    let normalized = candidate.replace('\\', "/") == select.replace('\\', "/");
+    #[cfg(not(windows))]
+    let normalized = false;
+    normalized
 }
 
 fn select_index(candidates: &[Candidate], select: &str) -> Result<usize> {
@@ -489,8 +498,17 @@ mod selector_tests {
     use super::separator_eq;
 
     #[test]
-    fn a_selector_matches_across_path_separators() {
+    fn a_selector_matches_exactly() {
         assert!(separator_eq("apps/web:package:dev", "apps/web:package:dev"));
+        assert!(!separator_eq(
+            "apps/web:package:dev",
+            "apps/admin:package:dev"
+        ));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn on_windows_the_two_separators_are_interchangeable() {
         assert!(separator_eq(
             "apps\\web:package:dev",
             "apps/web:package:dev"
@@ -499,10 +517,12 @@ mod selector_tests {
             "apps/web:package:dev",
             "apps\\web:package:dev"
         ));
-        assert!(!separator_eq(
-            "apps/web:package:dev",
-            "apps/admin:package:dev"
-        ));
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn on_unix_a_backslash_is_an_ordinary_filename_character() {
+        assert!(!separator_eq("apps\\web", "apps/web"));
     }
 }
 
