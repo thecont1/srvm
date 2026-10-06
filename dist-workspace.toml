@@ -21,6 +21,12 @@ install-path = "CARGO_HOME"
 install-updater = false
 # Attach GitHub provenance attestations to every artifact
 github-attestations = true
+# Publish the formula to the Homebrew tap on stable releases (skipped for
+# prereleases per publish-prereleases=false). The tap repository and the
+# HOMEBREW_TAP_TOKEN secret are approval-gated setup steps; without them the
+# publish job fails loudly at stable time rather than silently skipping.
+publish-jobs = ["homebrew"]
+tap = "thecont1/homebrew-srvm"
 # PRs build all six native artifacts and keep them as workflow artifacts
 # (no release, no publishing) so the matrix is exercised before any tag.
 pr-run-mode = "upload"
