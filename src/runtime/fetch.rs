@@ -80,15 +80,19 @@ impl Endpoints {
                 "https://api.github.com/repos/astral-sh/python-build-standalone/releases/latest"
                     .into()
             }),
-            // The default index lists only the newest releases, so a project
-            // pinning an older minor (go.mod `go 1.21`) would have nothing to
-            // resolve against; the historical list is the same schema.
-            go_index_url: env::var("SRVM_GO_INDEX_URL")
-                .unwrap_or_else(|_| "https://go.dev/dl/?mode=json&include=all".into()),
+            go_index_url: go_index_url(env::var("SRVM_GO_INDEX_URL").ok()),
             rust_dist_url: env::var("SRVM_RUST_DIST_URL")
                 .unwrap_or_else(|_| "https://static.rust-lang.org/dist".into()),
         }
     }
+}
+
+/// The Go release index to read: an explicit `SRVM_GO_INDEX_URL` wins, and the
+/// default asks for the full history. The plain list carries only the two newest
+/// releases, so a project pinning an older minor (`go 1.21`) would have nothing
+/// to match against.
+fn go_index_url(override_url: Option<String>) -> String {
+    override_url.unwrap_or_else(|| "https://go.dev/dl/?mode=json&include=all".into())
 }
 
 pub fn cache_dir() -> Result<PathBuf> {
@@ -766,19 +770,17 @@ mod tests {
     #[test]
     fn the_default_go_index_carries_the_full_release_history() {
         // A pinned older Go only resolves against the historical list, so the
-        // default has to ask for it; an explicit override stays untouched.
-        // SAFETY: this test owns the variable and is the only one touching it.
-        unsafe { std::env::remove_var("SRVM_GO_INDEX_URL") };
+        // default has to ask for it; an explicit override stays untouched. The
+        // helper is called directly: tests run in parallel, so no test may
+        // mutate the process environment.
         assert!(
-            Endpoints::from_env().go_index_url.contains("include=all"),
+            go_index_url(None).contains("include=all"),
             "the default Go index must request the full release history"
         );
-        unsafe { std::env::set_var("SRVM_GO_INDEX_URL", "http://127.0.0.1:9/go.json") };
         assert_eq!(
-            Endpoints::from_env().go_index_url,
+            go_index_url(Some("http://127.0.0.1:9/go.json".into())),
             "http://127.0.0.1:9/go.json"
         );
-        unsafe { std::env::remove_var("SRVM_GO_INDEX_URL") };
     }
 
     #[test]
