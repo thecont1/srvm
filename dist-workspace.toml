@@ -31,7 +31,7 @@ msvc-crt-static = true
 # The windows-11-arm image's preinstalled rustup resolves x64 toolchains
 # under emulation; force the native aarch64 toolchain there so the release
 # build is a native execution rather than a refused cross-compile.
-github-build-setup = "build-setup.yaml"
+github-build-setup = "../build-setup.yaml"
 
 # Six native execution hosts: each target builds, tests, and smokes on a
 # runner of its own architecture — never cross-compile only. The 0.28.0
