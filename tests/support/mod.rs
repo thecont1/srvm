@@ -25,6 +25,8 @@ pub fn srvm(bin: &Path) -> Command {
         .env_remove("PORT_FIXTURE_MODE")
         .env_remove("PORT_FIXTURE_LOG")
         .env_remove("PORT_FIXTURE_RELEASE")
+        .env_remove("PORT_FIXTURE_HOLD")
+        .env_remove("PORT_FIXTURE_ONCE")
         .env("NO_COLOR", "1")
         .arg("--no-open")
         .arg("--no-color")

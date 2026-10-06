@@ -343,6 +343,11 @@ fn run_install(
 /// process can claim the port in the gap and the child fails on bind.
 const HANDOFF_RETRIES: usize = 2;
 
+/// How long a server gets to announce itself before srvm starts probing its
+/// port, and how often the probe repeats while nothing has been announced.
+const PROBE_AFTER: Duration = Duration::from_secs(12);
+const PROBE_INTERVAL: Duration = Duration::from_secs(3);
+
 enum Attempt {
     Done,
     Stopped,
@@ -378,7 +383,7 @@ fn run_server(
             Attempt::Done | Attempt::Stopped => return Ok(()),
             Attempt::Retry { next_start, .. } if attempt < HANDOFF_RETRIES => {
                 println!(
-                    "  step       {}port was claimed before the app bound it; retrying",
+                    "  step       {}exited before announcing a URL; retrying with the next port",
                     labeled(label)
                 );
                 start = Some(next_start);
@@ -435,7 +440,10 @@ fn serve_attempt(
     let started = Instant::now();
     let probe_port = selected.or(spec.url_hint);
     let mut announced: Option<String> = None;
-    let mut probed_hint = false;
+    // Wait for a server to settle, then keep probing: a single attempt is a
+    // cliff, since a transient refusal would leave a running server
+    // unannounced for the rest of its life.
+    let mut next_probe = PROBE_AFTER;
 
     loop {
         while let Ok(url) = rx.try_recv() {
@@ -443,11 +451,11 @@ fn serve_attempt(
         }
 
         if announced.is_none()
-            && !probed_hint
-            && started.elapsed() >= Duration::from_secs(12)
+            && started.elapsed() >= PROBE_AFTER
+            && started.elapsed() >= next_probe
             && let Some(port) = probe_port
         {
-            probed_hint = true;
+            next_probe = started.elapsed() + PROBE_INTERVAL;
             if let Some(url) = probe_hint(port) {
                 announce_reported_url(&url, selected, &mut announced, opened, options, label);
             }
