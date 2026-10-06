@@ -6,7 +6,6 @@
 
 use std::{fs, path::Path};
 
-use clap::CommandFactory;
 use clap_complete::{Shell, generate_to};
 
 fn main() -> anyhow::Result<()> {
