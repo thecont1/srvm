@@ -11,4 +11,10 @@
       # The repo rust-toolchain.toml would resolve through the x64 shim and
       # rebuild on x86_64; drop it for this job only.
       rm -f rust-toolchain.toml
+      echo "probe: PATH=$PATH"
+      echo "probe: which cargo=$(command -v cargo) rustc=$(command -v rustc) rustup=$(command -v rustup)"
+      echo "probe: CARGO_HOME=${CARGO_HOME:-unset} RUSTUP_HOME=${RUSTUP_HOME:-unset}"
+      echo "probe: cargo=$(cargo -vV 2>&1 | head -1)"
+      echo "probe: rustc=$(rustc -vV 2>&1 | grep '^host:')"
+      echo "probe: default=$(rustup show active-toolchain 2>&1 | head -1)"
     fi
