@@ -76,7 +76,7 @@ Port notes: `--port` sets where the free-port *search* starts, not a hard requir
 
 ## Status
 
-M0–M6.1 and release-readiness milestone R are implemented and merged; M7 distribution is next/in progress on the feature branch. The M7 native-execution gate still needs six-host MSRV, live upstream runtime/archive smokes, and Windows console-event teardown before an RC can be approved. No release is published yet — see [`PLAN.md`](PLAN.md) for the gates and approval sequence.
+M0–M6.1 and release-readiness milestone R are implemented and merged. M7 is implemented on the feature branch (`dev/diparati`, draft PR #5): the six-native-runner release pipeline (cargo-dist, attestations, installers), the Windows console-event teardown regression, the opt-in live suite against real upstream archives, the six-host MSRV proof job, CLI completions and man page, and the Scoop/winget manifest generators. What still gates `v0.1.0-rc.1`: green six-host native/CI evidence (including the live gate on all six), the recorded real-repo dogfood pass, and the approval-gated external steps (crates.io publisher identity, Homebrew tap, Scoop bucket, winget submission). No release is published yet — see [`PLAN.md`](PLAN.md) for the gates and approval sequence.
 
 ## Acknowledgements
 
