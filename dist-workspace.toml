@@ -1,0 +1,25 @@
+[workspace]
+members = ["cargo:."]
+
+# Config for 'dist'
+[dist]
+cargo-dist-version = "0.28.0"
+ci = "github"
+installers = ["shell", "powershell", "homebrew"]
+targets = [
+  "aarch64-apple-darwin",
+  "aarch64-unknown-linux-gnu",
+  "aarch64-pc-windows-msvc",
+  "x86_64-apple-darwin",
+  "x86_64-unknown-linux-gnu",
+  "x86_64-pc-windows-msvc",
+]
+hosting = "github"
+# A prerelease (v0.1.0-rc.1) must never overwrite stable package-manager
+# feeds; rc tags publish GitHub archives/installers only, and Homebrew is
+# first updated by the separately approved stable release.
+publish-prereleases = false
+install-path = "CARGO_HOME"
+
+[dist.github]
+release-branch = "main"
