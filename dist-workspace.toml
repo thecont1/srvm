@@ -4,7 +4,7 @@ members = ["cargo:."]
 # Config for 'dist'
 [dist]
 # The preferred dist version to use in CI (Cargo.toml SemVer syntax)
-cargo-dist-version = "0.28.0"
+cargo-dist-version = "0.30.2"
 # CI backends to support
 ci = "github"
 # The installers to generate for each app
@@ -19,20 +19,15 @@ publish-prereleases = false
 install-path = "CARGO_HOME"
 # Whether to install an updater program
 install-updater = false
-# Attach GitHub provenance attestations to every artifact
+# Whether to enable GitHub Attestations
 github-attestations = true
-# Publish the formula to the Homebrew tap on stable releases (skipped for
-# prereleases per publish-prereleases=false). The tap repository and the
-# HOMEBREW_TAP_TOKEN secret are approval-gated setup steps; without them the
-# publish job fails loudly at stable time rather than silently skipping.
+# Publish jobs to run in CI
 publish-jobs = ["homebrew"]
+# A GitHub repo to push Homebrew formulas to
 tap = "thecont1/homebrew-srvm"
-# PRs build all six native artifacts and keep them as workflow artifacts
-# (no release, no publishing) so the matrix is exercised before any tag.
+# Which actions to run on pull requests
 pr-run-mode = "upload"
-# Release toolchain is pinned independently of the declared MSRV (1.89) via
-# rust-toolchain.toml: artifacts ship the locally verified 1.97.1.
-# Windows builds link the CRT statically where the toolchain supports it.
+# Whether +crt-static should be used on msvc
 msvc-crt-static = true
 # The windows-11-arm image's preinstalled rustup resolves x64 toolchains
 # under emulation; force the native aarch64 toolchain there so the release

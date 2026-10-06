@@ -1,7 +1,9 @@
 # Injected into every cargo-dist build job before artifacts are built.
-# The windows-11-arm image's preinstalled rustup resolves x64 toolchains
-# under emulation; force the native aarch64 toolchain there so the release
-# build is a native execution rather than a refused cross-compile.
+# cargo-dist ships no native windows-arm64 binary: dist.exe runs x64-emulated
+# on windows-11-arm and reports an x86_64 host, and the image's preinstalled
+# rustup resolves x64 toolchains under emulation too. This step forces the
+# native aarch64 toolchain; dist (>=0.29) then accepts the win->win build and
+# the build is genuinely native because cargo itself is arm64.
 - name: 'Force the native aarch64 toolchain on Windows ARM64 runners'
   shell: bash
   run: |
@@ -11,16 +13,7 @@
       # The repo rust-toolchain.toml would resolve through the x64 shim and
       # rebuild on x86_64; drop it for this job only.
       rm -f rust-toolchain.toml
-      echo "probe: PATH=$PATH"
-      echo "probe: which cargo=$(command -v cargo) rustc=$(command -v rustc) rustup=$(command -v rustup)"
-      echo "probe: CARGO_HOME=${CARGO_HOME:-unset} RUSTUP_HOME=${RUSTUP_HOME:-unset}"
-      echo "probe: cargo=$(cargo -vV 2>&1 | head -1)"
-      echo "probe: rustc=$(rustc -vV 2>&1 | grep '^host:')"
-      echo "probe: default=$(rustup show active-toolchain 2>&1 | head -1)"
-      echo "probe-pwsh:"
-      pwsh -NoProfile -Command "cargo -vV; (rustc -vV | Select-String '^host:'); rustup show active-toolchain; Write-Host ('archenv=' + $env:PROCESSOR_ARCHITECTURE); Write-Host ('psarch=' + [System.Runtime.InteropServices.RuntimeInformation]::ProcessArchitecture); (Get-Command cargo).Source"
-      # GITHUB_ENV is a Windows path Git Bash cannot address directly; convert it
-      # so the build step gets the toolchain pinned AND dist logs its host.
+      # GITHUB_ENV holds a Windows path Git Bash cannot address directly;
+      # convert it so the build step's toolchain pin survives.
       echo "RUSTUP_TOOLCHAIN=1.97.1-aarch64-pc-windows-msvc" >> "$(cygpath -u "$GITHUB_ENV")"
-      echo "RUST_LOG=cargo_dist=info" >> "$(cygpath -u "$GITHUB_ENV")"
     fi
