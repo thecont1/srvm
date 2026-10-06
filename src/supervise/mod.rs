@@ -34,6 +34,13 @@ static CURRENT_CHILDREN: OnceLock<Arc<Mutex<Vec<u32>>>> = OnceLock::new();
 static STATIC_STOP: OnceLock<Arc<AtomicBool>> = OnceLock::new();
 static SHUTDOWN: AtomicBool = AtomicBool::new(false);
 
+/// Whether a signal has already asked this run to stop. The shutdown path uses
+/// it so an interrupted run reports 130 even when the app's own death reaches
+/// the exit first.
+pub fn shutdown_requested() -> bool {
+    SHUTDOWN.load(Ordering::SeqCst)
+}
+
 #[derive(Debug, Clone, Copy)]
 pub struct SupervisorOptions {
     pub no_open: bool,
@@ -834,9 +841,12 @@ fn terminate_registered_children() {
             .lock()
             .unwrap_or_else(|err| err.into_inner())
             .clone();
-        for pid in pids {
+        for pid in pids.iter().copied() {
             kill::terminate_tree_by_pid(pid);
         }
+        // A descendant that traps TERM ignores the polite request, so the
+        // signal path has to escalate once the grace period is up.
+        kill::force_remaining(&pids);
     }
 }
 
