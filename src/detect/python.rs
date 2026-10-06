@@ -132,8 +132,10 @@ fn py_plan(
             }
             Some(dir) => {
                 let candidate = crate::bootstrap::Stamp::python_venv(&dir, &sources);
-                if crate::bootstrap::state(root, &candidate) == crate::bootstrap::StampState::Stale
-                {
+                if matches!(
+                    crate::bootstrap::state(root, &candidate),
+                    crate::bootstrap::StampState::Stale | crate::bootstrap::StampState::Incomplete
+                ) {
                     installs.push(pip_install(&dir, &sources));
                     stamp = Some(candidate);
                     planned = Some(dir);
@@ -350,8 +352,11 @@ mod tests {
                 .map(|install| install.command_line())
                 .collect::<Vec<_>>(),
             vec![
-                "python3 -m venv .venv",
-                ".venv/bin/python -m pip install -r requirements.txt",
+                "python3 -m venv .venv".to_string(),
+                format!(
+                    "{} -m pip install -r requirements.txt",
+                    venv_bin_path(Path::new(".venv"), "python").display()
+                ),
             ]
         );
         assert_eq!(
@@ -393,6 +398,32 @@ mod tests {
     }
 
     #[test]
+    fn a_venv_whose_install_never_finished_is_repaired() {
+        let dir = tempdir().unwrap();
+        std::fs::write(dir.path().join("manage.py"), "").unwrap();
+        std::fs::write(dir.path().join("requirements.txt"), "django\n").unwrap();
+        make_venv(dir.path(), ".venv", "python");
+        let stamp = crate::bootstrap::Stamp::python_venv(
+            Path::new(".venv"),
+            &["requirements.txt".to_string()],
+        );
+        crate::bootstrap::record_incomplete(dir.path(), &stamp).unwrap();
+
+        let spec = rule_django(dir.path(), &StubResolver::with(&["python3"]))
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(spec.installs.len(), 1, "{:?}", spec.installs);
+        assert!(
+            spec.installs[0]
+                .command_line()
+                .contains("pip install -r requirements.txt"),
+            "{:?}",
+            spec.installs
+        );
+    }
+
+    #[test]
     fn a_stale_venv_stamp_reinstalls_only_the_dependencies() {
         let dir = tempdir().unwrap();
         std::fs::write(dir.path().join("manage.py"), "").unwrap();
@@ -420,7 +451,10 @@ mod tests {
                 .iter()
                 .map(|install| install.command_line())
                 .collect::<Vec<_>>(),
-            vec![".venv/bin/python -m pip install -r requirements.txt"]
+            vec![format!(
+                "{} -m pip install -r requirements.txt",
+                venv_bin_path(Path::new(".venv"), "python").display()
+            )]
         );
         assert!(stale.stamp.is_some(), "a refresh is stamped again");
     }

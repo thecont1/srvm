@@ -39,6 +39,11 @@ pub struct Stamp {
 pub enum StampState {
     /// No stamp at all: unknown, do not reinstall.
     Missing,
+    /// An install was started here and never finished: repair it. A stamp is
+    /// marked incomplete before the install steps run and replaced only when
+    /// they all succeed, so a crash mid-install cannot leave a directory that
+    /// looks complete.
+    Incomplete,
     /// A stamp that cannot be read or understood: unknown, do not reinstall.
     Unknown,
     /// The recorded digest matches the sources on disk.
@@ -64,6 +69,13 @@ pub fn state(root: &Path, stamp: &Stamp) -> StampState {
     let Ok(text) = fs::read_to_string(&path) else {
         return StampState::Missing;
     };
+    if text
+        .lines()
+        .next()
+        .is_some_and(|line| line.ends_with(INCOMPLETE_DIGEST))
+    {
+        return StampState::Incomplete;
+    }
     let Some(recorded) = parse(&text) else {
         return StampState::Unknown;
     };
@@ -87,6 +99,20 @@ pub fn record(root: &Path, stamp: &Stamp) -> Result<()> {
     fs::write(&path, format_stamp(stamp, &digest))
         .with_context(|| format!("writing {}", path.display()))
 }
+
+/// Records that an install into this stamp's directory has started but not
+/// finished, so an interrupted bootstrap is repaired on the next run instead
+/// of being mistaken for a completed one.
+pub fn record_incomplete(root: &Path, stamp: &Stamp) -> Result<()> {
+    let dir = root.join(&stamp.dir);
+    fs::create_dir_all(&dir).with_context(|| format!("creating {}", dir.display()))?;
+    let path = dir.join(STAMP_FILE);
+    fs::write(&path, format_stamp(stamp, INCOMPLETE_DIGEST))
+        .with_context(|| format!("writing {}", path.display()))
+}
+
+/// The digest placeholder written before the install steps run.
+pub const INCOMPLETE_DIGEST: &str = "incomplete";
 
 pub fn format_stamp(stamp: &Stamp, digest: &str) -> String {
     format!(
@@ -166,13 +192,25 @@ pub fn js_install_needed(root: &Path, manager: &str) -> bool {
     let Ok(marker_time) = modified(&marker) else {
         return false;
     };
-    let Some(lockfile) = lookup(JS_LOCKFILES, manager).map(|name| root.join(name)) else {
-        return false;
-    };
-    let Ok(lock_time) = modified(&lockfile) else {
+    let Some(lock_time) = newest_lockfile(root, manager) else {
         return false;
     };
     lock_time > marker_time
+}
+
+/// The newest timestamp among every lockfile name `manager` may use: npm has
+/// both `package-lock.json` and `npm-shrinkwrap.json`, bun has both `bun.lock`
+/// and `bun.lockb`. `None` means no lockfile is present at all, which is
+/// unknown evidence and never triggers an install on its own.
+fn newest_lockfile(root: &Path, manager: &str) -> Option<SystemTime> {
+    let names = JS_LOCKFILES
+        .iter()
+        .find(|(name, _)| *name == manager)
+        .map(|(_, names)| *names)?;
+    names
+        .iter()
+        .filter_map(|name| modified(&root.join(name)).ok())
+        .max()
 }
 
 fn lookup(
@@ -218,6 +256,52 @@ mod tests {
 
     fn sources(names: &[&str]) -> Vec<String> {
         names.iter().map(|name| (*name).to_string()).collect()
+    }
+
+    #[test]
+    fn every_lockfile_name_counts_for_a_manager() {
+        let dir = tempdir().unwrap();
+        write_aged(
+            dir.path(),
+            "node_modules/.package-lock.json",
+            "{}",
+            Duration::from_secs(600),
+        );
+        write_aged(
+            dir.path(),
+            "node_modules/.bun-install",
+            "{}",
+            Duration::from_secs(600),
+        );
+        assert!(
+            !js_install_needed(dir.path(), "npm"),
+            "no lockfile is unknown evidence, not a reason to reinstall"
+        );
+        // npm's second lockfile name counts too.
+        write_aged(
+            dir.path(),
+            "npm-shrinkwrap.json",
+            "{}",
+            Duration::from_secs(60),
+        );
+        assert!(js_install_needed(dir.path(), "npm"));
+        assert!(!js_install_needed(dir.path(), "bun"));
+        write_aged(dir.path(), "bun.lockb", "{}", Duration::from_secs(60));
+        assert!(js_install_needed(dir.path(), "bun"));
+    }
+
+    #[test]
+    fn an_interrupted_install_is_repaired_not_trusted() {
+        let dir = tempdir().unwrap();
+        fs::write(dir.path().join("requirements.txt"), "django\n").unwrap();
+        let stamp = Stamp::python_venv(Path::new(".venv"), &sources(&["requirements.txt"]));
+        fs::create_dir_all(dir.path().join(".venv")).unwrap();
+
+        record_incomplete(dir.path(), &stamp).unwrap();
+        assert_eq!(state(dir.path(), &stamp), StampState::Incomplete);
+
+        record(dir.path(), &stamp).unwrap();
+        assert_eq!(state(dir.path(), &stamp), StampState::Fresh);
     }
 
     #[test]
