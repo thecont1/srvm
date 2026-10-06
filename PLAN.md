@@ -6,6 +6,18 @@ This plan merges the original project brief with the locked design decisions bel
 
 ---
 
+## 0. North star contract
+
+**After `cd`, bare `srvm` runs the project — zero decisions.** No command to recall, no directory to pick, no dependency to install, no port to free, no `.env` to source. Every flag is an escape hatch, never a requirement; when two options are equal, the one that removes a user decision wins over the one that adds a flag.
+
+1. **The user never names a command, runtime, package manager, or port.** `srvm` alone is the complete invocation for the common case.
+2. **The repo is the config.** Conventional locations (`frontend/`, `backend/`, `apps/*`, `packages/*`, `services/*`, `.env`, lockfiles, version-hint files) carry the intent. There is no `srvm.toml`.
+3. **Bootstrap like a teammate would.** Missing `.venv`, stale `node_modules`, absent `vendor/`/`deps/` — srvm performs the conventional, untracked, ecosystem-standard setup so clone → run works.
+4. **One lifecycle, honest exits.** Every app shares shutdown; failures are reported in the app's own words (tail + spec name); nothing leaks.
+5. **Reliability is part of simplicity.** Runtime-cache integrity and complete process-tree teardown are invisible until they fail — they are release blockers, not polish.
+
+---
+
 ## 1. Product framing
 
 ### 1.1 What srvm is
@@ -19,7 +31,7 @@ A **launcher**, full stop. srvm's entire job is the run lifecycle: detect → pr
 | "LaunchPad (`lp`)" branding | **`srvm`** everywhere | Consistent binary/repo name; cache dirs derive from it |
 | `~/.launchpad/runtimes/` cache | **Platform cache dir** (`dirs::cache_dir()/srvm`, override `SRVM_CACHE_DIR`) | Runtime archives are cached here since M5; the launcher remains stateless outside provisioning |
 | "Never install runtimes; embed a version manager day 1" | **Phased** — PATH + shim resolution first; archive fetching implemented in M5 | Detection stays read-only; launch-time provisioning follows the seam in §4.4 |
-| Both frontend + backend launched in one repo | **Single best match by default; `--all` launches the independent set** | `detect()` returns ranked candidates; `launch::launch_set` picks one per family and `supervise::run_many` runs them under one lifecycle (M6, §4.3/§4.5) |
+| Both frontend + backend launched in one repo | **Bare `srvm` launches the whole independent set; `--all` is a compat alias; `--select` picks one** | Reverses the earlier "single best match" lock (M6.1). Running the project means running all of it; `launch::default_set` dedups by (canonical app root, family) and a recognized root orchestrator runs alone (§4.5) |
 | Language "Go or Rust" | **Rust** | User's call; the design maps cleanly onto Rust threads + channels (§4.3) |
 | Comparison table using the old product name | **Independent launcher positioning** | No viewer or Docker daemon required for ordinary launch paths; supported missing runtimes can be fetched |
 
@@ -34,6 +46,9 @@ A **launcher**, full stop. srvm's entire job is the run lifecycle: detect → pr
 - **Early-death classification** — non-zero exit < 3s = `failed` + last ~12 log lines. No continuous crash-loop restart; unannounced failures after port injection have a bounded startup retry exception (§3.2).
 - **Output flood collapse** — repeated-pattern lines shown twice then folded into `· N more`.
 - **Static-site fallback** — bare `index.html` repo gets an embedded file server; guaranteed landing zone.
+- **Bounded conventional discovery** — the selected root, direct `frontend`/`backend`/`client`/`server`/`web`/`api`, and immediate children of `apps`/`packages`/`services` (§3.3). No symlink traversal, nothing outside the canonical workspace, hidden/vendor/generated directories skipped, hard cap of 128 candidate roots reported as a diagnostic instead of silent truncation.
+- **Bootstrap-only repo writes** — a missing `.venv`, a `node_modules` that predates the lockfile, an absent `vendor/`/`deps/` get the conventional, untracked, ecosystem-standard setup, so clone → run works. Tracked source files are never touched and `--no-install` remains the escape hatch.
+- **`.env` is parse-only** — `KEY=VALUE` (+`export`, quotes, comments, ~64 KiB cap) read from each app root and injected for unset vars only, so the OS environment always wins. Never evaluated, never echoed. `BROWSER=none` is always injected last.
 
 ---
 
@@ -42,34 +57,40 @@ A **launcher**, full stop. srvm's entire job is the run lifecycle: detect → pr
 ### 2.1 Happy path (revised from brief — real narration style)
 
 ```console
-$ srvm
+$ cd ~/projects/ai-app && srvm
   srvm 0.1.0
   workspace  ~/projects/ai-app
-  serve      next dev (node)
-  step       installing dependencies — npm install
-  port       3000 busy → 3001
-  app        http://localhost:3001
+  serve      [frontend] npm run dev (npm)
+  serve      [backend] python3 manage.py runserver (python)
+  step       [frontend] installing dependencies — npm install
+  step       [backend] installing dependencies — .venv/bin/pip install -r requirements.txt
+  port       [frontend] 5173
+  port       [backend] 8000
+  app        http://localhost:5173
+  app        http://localhost:8000
 
   ctrl-c to stop
 ```
 
-Deviation from the brief's mock: key-value narration uses aligned lowercase labels without decorative symbols. Runtime-download lines are implemented since M5 and appear only when fetching is needed.
+Bare `srvm` launches the whole independent set: one `serve`/`app` line per app, `[label]` only when the set has more than one, and a single `ctrl-c to stop` that stops everything. A repo with one candidate keeps the unlabeled narration (`srvm 0.1.0` / `workspace` / `serve` / `step` / `port` / `app`) unchanged.
+
+Deviations from the brief's mock: key-value narration uses aligned lowercase labels without decorative symbols. Runtime-download lines (M5) and bootstrap-install lines (M6.1) appear only when they are needed. When a recognized root orchestrator suppresses visible sub-apps, one `note` line points at them (`orchestrated by make:dev; --select <id> for one app`).
 
 ### 2.2 CLI surface
 
 | Invocation | Behavior |
 |---|---|
-| `srvm` | detect + launch in `.` |
-| `srvm <dir>` | detect + launch in `<dir>` |
+| `srvm` | discover + launch everything in `.` — the default set (§4.5) |
+| `srvm <dir>` | discover + launch everything in `<dir>` |
 | `srvm --dry-run [dir]` | print detection result(s) + resolved commands; exit 0. **Primary testing/debugging surface — build in M1** |
 | `srvm --no-open` | don't auto-open the app URL in a browser |
 | `srvm --port N` | arbitration starts at N instead of the spec's hint; `--port 0` picks an OS-assigned free port |
-| `srvm --select <name\|tool\|n>` | launch one ranked candidate by name, tool, or 1-based index; without it, launch the first candidate |
-| `srvm --no-install` | never run the spec's install step |
+| `srvm --select <id>` | launch exactly one candidate: 1-based dry-run index, qualified id (`apps/web:package:dev`), or a bare name/tool when it is unambiguous — an ambiguous bare name errors with the qualified options |
+| `srvm --no-install` | never run any install step, including bootstrap installs |
 | `srvm -v/--verbose` | child output unfiltered (skip flood-collapse) |
 | `srvm --quiet`, `--no-color` | narration controls (`--quiet` suppresses narration; `--no-color`/`NO_COLOR` disables ANSI) |
 | `srvm --version` | print and exit |
-| `srvm --all` | launch every independent app in the launch set (§4.5) with `[label]`-prefixed output; conflicts with `--select`; one-entry sets behave like the default |
+| `srvm --all` | compat alias for the default set — identical behavior, kept for docs and muscle memory; conflicts with `--select` |
 
 No subcommands in v0.1 — the bare invocation IS the product. (If a `doctor`/`runtimes` management subcommand is wanted later, `clap` subcommands bolt on cleanly.)
 
@@ -85,7 +106,7 @@ No subcommands in v0.1 — the bare invocation IS the product. (If a `doctor`/`r
 
 ## 3. Detection engine (M1 — the core asset)
 
-The detection engine is a fixed ordered rule table. **Order is semantics** — rules collect ranked candidates, and ordinary launch selects the first; some ecosystem rules also choose only their highest-priority command. Meta-frameworks precede bundlers and heavyweight fallbacks come last. This is root-oriented candidate detection, not recursive workspace discovery.
+The detection engine is a fixed ordered rule table. **Order is semantics** — rules collect ranked candidates, and within a root the first surviving candidate wins its family; some ecosystem rules also choose only their highest-priority command. Meta-frameworks precede bundlers and heavyweight fallbacks come last. The table itself is unchanged by M6.1: discovery (§3.3) decides which roots it runs against.
 
 | # | Rule | Markers | Command | Port hint |
 |---|---|---|---|---|
@@ -112,7 +133,7 @@ The detection engine is a fixed ordered rule table. **Order is semantics** — r
 | 19 | cargo | `Cargo.toml` + `src/main.rs` | `cargo run` | — |
 | 20 | go | `go.mod` + `main.go`, or exactly one `cmd/*/main.go` | `go run .` / `go run ./cmd/<x>` | — |
 | 21 | compose | `compose.y[a]ml`/`docker-compose.y[a]ml` | `docker compose up` | — |
-| 22 | static | `index.html` at root | embedded file server | 8000 |
+| 22 | static | `index.html` at the candidate root, or in `public/`, `www/`, `site/` when nothing else matches anywhere | embedded file server | 8000 |
 
 Supporting machinery (implemented; names match `src/detect/`):
 
@@ -165,6 +186,24 @@ Script-body recognition is deliberately conservative: an exact `framework-bin + 
 
 ---
 
+### 3.3 Conventional discovery (M6.1)
+
+`workspace::discover(root)` turns one directory into a bounded, located candidate list. The rule table above runs unchanged against each discovered root; discovery only decides *which roots* it sees.
+
+| Order | Root |
+|---|---|
+| 1 | the canonicalized selected root |
+| 2 | direct children named `frontend`, `backend`, `client`, `server`, `web`, `api` (exact lowercase names) |
+| 3 | immediate children of `apps/`, `packages/`, `services/` — **sorted by name**, directories only |
+
+Every candidate carries its canonical app root and its path relative to the workspace root, so a child app keeps root-qualified labels, per-app cwd, per-app hints, and per-app `.env`.
+
+**Bounds.** Hidden directories (leading `.`) and generated/vendor directories (`node_modules`, `vendor`, `target`, `dist`, `build`, `out`, `.venv`, `venv`, `env`, `deps`, `__pycache__`) are skipped. Symlinks are never traversed (`DirEntry::file_type()` only), so discovery cannot escape the canonical workspace. At most 128 candidate roots are visited; hitting the cap prints a diagnostic naming the limit — truncation is never silent. An oversized *structured* marker (`package.json`, `deno.json`) errors explicitly, while a malformed optional child marker produces a path-qualified warning without aborting discovery; root-level detection errors keep their existing behavior.
+
+**Static fallback.** `public/`, `www/`, and `site/` are probed for `index.html` only after every other rule came up empty, and only the first one found is used. `dist/`/`build/` stay excluded in v0.1 — generated output is ambiguous about which app produced it.
+
+---
+
 ## 4. Architecture
 
 ### 4.1 Crate layout (binary entry point plus library modules)
@@ -172,9 +211,13 @@ Script-body recognition is deliberately conservative: an exact `framework-bin + 
 ```text
 src/
   main.rs        delegates to cli::run()
-  lib.rs         exports cli, detect, launch, ports, runtime, staticsrv, supervise
+  lib.rs         exports bootstrap, cli, detect, dotenv, launch, ports, runtime,
+                 staticsrv, supervise, workspace
   cli.rs         clap, dry-run, candidate selection, runtime preparation, launch
-  launch.rs      Family classification and launch_set policy for --all
+  workspace.rs   bounded conventional discovery -> located candidates
+  launch.rs      Family classification, (root, family) dedup, default/select sets
+  dotenv.rs      parse-only .env reader (no eval), OS-env-precedence injection
+  bootstrap.rs   per-stack bootstrap installs and their stamps (M6.1b)
   detect/
     mod.rs       ServeSpec/CommandSpec/PortInjection; ToolResolver, PathResolver,
                  AvailabilityResolver; ranked detect()/detect_with()
@@ -238,7 +281,13 @@ Lean — every dep must justify itself:
 
 ### 4.5 Launch-set policy (`src/launch.rs`)
 
-`launch_set(&[ServeSpec]) -> Vec<usize>` is consulted only by `--all` and dry-run. Each candidate is classified into a `Family` (Js, Python, Ruby, Docs, Elixir, Php, Rust, Go, Orchestrator, Static) by name prefix (`package:`, `go:`, `make:`, `just:`, `task:`) then exact name, falling back on the tool. Rules: keep the first candidate per app family (later ones are alternative launchers for the same app); if any app survives, drop every orchestrator (`procfile`, `make`, `just`, `task`, `turbo`, `nx`, `compose`) and the static fallback; otherwise launch the first orchestrator alone; otherwise static alone. A one-entry set runs the ordinary single path. Discovery is still root-only — subdirectory apps are not found.
+`default_set(&[Candidate]) -> Set` is the product's center of gravity: it decides what bare `srvm` runs, and `--all` is only an alias for it. Each candidate is classified into a `Family` (Js, Python, Ruby, Docs, Elixir, Php, Rust, Go, Orchestrator, Static) by name prefix (`package:`, `go:`, `make:`, `just:`, `task:`) then exact name, falling back on the tool.
+
+1. **Root orchestrator precedence.** If the workspace root produced a recognized orchestrator (the existing `Orchestrator` family plus conservative `turbo`/`nx` package-script wrappers, recognized by bounded token inspection of the detected command — never by evaluating the script body), the default set is exactly that one candidate. Visible sub-apps stay in `--dry-run` and stay reachable through `--select`, and one `note` line says so.
+2. **Otherwise, dedup by (canonical app root, family).** `apps/web` and `apps/admin` both JS → two apps, on distinct ports. Two JS matches in one directory (`package:dev` script plus a `vite` fallback), or a JS app next to a Makefile in the same directory, remain one app — later matches in that root are alternative launchers for the same app.
+3. **Orchestrators and statics never join a mixed set.** A `Makefile`/`compose`/static candidate inside a sub-root is dropped when any real app exists; if no app survives, the first orchestrator runs alone; if there is still nothing, the first static candidate runs alone.
+
+The set's size selects the execution path: one entry takes the ordinary single-app lifecycle, two or more take `supervise::run_many`. `--select` always resolves to exactly one candidate. Orchestrator precedence is also what keeps bare `srvm` in a monorepo from starting the same work twice.
 
 ### 4.4 Implemented runtime-resolution and provisioning flow (M5)
 
@@ -274,37 +323,61 @@ Rust downloads the official **rustc, cargo, and rust-std** component archives ra
 | **M3** Port arbitration | Implemented / merged | `ports.rs`: requested/explicit/inherited/hint resolution, bounded probe-walk listener reservation, `{port}` template + env injection, sniffed-URL verify + "ignored" note, hardened HTTP probe hint | Occupied-port integration tests assert a real listener lands on the shifted port and the announced URL matches reality (see `tests/ports.rs`; 12s probe fallback exercised once) |
 | **M4** Static fallback | Implemented / merged | `staticsrv.rs`: in-process loopback HTTP server on the M3-reserved `TcpListener` (no drop/rebind), httparse + cap-std confinement, 4 bounded workers, GET/HEAD only | `srvm` in a bare-HTML dir serves it with an empty `PATH`; `tests/staticsrv.rs` covers MIME, traversal/symlink/dotfile denial (real sibling secrets), Host validation, request limits + 408 deadline, index-gated redirects, streaming/range semantics, read-only roots, `--no-open` positive/negative control, and signal shutdown |
 | **M5** Runtime fetch | Implemented / merged | Node, Python, Go, and rustc+cargo+rust-std archives; checksum-before-extract, cache/offline fallback, PATH prepend | Four PATH-scrubbed fixture boots pass in CI; real upstream toolchain and sequential Rust layout validation remain open (§5.1). No rustup-init |
-| **M6** Multi-stack | Implemented (`dev/bipasha`, awaiting CI/review) | `launch.rs` launch-set policy, `run_many` with live-PID registry + shared shutdown, `--all` (conflicts with `--select`), per-app labels/URLs/ports, dry-run `launch` listing | `tests/multi.rs`: two labeled apps on distinct ports, `--port N` ascending allocation, sibling-failure teardown, Ctrl+C reaps both (unix), one-app and dry-run paths; single-stack output unchanged. Decisions recorded in §5.2 |
+| **M6** Multi-stack | Implemented / merged (`f9e1a24`, PR #2) | `launch.rs` family classification, `run_many` with live-PID registry + shared shutdown, `--all`, per-app labels/URLs/ports, dry-run `launch` listing | `tests/multi.rs`: two labeled apps on distinct ports, `--port N` ascending allocation, sibling-failure teardown, Ctrl+C reaps both (unix), one-app and dry-run paths; single-stack output unchanged |
+| **M6.1** "Just run it" | Implemented on the feature branch | `workspace.rs` bounded conventional discovery, `launch::default_set` (bare `srvm` runs the whole independent set), per-app roots/cwd/hints/PATH, qualified `--select` ids, parse-only `.env` injection, ordered bootstrap installs (`bootstrap.rs` stamps a Python `.venv`, JS staleness follows the package manager's marker, `vendor/`/`deps/` gate Composer/Bundler/Mix) | Acceptance suite in §2/§5.2: frontend+backend, two JS apps, orchestrator-vs-sub-apps, spaces/non-ASCII paths, symlink/generated/cap limits, per-app cwd/hints/install, `.env` behavior, per-stack bootstrap (fixture stubs), dry-run purity, unified teardown |
+| **R** Release readiness | Not started | runtime cache + Rust prefix integrity, cross-process cache safety, Go historical index, owned bounded lifecycle/teardown, MSRV verified on six hosts | Failing regressions first for Rust-prefix assembly, resistant descendants, cancel-during-startup, and real-archive naming; `cargo +1.89.0 check --locked --all-targets` evidence recorded |
 | **M7** Distribution | Not started | release CI matrix via `cargo-dist` (or manual goreleaser-style), install.sh, brew/scoop/winget taps, shell completions, man page | One-command install on all three OSes. No release workflow or GitHub releases exist at the verified baseline |
 
-### Current status snapshot (verified baseline: `main` at `8852bc9`)
+### Current status snapshot (verified baseline: `main` at `f9e1a24`)
 
-**Implemented and merged:** M0–M5. [PR #1](https://github.com/thecont1/srvm/pull/1) merged on 2026-10-05 as `098f1b5`; `8852bc9` adds the post-merge quick-startup retry correction. The working tree was clean at assessment. Missing supported runtimes are provisioned into the platform cache; repo-local and off-PATH tool directories reach children and descendants. Detection and dry-run remain download-free.
+**Implemented and merged:** M0–M6. [PR #1](https://github.com/thecont1/srvm/pull/1) merged as `098f1b5`; [PR #2](https://github.com/thecont1/srvm/pull/2) merged the M6 multi-stack work as `f9e1a24`, which is both `main` and `origin/main` and is the baseline for this plan. M6.1 ("just run it") is the in-progress milestone; the readiness gate and M7 follow it.
 
-**Verified CI:** [run 37318739459](https://github.com/thecont1/srvm/actions/runs/37318739459), latest attempt 2, reports successful macOS, Ubuntu, and Windows jobs for `8852bc9`. The workflow runs `cargo fmt --check`, `cargo clippy --all-targets -- -D warnings`, and `cargo test`; it does not test release packaging or live upstream runtime boots. No local suite was rerun for this documentation-only assessment. These results establish the existing fixture-based baseline, not every production claim.
+**Verified CI:** [run 37335467566](https://github.com/thecont1/srvm/actions/runs/37335467566) reports successful macOS, Ubuntu, and Windows jobs for `f9e1a24`. `.github/workflows/ci.yml` runs `cargo fmt --check`, `cargo clippy --locked --all-targets -- -D warnings`, and `cargo test --locked`; it does not test release packaging, six-native-target execution, or live upstream runtime boots.
 
-**M6 implemented on `dev/bipasha`** (three commits after the plan reconciliation; 172 tests locally: 111 lib + 6 cli + 7 multi + 12 ports + 4 runtime_boot + 32 staticsrv; fmt/clippy clean). Three-OS CI runs on the PR. **Next:** M7 distribution, which has no release workflow or published GitHub releases yet. Keep the validation carryovers below visible while moving forward.
+**M6.1 on `dev/chetna` (not yet merged):** conventional discovery, the default launch set, per-app roots, parse-only `.env`, and bootstrap installs with stamps are implemented with unit and integration regressions (`workspace.rs`, `launch.rs`, `dotenv.rs`, `bootstrap.rs`, `tests/discovery.rs`, `tests/bootstrap.rs`). The Python bootstrap test builds a real virtualenv and proves the stamp skips the second run's install. Still open before M6.1 can close: per-app `--no-install`/`--port` overrides, static-alongside-apps, `--json` dry-run output, and a review pass over the acceptance list in §5.2. The multi-app flake was reproduced under real cross-process port pressure and fixed here: a reserved port stolen in the spawn handoff window was recovered only when the death looked quick or the thief still held the port, so a launch could fail outright with `package:dev exited`, and a retry used `selected + 1`, which in a multi-app launch is the next app's reserved port. A port-injected app that dies without announcing is now retried within the bounded retries, and each retry moves above every port the launch selected. Regressions: `all_retries_a_slow_death_that_never_announced`, `all_handoff_retry_never_steals_a_sibling_port`, `supervise::retry_tests`. `all_port_start_allocates_distinct_ascending_ports` now claims ascending allocation only when srvm reported no handoff retry, since a retried launch does not promise port order in launch order; 120 concurrent runs of it are clean.
 
-### 5.1 Validation carryovers from implemented milestones
+**Next:** the release-readiness gate (runtime cache/Rust prefix, lifecycle ownership, MSRV), then M7 distribution with its six-target release pipeline and the `v0.1.0-rc.1` approval gate. No release workflow or published GitHub releases exist yet. Keep the validation carryovers below visible while moving forward.
+
+### 5.1 Validation carryovers from implemented milestones (open until milestone R closes them)
 
 - **M2 lifecycle:** real-framework boots and arbitrary nested/TERM-resistant descendant cleanup are not automated. `dropping_guard_reaps_server_tree` checks a fixture listener is released; on Windows its test guard itself calls `taskkill`, so it is not proof of srvm's own signal-driven tree cleanup. M6 added sibling-failure and unix Ctrl+C teardown tests for two apps, but nested/TERM-resistant trees and Windows signal-driven cleanup remain open.
 - **M5 real toolchains:** `tests/runtime_boot.rs` uses locally served fixture archives and stub executables, not live distributions or real compiler/framework boots. Several CLI/runtime tests lack process-level timeouts; use bounded waits for new coverage.
 - **M5 Rust component layout:** `ensure_rust` installs three archives sequentially, and `extract_verified_flat` scans every top-level directory in the shared destination on each call, including previously installed directories. The flat-extraction unit test covers one combined synthetic archive; the boot fixture only runs a stub cargo and uses a simplified standard-library path. This is a concrete validation concern, not a reproduced live-upstream failure. Add a realistic sequential three-archive regression asserting stable `bin/rustc`, `bin/cargo`, and `lib/rustlib/<target>/lib`, then an opt-in fetched-toolchain compile/run smoke test. Check this before expanding runtime concurrency.
 
-### 5.2 M6 decisions as implemented
+### 5.2 Launch-set and discovery decisions (M6 + M6.1)
 
 | Gate | Decision |
 |---|---|
-| Discovery depth | Root only. Subdirectory/monorepo discovery is deferred; orchestrators (turbo/nx/Procfile/compose) remain the way to launch several directories |
-| Dedup / orchestrator precedence | §4.5: first per family; orchestrators and static dropped when an app exists, else first orchestrator, else static |
-| `--all` + `--select` | clap `conflicts_with`; `--all` with a one-entry set behaves exactly like the default path |
+| Discovery | Bounded conventional locations (§3.3): selected root, `frontend`/`backend`/`client`/`server`/`web`/`api`, immediate children of `apps`/`packages`/`services`; sorted sub-roots; 128-root cap; no symlink traversal; hidden/vendor/generated skipped |
+| Default set | Bare `srvm` runs `launch::default_set`: dedup by (canonical app root, family); a recognized root orchestrator runs alone with a `note`; `--all` is a compat alias; `--select` picks exactly one |
+| `--all` + `--select` | clap `conflicts_with`; `--all` is a no-op alias for the default set; `--select` accepts a 1-based index, a qualified id (`apps/web:package:dev`), or an unambiguous bare name/tool and errors with the qualified options when ambiguous |
 | `--port N` across apps | App 1 starts at N, each later app starts one past the previous selection; `--port 0` is OS-assigned per app; without `--port`, each app's own hint/inherited port, with held reservations resolving duplicates |
 | Sibling failure / aggregate exit | Exit 0 keeps siblings running; any failure shuts every app down and srvm exits non-zero. Exit 0 only when every app exited 0 |
 | Browser | Opens once, for the first announced URL; `--no-open` honored |
-| Provisioning | `prepare_runtimes` and installs run sequentially before any server starts |
-| Static coexistence | Not supported; static only serves when nothing else is detected |
+| Provisioning | `prepare_runtimes`, bootstrap installs, and `.env` injection run sequentially, per app root, before any server starts; installs finish before any port is reserved |
+| Bootstrap writes | Only conventional untracked dirs (`.venv`, `node_modules`, `vendor/`, `deps/`); a stamp written after the last step succeeds, so repeat runs stay cheap and a partial bootstrap never looks complete; `--no-install` opts out |
+| Static coexistence | Not supported; static serves only when nothing else is detected — a root `index.html` or a conventional asset dir (`public/`, `www/`, `site/`) |
 
-**Deferred from M6:** bounded subdirectory discovery; per-app `--no-install`/`--port` overrides; static alongside apps; stronger spawn-registration-window and TERM-resistant descendant tests (§5.1). Windows Ctrl+C multi-app teardown relies on `taskkill /T /F` per registered PID and is only exercised by the unix-gated test.
+**Deferred from M6/M6.1:** per-app `--no-install`/`--port` overrides; static alongside apps; `--json` dry-run output for agents; stronger spawn-registration-window and TERM-resistant descendant tests (§5.1). Windows Ctrl+C multi-app teardown relies on `taskkill /T /F` per registered PID and is exercised only by the unix-gated test.
+
+### 5.3 Settled sub-gate designs (M6.1)
+
+**Shared-JS-workspace declaration parser.** A shared JS install is recognized only from declarations, never inferred:
+
+- `package.json` `"workspaces"`, as an array of patterns or `{"packages": [patterns]}`.
+- `pnpm-workspace.yaml`, top-level `packages:` list items only (`- 'apps/*'`), parsed line-wise — no general YAML.
+
+Patterns support literal segments, `*`, and `**`. An app root is owned by the nearest ancestor inside the workspace that declares a workspace whose patterns match the app root's relative path; the install then runs once at that ancestor with the ancestor's package manager and the app root's own install is suppressed. Nested declarations, unparseable structure, or patterns that do not match produce a warning and fall back to per-root installs — srvm never guesses.
+
+**Bootstrap stamp formats (implemented).** One versioned, tab-separated line written into the untracked directory it describes:
+
+`srvm-bootstrap-v1<TAB><purpose><TAB><source-rel-path><TAB>sha256:<hex>`
+
+for example `<app>/.venv/.srvm-bootstrap` holding `python-requirements` + `requirements.txt` + the digest. Multiple sources hash as a sorted list of `<rel>\0<sha256>\n` records. A missing or unparsable stamp means *unknown, do not reinstall*; a mismatching digest means stale → reinstall. JS staleness is deliberately **not** stamped: it compares the lockfile mtime with the package manager's own marker (`node_modules/.package-lock.json`, `.modules.yaml`, `.bun-install`), and a missing marker next to an existing `node_modules` is unknown rather than stale.
+
+**Windows Job Objects.** Not implemented. `taskkill /T /F` per registered PID remains the mechanism; Job Objects become an explicit reviewed sub-gate only if a Windows regression proves the current teardown insufficient.
+
+**MSRV.** `rust-version = "1.89"` is proposed because it enables `File::try_lock` for the runtime cache lock without a new dependency; it is verified with `cargo +1.89.0 check --locked --all-targets` on every supported host before being set, and revised only from evidence.
 
 ---
 
@@ -326,11 +399,11 @@ Rust downloads the official **rustc, cargo, and rust-std** component archives ra
 | `PORT` ignored by a framework | Per-spec args injection where available; post-inject verification against sniffed URL + honest "override ignored" note |
 | Runtime fetch trust (M5) | HTTPS distributions/checksum metadata (loopback HTTP allowed for fixtures), SHA-256 before extraction, staged cache publication; upstream-supplied checksums are integrity checks, not independent publisher authentication |
 | `.cmd`/`.bat` shims on Windows can't take signals | Kill the tree, never just the shim PID |
-| Monorepo false positives or apps below the selected root | `--select` chooses among detected root candidates; it does not discover deeper apps. Turbo/Nx may already orchestrate several services, so the launch set drops orchestrators when a concrete app exists and otherwise runs the first orchestrator alone (§4.5). Discovery stays root-only |
+| Monorepo false positives or apps below the selected root | Discovery is bounded to conventional locations (§3.3), and orchestrator precedence (§4.5) keeps turbo/nx/compose/Procfile from double-launching the sub-apps they already run. `--dry-run` lists every per-root candidate plus effective launch membership, and `--select` reaches suppressed ones. Anything outside the conventional locations stays invisible by design |
 | Repos with several matching rules where first is wrong | `detect()` returns all; `--dry-run` shows the full ranked list so `--select` is discoverable |
 | Port race between reservation and child bind | At most two startup retries after an injected-port, unannounced nonzero exit; quick failures use a heuristic, slower ones require an occupied endpoint (§3.2). Report the actual sniffed URL when the app binds elsewhere |
-| Concurrent provisioning into one cache version | Current staging names are shared and unguarded; `--all` prepares runtimes and installs sequentially, so add explicit locking before any concurrent provisioning |
-| Rust component layout differs from synthetic fixtures | Sequential extraction must preserve one usable compiler/sysroot prefix; track the validation follow-up in §5.1 rather than treating a stub cargo boot as proof |
+| Concurrent provisioning into one cache version | A bounded `File::try_lock` (MSRV 1.89) on a stable per-runtime/platform/version lock file, with the post-acquire recheck and unique owned staging dirs added under milestone R; `--all` still prepares runtimes and installs sequentially |
+| Rust component layout differs from synthetic fixtures | A failing three-archive regression lands first, then the assembled prefix is validated (rustc, cargo, compiler libs, `lib/rustlib/<target>/lib`) before the cache marker is published — never by scanning previously assembled directories. Milestone R owns this; a stub cargo boot is not proof |
 | AI-generated repos lack lockfiles/scripts or tools | Framework-dependency detection and static fallback cover some cases; M5 fetches the supported runtime names in §4.4, not every package manager or framework dependency |
 
 ## 8. Explicit non-goals (v1)
@@ -341,11 +414,16 @@ Rust downloads the official **rustc, cargo, and rust-std** component archives ra
 - Telemetry (srvm ships without any — revisit only with explicit user demand)
 - Continuous auto-restart / crash-loop supervision — only the bounded startup-handoff heuristic in §3.2 is implemented; exhausted attempts return the failure
 - Plugin architecture
+- JSON dry-run output (`--json`) for agents — recorded, post-v0.1
+- musl targets — Linux ships GNU/glibc in v0.1
+- Arbitrary script bodies or evaluated repo commands — detection and `.env` handling are parse-only
+- Daemon mode / supervised auto-restart
 
 ## 9. Open questions for the maintainer
 
 1. **`--port` semantics**: settled — it is the arbitration *start* (with `0` meaning OS-assigned). An exact-port flag (`--exact-port`) could be added later if requested.
 2. **Static server binding**: settled — loopback `127.0.0.1` only, no `--host` flag in v0.1; expose it only if requested.
 3. **Name collision check**: `srvm` is short for "serve 'em"; verify crates.io/`brew` name availability before M7 publish — have `srv`/`srve`/`srvup` as backups.
-4. **Minimum Rust version**: edition 2024 is configured, but Cargo.toml has no `rust-version` and CI tracks stable. Choose and verify an explicit MSRV before M7 rather than treating a moving stable channel as a fixed minimum.
-5. **Subdirectory discovery**: `--all` is root-only by design (§5.2). Decide whether bounded `apps/*`/`packages/*` discovery is wanted before M7 freezes the CLI surface.
+4. **Minimum Rust version**: settled in proposal — `rust-version = "1.89"`, set only after `cargo +1.89.0 check --locked --all-targets` passes on every supported host, then revised only from evidence (§5.3).
+5. **Subdirectory discovery**: settled — bounded conventional discovery replaces root-only detection (§3.3), bare `srvm` runs the resulting independent set, and `--all` survives as a compat alias (§4.5).
+6. **Registry identity**: the crates.io name is still unverified (the API returned 403 during research). Confirm name availability, publisher identity, and tap/bucket ownership before M7 publishes; `srv`/`srve`/`srvup` remain the documented backups. No rename or reservation happens without explicit approval.

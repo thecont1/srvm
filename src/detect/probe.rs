@@ -1,6 +1,6 @@
 use std::{fs, io::Read, path::Path};
 
-use anyhow::Result;
+use anyhow::{Result, bail};
 use serde_json::Value;
 
 const PROBE_CAP: u64 = 1_048_576;
@@ -20,7 +20,12 @@ pub fn file_contains(root: &Path, rel: &str, needle: &str) -> bool {
 }
 
 pub fn read_to_string(root: &Path, rel: &str) -> Result<String> {
-    Ok(fs::read_to_string(root.join(rel))?)
+    let path = root.join(rel);
+    let len = fs::metadata(&path)?.len();
+    if len > PROBE_CAP {
+        bail!("{rel} is {len} bytes, above the {PROBE_CAP}-byte marker cap");
+    }
+    Ok(fs::read_to_string(path)?)
 }
 
 /// Capped, lossy file read for marker scanning — returns None when the file

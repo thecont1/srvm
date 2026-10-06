@@ -18,6 +18,7 @@ use anyhow::{Context, Result, bail};
 use crate::{
     detect::{CommandSpec, PortInjection, ServeSpec},
     ports, staticsrv,
+    workspace::Candidate,
 };
 
 mod collapse;
@@ -48,6 +49,7 @@ pub fn run(
     spec: &ServeSpec,
     options: SupervisorOptions,
     path_prepend: &[PathBuf],
+    app_env: &[(String, String)],
 ) -> Result<()> {
     let stop = spec.is_static.then(|| {
         STATIC_STOP
@@ -63,18 +65,22 @@ pub fn run(
         return run_static(root, requested, options, stop);
     }
 
-    if !options.no_install
-        && let Some(install) = &spec.install
-    {
-        println!(
-            "  step       installing dependencies — {}",
-            install.command_line()
-        );
-        run_install(root, install, options, path_prepend, None)?;
+    if !options.no_install && !spec.installs.is_empty() {
+        run_bootstrap(root, spec, options, path_prepend, None, app_env)?;
     }
 
     let opened = Arc::new(AtomicBool::new(false));
-    run_server(root, spec, requested, options, path_prepend, None, &opened)
+    run_server(
+        root,
+        spec,
+        requested,
+        options,
+        path_prepend,
+        None,
+        &opened,
+        app_env,
+        &[],
+    )
 }
 
 fn run_static(
@@ -105,16 +111,18 @@ fn run_static(
 
 pub struct LaunchItem<'a> {
     pub label: String,
-    pub spec: &'a ServeSpec,
+    pub candidate: &'a Candidate,
     pub path_prepend: Vec<PathBuf>,
+    /// Parsed `.env` pairs for this app, injected for unset vars only.
+    pub env: Vec<(String, String)>,
 }
 
 /// Launches several apps under one supervisor: ports are allocated up front
 /// so every app gets a distinct one, installs still run sequentially, and one
 /// worker thread supervises each child. Any app failing shuts the rest down
 /// and propagates the error; apps that exit 0 keep the others running.
-pub fn run_many(root: &Path, items: &[LaunchItem], options: SupervisorOptions) -> Result<()> {
-    if items.iter().any(|item| item.spec.is_static) {
+pub fn run_many(items: &[LaunchItem], options: SupervisorOptions) -> Result<()> {
+    if items.iter().any(|item| item.candidate.spec.is_static) {
         bail!("static serving does not participate in multi-app launch");
     }
     if items.len() < 2 {
@@ -125,24 +133,18 @@ pub fn run_many(root: &Path, items: &[LaunchItem], options: SupervisorOptions) -
 
     let mut requested = Vec::with_capacity(items.len());
     for item in items {
-        requested.push(plan_port(item.spec, options, Some(&item.label))?);
+        requested.push(plan_port(&item.candidate.spec, options, Some(&item.label))?);
     }
 
     for item in items {
-        if !options.no_install
-            && let Some(install) = &item.spec.install
-        {
-            println!(
-                "  step       {}installing dependencies — {}",
-                labeled(Some(&item.label)),
-                install.command_line()
-            );
-            run_install(
-                root,
-                install,
+        if !options.no_install && !item.candidate.spec.installs.is_empty() {
+            run_bootstrap(
+                &item.candidate.root,
+                &item.candidate.spec,
                 options,
                 &item.path_prepend,
                 Some(&item.label),
+                &item.env,
             )?;
         }
     }
@@ -179,6 +181,8 @@ pub fn run_many(root: &Path, items: &[LaunchItem], options: SupervisorOptions) -
         selected.push(sel);
     }
     drop(held);
+    // Every port this launch selected, so a retry can steer clear of siblings.
+    let sibling_ports: Vec<u16> = selected.iter().flatten().copied().collect();
 
     let opened = Arc::new(AtomicBool::new(false));
     thread::scope(|scope| -> Result<()> {
@@ -187,15 +191,18 @@ pub fn run_many(root: &Path, items: &[LaunchItem], options: SupervisorOptions) -
             let tx = tx.clone();
             let opened = opened.clone();
             let start = selected[idx];
+            let siblings = sibling_ports.clone();
             scope.spawn(move || {
                 let result = run_server(
-                    root,
-                    item.spec,
+                    &item.candidate.root,
+                    &item.candidate.spec,
                     start,
                     options,
                     &item.path_prepend,
                     Some(item.label.as_str()),
                     &opened,
+                    &item.env,
+                    &siblings,
                 );
                 let _ = tx.send(result);
             });
@@ -262,15 +269,41 @@ fn plan_port(
     Ok(requested)
 }
 
+/// Runs every bootstrap install step in order and then records the stamp that
+/// makes the next run cheap. A failing step aborts before anything is stamped,
+/// so a partial bootstrap is never mistaken for a complete one.
+fn run_bootstrap(
+    root: &Path,
+    spec: &ServeSpec,
+    options: SupervisorOptions,
+    path_prepend: &[PathBuf],
+    label: Option<&str>,
+    app_env: &[(String, String)],
+) -> Result<()> {
+    for install in &spec.installs {
+        println!(
+            "  step       {}installing dependencies — {}",
+            labeled(label),
+            install.command_line()
+        );
+        run_install(root, install, options, path_prepend, label, app_env)?;
+    }
+    if let Some(stamp) = &spec.stamp {
+        crate::bootstrap::record(root, stamp)?;
+    }
+    Ok(())
+}
+
 fn run_install(
     root: &Path,
     command: &CommandSpec,
     options: SupervisorOptions,
     path_prepend: &[PathBuf],
     label: Option<&str>,
+    app_env: &[(String, String)],
 ) -> Result<()> {
     let ring = Arc::new(Mutex::new(Ring::default()));
-    let mut child = spawn(command, root, &[], path_prepend)?;
+    let mut child = spawn(command, root, &child_env(app_env, &[]), path_prepend)?;
     register_child(child.id());
     let (tx, _rx) = mpsc::channel::<String>();
     let mut joins = attach_pumps(&mut child, ring.clone(), false, tx, options, label)?;
@@ -310,12 +343,18 @@ fn run_install(
 /// process can claim the port in the gap and the child fails on bind.
 const HANDOFF_RETRIES: usize = 2;
 
+/// How long a server gets to announce itself before srvm starts probing its
+/// port, and how often the probe repeats while nothing has been announced.
+const PROBE_AFTER: Duration = Duration::from_secs(12);
+const PROBE_INTERVAL: Duration = Duration::from_secs(3);
+
 enum Attempt {
     Done,
     Stopped,
     Retry { next_start: u16, err: anyhow::Error },
 }
 
+#[allow(clippy::too_many_arguments)]
 fn run_server(
     root: &Path,
     spec: &ServeSpec,
@@ -324,6 +363,8 @@ fn run_server(
     path_prepend: &[PathBuf],
     label: Option<&str>,
     opened: &Arc<AtomicBool>,
+    app_env: &[(String, String)],
+    siblings: &[u16],
 ) -> Result<()> {
     let mut start = requested;
     for attempt in 0..=HANDOFF_RETRIES {
@@ -336,11 +377,13 @@ fn run_server(
             path_prepend,
             label,
             opened,
+            app_env,
+            siblings,
         )? {
             Attempt::Done | Attempt::Stopped => return Ok(()),
             Attempt::Retry { next_start, .. } if attempt < HANDOFF_RETRIES => {
                 println!(
-                    "  step       {}port was claimed before the app bound it; retrying",
+                    "  step       {}exited before announcing a URL; retrying with the next port",
                     labeled(label)
                 );
                 start = Some(next_start);
@@ -361,6 +404,8 @@ fn serve_attempt(
     path_prepend: &[PathBuf],
     label: Option<&str>,
     opened: &Arc<AtomicBool>,
+    app_env: &[(String, String)],
+    siblings: &[u16],
 ) -> Result<Attempt> {
     let ring = Arc::new(Mutex::new(Ring::default()));
 
@@ -387,7 +432,7 @@ fn serve_attempt(
         command.command_line()
     );
     drop(reservation);
-    let mut child = spawn(&command, root, &env, path_prepend)?;
+    let mut child = spawn(&command, root, &child_env(app_env, &env), path_prepend)?;
     register_child(child.id());
 
     let (tx, rx) = mpsc::channel::<String>();
@@ -395,7 +440,10 @@ fn serve_attempt(
     let started = Instant::now();
     let probe_port = selected.or(spec.url_hint);
     let mut announced: Option<String> = None;
-    let mut probed_hint = false;
+    // Wait for a server to settle, then keep probing: a single attempt is a
+    // cliff, since a transient refusal would leave a running server
+    // unannounced for the rest of its life.
+    let mut next_probe = PROBE_AFTER;
 
     loop {
         while let Ok(url) = rx.try_recv() {
@@ -403,11 +451,11 @@ fn serve_attempt(
         }
 
         if announced.is_none()
-            && !probed_hint
-            && started.elapsed() >= Duration::from_secs(12)
+            && started.elapsed() >= PROBE_AFTER
+            && started.elapsed() >= next_probe
             && let Some(port) = probe_port
         {
-            probed_hint = true;
+            next_probe = started.elapsed() + PROBE_INTERVAL;
             if let Some(url) = probe_hint(port) {
                 announce_reported_url(&url, selected, &mut announced, opened, options, label);
             }
@@ -442,21 +490,15 @@ fn serve_attempt(
             } else {
                 error_with_tail(format!("{} exited: {status}", spec.name), &ring, label)
             };
-            // A child that died without announcing may have lost the
-            // reservation-to-bind handoff. The thief can come and go between
-            // the child's death and an occupancy probe, so treat a quick
-            // death as evidence on its own and probe the port only for
-            // slower deaths. Unrelated failures still surface unchanged once
-            // the bounded retries are exhausted.
-            let quick = started.elapsed() < Duration::from_secs(3);
-            let retry = if announced.is_none() && quick {
-                selected.map(|selected| selected.saturating_add(1))
-            } else if announced.is_none() {
-                selected.and_then(|selected| {
-                    retry_handoff_start(selected, |port| {
-                        std::net::TcpListener::bind(("127.0.0.1", port)).map(|_| ())
-                    })
-                })
+            // A child that died without announcing a URL may have lost the
+            // reservation-to-bind handoff, and timing cannot tell the two
+            // apart: a thief can come and go before srvm looks, so an
+            // occupancy probe is not evidence. Retry any such death of a
+            // port-injected app within the bounded retries, moving clear of
+            // the ports this launch already selected; a genuinely broken app
+            // still surfaces its own output once the retries are exhausted.
+            let retry = if announced.is_none() {
+                selected.map(|selected| retry_start(selected, siblings))
             } else {
                 None
             };
@@ -470,20 +512,18 @@ fn serve_attempt(
     }
 }
 
-/// Occupancy probe for slower deaths: if the injected port is still held by
-/// another process when the child died, relaunch one port up. Non-AddrInUse
-/// bind errors (permissions, protocol issues) are not a snipe. Quick deaths
-/// retry without this probe — the thief may already have come and gone.
-fn retry_handoff_start(
-    selected: u16,
-    bind: impl FnOnce(u16) -> std::io::Result<()>,
-) -> Option<u16> {
-    match bind(selected) {
-        Err(error) if error.kind() == std::io::ErrorKind::AddrInUse => {
-            Some(selected.saturating_add(1))
-        }
-        _ => None,
-    }
+/// The port to try after a handoff loss. `siblings` are the ports selected for
+/// the other apps in this launch: a retry must never target one of them, since
+/// those reservations are released before the children spawn, so a retried app
+/// could otherwise bind a port its sibling is about to use.
+fn retry_start(selected: u16, siblings: &[u16]) -> u16 {
+    let highest = siblings
+        .iter()
+        .copied()
+        .max()
+        .unwrap_or(selected)
+        .max(selected);
+    highest.saturating_add(1)
 }
 
 fn attach_pumps(
@@ -533,6 +573,28 @@ fn attach_pumps(
     Ok(joins)
 }
 
+/// The environment a child of an app receives: the app's `.env` pairs, then
+/// srvm's own injection (a reserved port), with `BROWSER=none` forced last so a
+/// dev server never hijacks the user's browser even when `.env` asks it to.
+fn child_env(app_env: &[(String, String)], injected: &[(String, String)]) -> Vec<(String, String)> {
+    let mut pairs: Vec<(String, String)> = app_env
+        .iter()
+        .filter(|(key, _)| key != "BROWSER")
+        .cloned()
+        .collect();
+    for (key, value) in injected {
+        if key == "BROWSER" {
+            continue;
+        }
+        match pairs.iter_mut().find(|(name, _)| name == key) {
+            Some(existing) => existing.1 = value.clone(),
+            None => pairs.push((key.clone(), value.clone())),
+        }
+    }
+    pairs.push(("BROWSER".into(), "none".into()));
+    pairs
+}
+
 fn spawn(
     command: &CommandSpec,
     root: &Path,
@@ -542,7 +604,6 @@ fn spawn(
     let mut cmd = Command::new(resolve_program(&command.program, root, path_prepend));
     cmd.args(&command.args)
         .current_dir(root)
-        .env("BROWSER", "none")
         .envs(env_pairs.iter().map(|(key, value)| (key, value)))
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
@@ -558,16 +619,86 @@ fn spawn(
         .with_context(|| format!("failed to spawn {}", command.command_line()))
 }
 
+#[cfg(test)]
+mod retry_tests {
+    use super::retry_start;
+
+    #[test]
+    fn a_retry_moves_one_port_up_when_nothing_else_is_selected() {
+        assert_eq!(retry_start(4000, &[]), 4001);
+        assert_eq!(retry_start(4000, &[4000]), 4001);
+    }
+
+    #[test]
+    fn a_retry_clears_every_sibling_port() {
+        // The launch selected 4001 and 4002. When the first app loses 4001 it
+        // must not retry onto 4002: that port belongs to its sibling.
+        assert_eq!(retry_start(4001, &[4001, 4002]), 4003);
+    }
+
+    #[test]
+    fn a_retry_from_the_highest_sibling_still_moves_up() {
+        assert_eq!(retry_start(4002, &[4001, 4002]), 4003);
+    }
+
+    #[test]
+    fn saturation_does_not_wrap_around() {
+        assert_eq!(retry_start(u16::MAX, &[u16::MAX]), u16::MAX);
+    }
+}
+
+#[cfg(test)]
+mod env_tests {
+    use super::child_env;
+
+    fn pairs(items: &[(&str, &str)]) -> Vec<(String, String)> {
+        items
+            .iter()
+            .map(|(key, value)| ((*key).to_string(), (*value).to_string()))
+            .collect()
+    }
+
+    #[test]
+    fn reserved_ports_override_dotenv_and_browser_is_forced_last() {
+        let app = pairs(&[("PORT", "9999"), ("BROWSER", "firefox"), ("DEBUG", "1")]);
+
+        let env = child_env(&app, &pairs(&[("PORT", "54123")]));
+
+        assert_eq!(
+            env,
+            vec![
+                ("PORT".into(), "54123".into()),
+                ("DEBUG".into(), "1".into()),
+                ("BROWSER".into(), "none".into()),
+            ]
+        );
+    }
+
+    #[test]
+    fn browser_is_injected_even_without_a_dotenv() {
+        assert_eq!(child_env(&[], &[]), pairs(&[("BROWSER", "none")]));
+    }
+}
+
 /// Bare program names are resolved through the child's search path —
 /// `path_prepend` dirs first, then PATH, shims, and node_modules/.bin — so a
 /// tool detection found is also the tool spawned. On Windows this yields the
 /// spawnable `.cmd`/`.exe` file, which a bare name cannot resolve to.
-/// Programs written with a path (`.venv/bin/python`, `./script.sh`) are left
-/// untouched; `Command` resolves them against the working directory.
+/// Programs written with a path (`.venv/bin/python`, `./script.sh`) are
+/// anchored to the app root, which is the directory the child runs in.
 fn resolve_program(program: &str, root: &Path, path_prepend: &[PathBuf]) -> PathBuf {
     let path = Path::new(program);
     if path.components().count() != 1 {
-        return path.to_path_buf();
+        // A program written as a path is anchored to the app root here rather
+        // than left to the spawner: Windows resolves a relative executable
+        // path against srvm's own working directory, not the child's, so a
+        // planned `.venv\Scripts\python.exe` would not be found even though
+        // the child runs in that root.
+        return if path.is_absolute() {
+            path.to_path_buf()
+        } else {
+            root.join(path)
+        };
     }
     crate::detect::binpath::resolve_for_spawn(program, root, path_prepend)
         .unwrap_or_else(|| path.to_path_buf())
@@ -735,7 +866,7 @@ fn join_pumps(joins: &mut Vec<thread::JoinHandle<()>>) {
 
 #[cfg(test)]
 mod tests {
-    use super::{SupervisorOptions, announce_reported_url, probe_hint, retry_handoff_start};
+    use super::{SupervisorOptions, announce_reported_url, probe_hint};
     use std::{
         io::{Read, Write},
         net::{TcpListener, TcpStream},
@@ -774,57 +905,6 @@ mod tests {
 
         assert_eq!(probe_hint(port), Some(format!("http://127.0.0.1:{port}")));
         handle.join().unwrap();
-    }
-
-    #[test]
-    fn retries_when_the_selected_port_was_claimed() {
-        let port = 5000;
-        let mut calls = Vec::new();
-
-        assert_eq!(
-            retry_handoff_start(port, |candidate| {
-                calls.push(candidate);
-                Err(std::io::Error::new(
-                    std::io::ErrorKind::AddrInUse,
-                    "claimed",
-                ))
-            }),
-            Some(port.saturating_add(1))
-        );
-        assert_eq!(calls, vec![port]);
-    }
-
-    #[test]
-    fn does_not_retry_on_bind_errors_other_than_addr_in_use() {
-        let port = 5000;
-        let mut calls = Vec::new();
-
-        assert_eq!(
-            retry_handoff_start(port, |candidate| {
-                calls.push(candidate);
-                Err(std::io::Error::new(
-                    std::io::ErrorKind::PermissionDenied,
-                    "not a snipe",
-                ))
-            }),
-            None
-        );
-        assert_eq!(calls, vec![port]);
-    }
-
-    #[test]
-    fn does_not_retry_when_the_selected_port_is_free() {
-        let port = 5000;
-        let mut calls = Vec::new();
-
-        assert_eq!(
-            retry_handoff_start(port, |candidate| {
-                calls.push(candidate);
-                Ok(())
-            }),
-            None
-        );
-        assert_eq!(calls, vec![port]);
     }
 
     #[test]
@@ -1040,5 +1120,33 @@ mod tests {
             Some("http://127.0.0.1:9123/app?x=1#f")
         );
         assert!(opened.load(Ordering::SeqCst));
+    }
+}
+
+#[cfg(test)]
+mod program_tests {
+    use super::resolve_program;
+    use std::path::{Path, PathBuf};
+
+    #[test]
+    fn a_relative_program_path_is_anchored_to_the_app_root() {
+        let root = Path::new("/apps/web");
+
+        assert_eq!(
+            resolve_program(".venv/bin/python", root, &[]),
+            root.join(".venv/bin/python")
+        );
+        assert_eq!(
+            resolve_program("./server.sh", root, &[]),
+            root.join("./server.sh")
+        );
+    }
+
+    #[test]
+    fn an_absolute_program_path_is_left_alone() {
+        assert_eq!(
+            resolve_program("/usr/bin/env", Path::new("/apps/web"), &[]),
+            PathBuf::from("/usr/bin/env")
+        );
     }
 }

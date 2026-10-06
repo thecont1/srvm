@@ -1,4 +1,74 @@
-use std::{fs, path::Path};
+use std::{
+    fs,
+    path::{Path, PathBuf},
+};
+
+/// Where a project's version hints are looked for: the app root first, then
+/// each ancestor up to — never past — the workspace root. A hint file above
+/// the workspace is never consulted, so provisioning stays inside discovery's
+/// bounds.
+#[derive(Debug, Clone)]
+pub struct Scope {
+    app: PathBuf,
+    ceiling: Option<PathBuf>,
+}
+
+impl Scope {
+    /// The app root alone: no ancestor lookup.
+    pub fn app(root: &Path) -> Self {
+        Self {
+            app: root.to_path_buf(),
+            ceiling: None,
+        }
+    }
+
+    /// The app root plus its ancestors, bounded by the workspace root.
+    pub fn within(app: &Path, workspace: &Path) -> Self {
+        Self {
+            app: app.to_path_buf(),
+            ceiling: Some(workspace.to_path_buf()),
+        }
+    }
+
+    fn locate(&self, name: &str) -> Option<PathBuf> {
+        let candidate = self.app.join(name);
+        if candidate.is_file() {
+            return Some(candidate);
+        }
+
+        // Without a ceiling the app root is the whole scope.
+        let ceiling = self.ceiling.as_deref()?;
+        let mut current = self.app.parent();
+        while let Some(dir) = current {
+            // A hint above the workspace is never consulted, even when the app
+            // root is the workspace root itself.
+            if !dir.starts_with(ceiling) {
+                break;
+            }
+            let candidate = dir.join(name);
+            if candidate.is_file() {
+                return Some(candidate);
+            }
+            if dir == ceiling {
+                break;
+            }
+            current = dir.parent();
+        }
+        None
+    }
+
+    fn read(&self, name: &str) -> Option<String> {
+        fs::read_to_string(self.locate(name)?).ok()
+    }
+
+    fn read_version(&self, name: &str) -> Option<String> {
+        let text = self.read(name)?;
+        text.lines()
+            .map(str::trim)
+            .find(|line| !line.is_empty() && !line.starts_with('#'))
+            .map(str::to_string)
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum NodeWant {
@@ -9,13 +79,22 @@ pub enum NodeWant {
 }
 
 pub fn node_want(root: &Path) -> Option<NodeWant> {
-    read_version_file(root, ".nvmrc")
-        .or_else(|| read_version_file(root, ".node-version"))
+    node_want_in(&Scope::app(root))
+}
+
+pub fn node_want_in(scope: &Scope) -> Option<NodeWant> {
+    scope
+        .read_version(".nvmrc")
+        .or_else(|| scope.read_version(".node-version"))
         .map(|raw| parse_node_want(&raw))
 }
 
 pub fn go_want(root: &Path) -> Option<GoWant> {
-    let text = fs::read_to_string(root.join("go.mod")).ok()?;
+    go_want_in(&Scope::app(root))
+}
+
+pub fn go_want_in(scope: &Scope) -> Option<GoWant> {
+    let text = scope.read("go.mod")?;
     let mut language = None;
     let mut toolchain = None;
     for line in text.lines() {
@@ -39,14 +118,19 @@ pub fn go_want(root: &Path) -> Option<GoWant> {
 }
 
 pub fn rust_channel(root: &Path) -> Option<String> {
-    read_to_optional(root, "rust-toolchain.toml")
-        .as_deref()
-        .and_then(channel_from_toml)
-        .or_else(|| read_version_file(root, "rust-toolchain").filter(|raw| channel_token_ok(raw)))
+    rust_channel_in(&Scope::app(root))
 }
 
-fn read_to_optional(root: &Path, name: &str) -> Option<String> {
-    fs::read_to_string(root.join(name)).ok()
+pub fn rust_channel_in(scope: &Scope) -> Option<String> {
+    scope
+        .read("rust-toolchain.toml")
+        .as_deref()
+        .and_then(channel_from_toml)
+        .or_else(|| {
+            scope
+                .read_version("rust-toolchain")
+                .filter(|raw| channel_token_ok(raw))
+        })
 }
 
 fn parse_go_version(raw: &str) -> Option<GoWant> {
@@ -143,7 +227,11 @@ pub enum GoWant {
 }
 
 pub fn python_want(root: &Path) -> Option<String> {
-    read_version_file(root, ".python-version").filter(|raw| {
+    python_want_in(&Scope::app(root))
+}
+
+pub fn python_want_in(scope: &Scope) -> Option<String> {
+    scope.read_version(".python-version").filter(|raw| {
         let mut parts = raw.split('.');
         let major = parts
             .next()
@@ -183,14 +271,6 @@ fn parse_node_want(raw: &str) -> NodeWant {
         return NodeWant::Prefix(version.to_string());
     }
     NodeWant::Latest
-}
-
-fn read_version_file(root: &Path, name: &str) -> Option<String> {
-    let text = fs::read_to_string(root.join(name)).ok()?;
-    text.lines()
-        .map(str::trim)
-        .find(|line| !line.is_empty() && !line.starts_with('#'))
-        .map(str::to_string)
 }
 
 #[cfg(test)]
@@ -261,6 +341,41 @@ mod tests {
     fn python_version_skips_comments() {
         let dir = root(&[(".python-version", "# pyenv\n3.12\n")]);
         assert_eq!(python_want(dir.path()).as_deref(), Some("3.12"));
+    }
+
+    #[test]
+    fn hint_scope_walks_up_only_to_the_workspace_root() {
+        let workspace = tempfile::tempdir().unwrap();
+        let app = workspace.path().join("apps/web");
+        fs::create_dir_all(&app).unwrap();
+        fs::write(workspace.path().join(".nvmrc"), "20\n").unwrap();
+
+        let scoped = Scope::within(&app, workspace.path());
+        assert_eq!(node_want_in(&scoped), Some(NodeWant::Prefix("20".into())));
+        assert_eq!(node_want_in(&Scope::app(&app)), None);
+    }
+
+    #[test]
+    fn hint_scope_ignores_files_above_the_workspace_root() {
+        let outer = tempfile::tempdir().unwrap();
+        let workspace = outer.path().join("repo");
+        let app = workspace.join("frontend");
+        fs::create_dir_all(&app).unwrap();
+        fs::write(outer.path().join(".nvmrc"), "18\n").unwrap();
+        fs::write(
+            outer.path().join("go.mod"),
+            "module example.com/x\n\ngo 1.21\n",
+        )
+        .unwrap();
+
+        let scoped = Scope::within(&app, &workspace);
+        assert_eq!(node_want_in(&scoped), None);
+        assert_eq!(go_want_in(&scoped), None);
+        assert_eq!(
+            node_want_in(&Scope::within(&workspace, &workspace)),
+            None,
+            "the workspace root itself is inside the ceiling"
+        );
     }
 
     #[test]

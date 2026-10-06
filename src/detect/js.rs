@@ -1,6 +1,6 @@
 use std::{collections::BTreeMap, path::Path};
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use serde::Deserialize;
 use serde_json::Value;
 
@@ -28,7 +28,8 @@ pub fn rule_deno(root: &Path, resolver: &dyn ToolResolver) -> Result<Option<Serv
         return Ok(None);
     }
 
-    let value = probe::read_jsonc(root, rel)?;
+    let value = probe::read_jsonc(root, rel)
+        .with_context(|| format!("malformed {rel} in {}", root.display()))?;
     let Some(tasks) = value.get("tasks").and_then(Value::as_object) else {
         return Ok(None);
     };
@@ -53,7 +54,8 @@ pub fn rule_package_json(root: &Path, resolver: &dyn ToolResolver) -> Result<Vec
         return Ok(Vec::new());
     }
 
-    let pkg: PackageJson = serde_json::from_str(&probe::read_to_string(root, "package.json")?)?;
+    let pkg: PackageJson = serde_json::from_str(&probe::read_to_string(root, "package.json")?)
+        .with_context(|| format!("malformed package.json in {}", root.display()))?;
     let Some(pm) = pick_pm(root, resolver, pkg.package_manager.as_deref()) else {
         return Ok(Vec::new());
     };
@@ -76,8 +78,8 @@ pub fn rule_package_json(root: &Path, resolver: &dyn ToolResolver) -> Result<Vec
             hint,
             injection,
         );
-        if !probe::dir_exists(root, "node_modules") {
-            spec.install = Some(CommandSpec::new(pm.name.clone(), ["install"]));
+        if crate::bootstrap::js_install_needed(root, &pm.name) {
+            spec = spec.with_install(CommandSpec::new(pm.name.clone(), ["install"]));
         }
         specs.push(spec);
         return Ok(specs);
@@ -520,5 +522,57 @@ mod tests {
         rule_package_json(dir.path(), &StubResolver::with(tools))
             .unwrap()
             .remove(0)
+    }
+
+    fn aged(root: &Path, rel: &str, age_secs: u64) {
+        let path = root.join(rel);
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).unwrap();
+        }
+        std::fs::write(&path, "{}").unwrap();
+        let when = std::time::SystemTime::now() - std::time::Duration::from_secs(age_secs);
+        std::fs::File::options()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_modified(when)
+            .unwrap();
+    }
+
+    #[test]
+    fn js_installs_only_when_modules_are_missing_or_older_than_the_lockfile() {
+        let dir = tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("package.json"),
+            r#"{"scripts":{"dev":"node server.js"}}"#,
+        )
+        .unwrap();
+
+        let missing = rule_package_json(dir.path(), &StubResolver::with(&["npm"]))
+            .unwrap()
+            .remove(0);
+        assert_eq!(missing.installs.len(), 1, "missing node_modules installs");
+
+        std::fs::create_dir_all(dir.path().join("node_modules")).unwrap();
+        let unstamped = rule_package_json(dir.path(), &StubResolver::with(&["npm"]))
+            .unwrap()
+            .remove(0);
+        assert!(
+            unstamped.installs.is_empty(),
+            "no package-manager marker is unknown, never stale"
+        );
+
+        aged(dir.path(), "node_modules/.package-lock.json", 600);
+        aged(dir.path(), "package-lock.json", 300);
+        let stale = rule_package_json(dir.path(), &StubResolver::with(&["npm"]))
+            .unwrap()
+            .remove(0);
+        assert_eq!(stale.installs.len(), 1, "a newer lockfile reinstalls");
+
+        aged(dir.path(), "node_modules/.package-lock.json", 0);
+        let fresh = rule_package_json(dir.path(), &StubResolver::with(&["npm"]))
+            .unwrap()
+            .remove(0);
+        assert!(fresh.installs.is_empty(), "{:?}", fresh.installs);
     }
 }

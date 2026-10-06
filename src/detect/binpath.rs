@@ -4,7 +4,15 @@ use std::{
 };
 
 pub fn look_path(tool: &str, root: &Path) -> Option<PathBuf> {
-    bin_dirs(root)
+    look_path_within(tool, root, None)
+}
+
+/// `look_path`, with `node_modules/.bin` lookup walking from `root` up to —
+/// never past — `ceiling`. Without a ceiling only `root`'s own
+/// `node_modules/.bin` is searched, which keeps detection inside the selected
+/// root.
+pub fn look_path_within(tool: &str, root: &Path, ceiling: Option<&Path>) -> Option<PathBuf> {
+    bin_dirs(root, ceiling)
         .into_iter()
         .find_map(|dir| executable_in(&dir, tool))
 }
@@ -85,7 +93,7 @@ fn is_executable(path: &Path) -> bool {
     }
 }
 
-fn bin_dirs(root: &Path) -> Vec<PathBuf> {
+fn bin_dirs(root: &Path, ceiling: Option<&Path>) -> Vec<PathBuf> {
     let mut dirs = Vec::new();
 
     if let Some(path) = env::var_os("PATH") {
@@ -117,7 +125,28 @@ fn bin_dirs(root: &Path) -> Vec<PathBuf> {
         }
     }
 
-    dirs.push(root.join("node_modules/.bin"));
+    dirs.extend(node_modules_bins(root, ceiling));
+    dirs
+}
+
+/// `node_modules/.bin` for the app root and, when a workspace ceiling is
+/// given, each ancestor up to and including it — hoisted dependencies are
+/// visible, nothing above the workspace is.
+fn node_modules_bins(root: &Path, ceiling: Option<&Path>) -> Vec<PathBuf> {
+    let mut dirs = Vec::new();
+    let mut current = Some(root);
+
+    while let Some(dir) = current {
+        dirs.push(dir.join("node_modules/.bin"));
+        // Stop at the ceiling. A ceiling that is not an ancestor of `root`,
+        // or a differently canonicalized path, must stop the walk at the
+        // root's own bin directory rather than climb outside the workspace.
+        match ceiling {
+            Some(ceiling) if dir != ceiling && dir.starts_with(ceiling) => current = dir.parent(),
+            _ => break,
+        }
+    }
+
     dirs
 }
 
@@ -125,4 +154,35 @@ fn home_dir() -> Option<PathBuf> {
     env::var_os("HOME")
         .map(PathBuf::from)
         .or_else(|| env::var_os("USERPROFILE").map(PathBuf::from))
+}
+
+#[cfg(test)]
+mod ceiling_tests {
+    use super::node_modules_bins;
+    use std::path::Path;
+
+    #[test]
+    fn the_walk_stops_at_the_workspace_ceiling() {
+        let root = Path::new("/workspace/apps/web");
+        let ceiling = Path::new("/workspace");
+
+        assert_eq!(
+            node_modules_bins(root, Some(ceiling)),
+            vec![
+                root.join("node_modules/.bin"),
+                Path::new("/workspace/apps").join("node_modules/.bin"),
+                ceiling.join("node_modules/.bin"),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_ceiling_that_is_not_an_ancestor_stops_the_walk_at_the_root() {
+        let root = Path::new("/workspace/apps/web");
+
+        assert_eq!(
+            node_modules_bins(root, Some(Path::new("/elsewhere"))),
+            vec![root.join("node_modules/.bin")]
+        );
+    }
 }

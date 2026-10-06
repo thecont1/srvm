@@ -111,8 +111,9 @@ fn supervisor_retries_when_reserved_port_is_claimed_before_bind() {
     // announcement, and at least one handoff must have happened.
     let (seen, app_line) = wait_announcement(&out, &_err, Duration::from_secs(25));
     assert!(
-        seen.iter()
-            .any(|line| line.contains("port was claimed before the app bound it; retrying")),
+        seen.iter().any(
+            |line| line.contains("exited before announcing a URL; retrying with the next port")
+        ),
         "no handoff happened:\n{}",
         seen.join("\n")
     );

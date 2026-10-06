@@ -128,10 +128,14 @@ impl HttpGet for UreqClient {
     }
 }
 
-pub fn fetch_if_missing(kind: RuntimeKind, root: &Path, quiet: bool) -> Result<Vec<PathBuf>> {
+pub fn fetch_if_missing(
+    kind: RuntimeKind,
+    scope: &hint::Scope,
+    quiet: bool,
+) -> Result<Vec<PathBuf>> {
     ensure(
         kind,
-        root,
+        scope,
         &cache_dir()?,
         &UreqClient,
         &Endpoints::from_env(),
@@ -141,22 +145,22 @@ pub fn fetch_if_missing(kind: RuntimeKind, root: &Path, quiet: bool) -> Result<V
 
 pub fn ensure(
     kind: RuntimeKind,
-    root: &Path,
+    scope: &hint::Scope,
     cache: &Path,
     client: &dyn HttpGet,
     endpoints: &Endpoints,
     quiet: bool,
 ) -> Result<Vec<PathBuf>> {
     match kind {
-        RuntimeKind::Node => ensure_node(root, cache, client, endpoints, quiet),
-        RuntimeKind::Python => ensure_python(root, cache, client, endpoints, quiet),
-        RuntimeKind::Go => ensure_go(root, cache, client, endpoints, quiet),
-        RuntimeKind::Rust => ensure_rust(root, cache, client, endpoints, quiet),
+        RuntimeKind::Node => ensure_node(scope, cache, client, endpoints, quiet),
+        RuntimeKind::Python => ensure_python(scope, cache, client, endpoints, quiet),
+        RuntimeKind::Go => ensure_go(scope, cache, client, endpoints, quiet),
+        RuntimeKind::Rust => ensure_rust(scope, cache, client, endpoints, quiet),
     }
 }
 
 fn ensure_node(
-    root: &Path,
+    scope: &hint::Scope,
     cache: &Path,
     client: &dyn HttpGet,
     endpoints: &Endpoints,
@@ -170,14 +174,14 @@ fn ensure_node(
                 cache,
                 "node",
                 &[&["node"]],
-                |version| node_matches_cached(version, hint::node_want(root).as_ref()),
+                |version| node_matches_cached(version, hint::node_want_in(scope).as_ref()),
                 err,
             );
         }
     };
     let choice = node::select_node(
         &index,
-        hint::node_want(root).as_ref(),
+        hint::node_want_in(scope).as_ref(),
         node_target()?,
         node_archive_ext(),
     )?;
@@ -199,7 +203,7 @@ fn ensure_node(
 }
 
 fn ensure_python(
-    root: &Path,
+    scope: &hint::Scope,
     cache: &Path,
     client: &dyn HttpGet,
     endpoints: &Endpoints,
@@ -212,14 +216,14 @@ fn ensure_python(
                 cache,
                 "python",
                 &[&["python3", "python"]],
-                |version| python_matches_cached(version, hint::python_want(root).as_deref()),
+                |version| python_matches_cached(version, hint::python_want_in(scope).as_deref()),
                 err,
             );
         }
     };
     let choice = python::select_python(
         &release,
-        hint::python_want(root).as_deref(),
+        hint::python_want_in(scope).as_deref(),
         python_triple()?,
     )?;
     let dest = cache.join("runtimes").join("python").join(&choice.version);
@@ -239,7 +243,7 @@ fn ensure_python(
 }
 
 fn ensure_go(
-    root: &Path,
+    scope: &hint::Scope,
     cache: &Path,
     client: &dyn HttpGet,
     endpoints: &Endpoints,
@@ -253,12 +257,17 @@ fn ensure_go(
                 cache,
                 "go",
                 &[&["go"]],
-                |version| go_matches_cached(version, hint::go_want(root).as_ref()),
+                |version| go_matches_cached(version, hint::go_want_in(scope).as_ref()),
                 err,
             );
         }
     };
-    let choice = go::select_go(&index, hint::go_want(root).as_ref(), go_os()?, go_arch()?)?;
+    let choice = go::select_go(
+        &index,
+        hint::go_want_in(scope).as_ref(),
+        go_os()?,
+        go_arch()?,
+    )?;
     let dest = cache.join("runtimes").join("go").join(&choice.version);
     if let Some(bins) = cached_bins(&dest, &[&["go"]]) {
         return Ok(bins);
@@ -272,14 +281,14 @@ fn ensure_go(
 }
 
 fn ensure_rust(
-    root: &Path,
+    scope: &hint::Scope,
     cache: &Path,
     client: &dyn HttpGet,
     endpoints: &Endpoints,
     quiet: bool,
 ) -> Result<Vec<PathBuf>> {
     let dist = endpoints.rust_dist_url.trim_end_matches('/');
-    let wanted = hint::rust_channel(root);
+    let wanted = hint::rust_channel_in(scope);
     let channel = rust::channel_filename(wanted.as_deref())?;
     let manifest = match get(client, &format!("{dist}/{channel}")) {
         Ok(bytes) => String::from_utf8(bytes).context("rust channel manifest is not utf-8")?,
@@ -622,7 +631,7 @@ mod tests {
         };
         let bins = ensure(
             RuntimeKind::Node,
-            root.path(),
+            &hint::Scope::app(root.path()),
             cache.path(),
             &client,
             &endpoints,
@@ -637,7 +646,7 @@ mod tests {
 
         ensure(
             RuntimeKind::Node,
-            root.path(),
+            &hint::Scope::app(root.path()),
             cache.path(),
             &client,
             &endpoints,
@@ -691,7 +700,7 @@ mod tests {
         };
         let err = ensure(
             RuntimeKind::Node,
-            root.path(),
+            &hint::Scope::app(root.path()),
             cache.path(),
             &client,
             &endpoints,
@@ -805,7 +814,7 @@ mod tests {
 
         let bins = ensure(
             RuntimeKind::Node,
-            root.path(),
+            &hint::Scope::app(root.path()),
             cache.path(),
             &client,
             &endpoints(),
@@ -836,7 +845,7 @@ mod tests {
 
         let bins = ensure(
             RuntimeKind::Node,
-            root.path(),
+            &hint::Scope::app(root.path()),
             cache.path(),
             &offline_client(),
             &endpoints(),
@@ -855,7 +864,7 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         let err = ensure(
             RuntimeKind::Node,
-            root.path(),
+            &hint::Scope::app(root.path()),
             cache.path(),
             &offline_client(),
             &endpoints(),
@@ -908,7 +917,7 @@ mod tests {
 
         let go_bins = ensure(
             RuntimeKind::Go,
-            root.path(),
+            &hint::Scope::app(root.path()),
             cache.path(),
             &offline_client(),
             &endpoints(),
@@ -922,7 +931,7 @@ mod tests {
 
         let py_bins = ensure(
             RuntimeKind::Python,
-            root.path(),
+            &hint::Scope::app(root.path()),
             cache.path(),
             &offline_client(),
             &endpoints(),
@@ -936,7 +945,7 @@ mod tests {
 
         let rust_bins = ensure(
             RuntimeKind::Rust,
-            root.path(),
+            &hint::Scope::app(root.path()),
             cache.path(),
             &offline_client(),
             &endpoints(),
@@ -964,7 +973,7 @@ mod tests {
 
         let bins = ensure(
             RuntimeKind::Node,
-            root.path(),
+            &hint::Scope::app(root.path()),
             cache.path(),
             &offline_client(),
             &endpoints(),
