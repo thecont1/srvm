@@ -18,5 +18,9 @@
       echo "probe: rustc=$(rustc -vV 2>&1 | grep '^host:')"
       echo "probe: default=$(rustup show active-toolchain 2>&1 | head -1)"
       echo "probe-pwsh:"
-      pwsh -NoProfile -Command "cargo -vV; (rustc -vV | Select-String '^host:'); rustup show active-toolchain; Write-Host \"arch=$env:PROCESSOR_ARCHITECTURE\"; (Get-Command cargo).Source"
+      pwsh -NoProfile -Command "cargo -vV; (rustc -vV | Select-String '^host:'); rustup show active-toolchain; Write-Host ('archenv=' + $env:PROCESSOR_ARCHITECTURE); Write-Host ('psarch=' + [System.Runtime.InteropServices.RuntimeInformation]::ProcessArchitecture); (Get-Command cargo).Source"
+      # GITHUB_ENV is a Windows path Git Bash cannot address directly; convert it
+      # so the build step gets the toolchain pinned AND dist logs its host.
+      echo "RUSTUP_TOOLCHAIN=1.97.1-aarch64-pc-windows-msvc" >> "$(cygpath -u "$GITHUB_ENV")"
+      echo "RUST_LOG=cargo_dist=info" >> "$(cygpath -u "$GITHUB_ENV")"
     fi
