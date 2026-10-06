@@ -19,8 +19,17 @@ use std::{
 use support::{ChildGuard, SERIAL, line_reader, srvm, wait_exit, wait_for};
 use tempfile::{TempDir, tempdir};
 
-/// A repository whose `dev` script srvm will run through the stub `npm` on PATH.
+/// A repository whose `dev` script srvm will run through the stub `npm` on
+/// PATH. Dependencies are present, so srvm spawns the script instead of
+/// installing first.
 fn app_repo() -> TempDir {
+    let repo = app_repo_without_deps();
+    fs::create_dir(repo.path().join("node_modules")).unwrap();
+    repo
+}
+
+/// The same repository with no installed dependencies, so srvm bootstraps.
+fn app_repo_without_deps() -> TempDir {
     let repo = tempdir().unwrap();
     fs::write(
         repo.path().join("package.json"),
@@ -28,6 +37,12 @@ fn app_repo() -> TempDir {
     )
     .unwrap();
     repo
+}
+
+/// The real fixture listener, so an announced URL is actually served and srvm
+/// treats the app as running instead of failing the launch.
+fn listener() -> String {
+    support::fixture_bin().display().to_string()
 }
 
 /// Writes an executable stub. Its body decides what srvm actually gets.
@@ -93,9 +108,9 @@ fn a_term_resistant_descendant_does_not_survive_ctrl_c() {
         &format!(
             "#!/bin/sh\n\
              /bin/sh -c 'trap \"\" TERM; echo $$ > {pid}; while :; do /bin/sleep 1; done' &\n\
-             echo \"http://127.0.0.1:${{PORT:-4321}}\"\n\
-             wait\n",
-            pid = pid_file.display()
+             exec \"{listener}\" \"$@\"\n",
+            pid = pid_file.display(),
+            listener = listener()
         ),
     );
 
@@ -127,9 +142,9 @@ fn a_grandchild_holding_the_pipes_does_not_block_shutdown() {
         &format!(
             "#!/bin/sh\n\
              /bin/sh -c 'echo $$ > {pid}; /bin/sleep 300' &\n\
-             echo \"http://127.0.0.1:${{PORT:-4321}}\"\n\
-             wait\n",
-            pid = pid_file.display()
+             exec \"{listener}\" \"$@\"\n",
+            pid = pid_file.display(),
+            listener = listener()
         ),
     );
 
@@ -180,7 +195,7 @@ fn ctrl_c_in_the_spawn_window_still_stops_the_app() {
 #[test]
 fn ctrl_c_during_a_bootstrap_install_stops_the_install() {
     let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
-    let repo = app_repo();
+    let repo = app_repo_without_deps();
     let bin = tempdir().unwrap();
     let pid_file = repo.path().join("install.pid");
     // No node_modules in the repo, so srvm installs first: the interrupt has to
@@ -196,11 +211,11 @@ fn ctrl_c_during_a_bootstrap_install_stops_the_install() {
              \x20 /bin/sleep 300\n\
              \x20 ;;\n\
              *)\n\
-             \x20 echo \"http://127.0.0.1:${{PORT:-4321}}\"\n\
-             \x20 wait\n\
+             \x20 exec \"{listener}\" \"$@\"\n\
              \x20 ;;\n\
              esac\n",
-            pid = pid_file.display()
+            pid = pid_file.display(),
+            listener = listener()
         ),
     );
 

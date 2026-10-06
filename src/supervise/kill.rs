@@ -46,7 +46,9 @@ pub fn terminate_tree_by_pid(pid: u32) {
     }
 }
 
-/// How long a process tree gets to stop politely before it is forced.
+/// How long a process tree gets to stop politely before it is forced. Only
+/// unix needs the wait: Windows force-kills in one pass.
+#[cfg(unix)]
 const GRACE: Duration = Duration::from_millis(1500);
 
 /// Force-kills a whole process group (unix) or process tree (windows).
@@ -75,8 +77,8 @@ pub fn force_tree_by_pid(pid: u32) {
 pub fn force_remaining(pids: &[u32]) {
     #[cfg(unix)]
     {
-        let deadline = Instant::now() + GRACE;
-        while Instant::now() < deadline && pids.iter().any(|pid| group_alive(*pid)) {
+        let deadline = std::time::Instant::now() + GRACE;
+        while std::time::Instant::now() < deadline && pids.iter().any(|pid| group_alive(*pid)) {
             thread::sleep(Duration::from_millis(50));
         }
         for pid in pids {
