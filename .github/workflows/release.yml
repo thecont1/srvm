@@ -127,9 +127,9 @@ jobs:
             curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
             echo "$HOME/.cargo/bin" >> $GITHUB_PATH
           fi
-      - name: "Force the native aarch64 toolchain on ARM64 runners"
+      - name: "Force the native aarch64 toolchain on Windows ARM64 runners"
         run: |
-          if [ "${RUNNER_ARCH:-}" = "ARM64" ]; then
+          if [ "${RUNNER_ARCH:-}" = "ARM64" ] && [ "${RUNNER_OS:-}" = "Windows" ]; then
             rustup toolchain install 1.97.1-aarch64-pc-windows-msvc --profile minimal
             echo "RUSTUP_TOOLCHAIN=1.97.1-aarch64-pc-windows-msvc" >> "$GITHUB_ENV"
           fi

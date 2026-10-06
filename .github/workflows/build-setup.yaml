@@ -2,10 +2,10 @@
 # The windows-11-arm image's preinstalled rustup resolves x64 toolchains
 # under emulation; force the native aarch64 toolchain there so the release
 # build is a native execution rather than a refused cross-compile.
-- name: 'Force the native aarch64 toolchain on ARM64 runners'
+- name: 'Force the native aarch64 toolchain on Windows ARM64 runners'
   shell: bash
   run: |
-    if [ "${RUNNER_ARCH:-}" = "ARM64" ]; then
+    if [ "${RUNNER_ARCH:-}" = "ARM64" ] && [ "${RUNNER_OS:-}" = "Windows" ]; then
       rustup toolchain install 1.97.1-aarch64-pc-windows-msvc --profile minimal
       echo "RUSTUP_TOOLCHAIN=1.97.1-aarch64-pc-windows-msvc" >> "$GITHUB_ENV"
     fi
