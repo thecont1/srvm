@@ -5,7 +5,7 @@ use std::{
 };
 
 use anyhow::{Result, bail};
-use clap::Parser;
+use clap::{CommandFactory, Parser};
 
 use crate::{
     detect::{PortInjection, ServeSpec, binpath},
@@ -14,6 +14,11 @@ use crate::{
     supervise::{self, LaunchItem, SupervisorOptions},
     workspace::{self, Candidate},
 };
+
+/// Build the CLI schema shared by runtime parsing and generated assets so they cannot drift.
+pub fn command() -> clap::Command {
+    Cli::command()
+}
 
 #[derive(Debug, Parser)]
 #[command(name = "srvm", version, about = "Zero-config universal app launcher")]

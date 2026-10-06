@@ -1,5 +1,10 @@
 pub mod bootstrap;
 pub mod cli;
+
+/// Build the generated completion/man-page assets from the same schema the CLI parses.
+pub fn command() -> clap::Command {
+    cli::command()
+}
 pub mod detect;
 pub mod dotenv;
 pub mod launch;
