@@ -985,4 +985,242 @@ mod tests {
             "an unverified cache dir must not satisfy the fallback: {bins:?}"
         );
     }
+
+    fn hex_of(bytes: &[u8]) -> String {
+        Sha256::digest(bytes)
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect()
+    }
+
+    fn archive_of(files: &[(String, Vec<u8>)]) -> Vec<u8> {
+        let refs: Vec<(&str, &[u8])> = files
+            .iter()
+            .map(|(path, body)| (path.as_str(), body.as_slice()))
+            .collect();
+        host_archive(&refs)
+    }
+
+    /// The three archives a real Rust release ships, named and nested the way
+    /// the dist server nests them: each tarball wraps a payload directory
+    /// inside a versioned top-level directory, and the payload's contents are
+    /// what belongs at the toolchain prefix — `rustc/` and `cargo/` carry the
+    /// binaries, `rust-std-<triple>/` carries the standard library under
+    /// `lib/rustlib/<triple>/lib`.
+    fn rust_fixture(triple: &str, std_payload: bool) -> (String, HashMap<String, Vec<u8>>) {
+        let version = "1.81.0".to_string();
+        let base = "http://127.0.0.1:9";
+        let (rustc_name, cargo_name, std_name) = rust::component_filenames(&version, triple);
+        let rustc = archive_of(&[
+            (
+                format!("rustc-{version}-{triple}/rustc/bin/rustc"),
+                b"#!/bin/sh\n".to_vec(),
+            ),
+            (
+                format!("rustc-{version}-{triple}/rustc/lib/librustc_driver.so"),
+                b"driver".to_vec(),
+            ),
+            (
+                format!("rustc-{version}-{triple}/install.sh"),
+                b"#!/bin/sh\n".to_vec(),
+            ),
+        ]);
+        let cargo = archive_of(&[(
+            format!("cargo-{version}-{triple}/cargo/bin/cargo"),
+            b"#!/bin/sh\n".to_vec(),
+        )]);
+        let std = if std_payload {
+            archive_of(&[(
+                format!(
+                    "rust-std-{version}-{triple}/rust-std-{triple}/lib/rustlib/{triple}/lib/libstd.rlib"
+                ),
+                b"std".to_vec(),
+            )])
+        } else {
+            archive_of(&[(
+                format!("rust-std-{version}-{triple}/components"),
+                b"rust-std\n".to_vec(),
+            )])
+        };
+
+        let mut files = HashMap::new();
+        files.insert(
+            format!("{base}/channel-rust-stable.toml"),
+            format!("[pkg.rustc]\nversion = \"{version} (abcdef 2024-09-04)\"\n").into_bytes(),
+        );
+        for (name, body) in [
+            (&rustc_name, &rustc),
+            (&cargo_name, &cargo),
+            (&std_name, &std),
+        ] {
+            files.insert(format!("{base}/{name}"), body.clone());
+            files.insert(
+                format!("{base}/{name}.sha256"),
+                format!("{}  {name}\n", hex_of(body)).into_bytes(),
+            );
+        }
+        (version, files)
+    }
+
+    fn rust_endpoints() -> Endpoints {
+        Endpoints {
+            node_index_url: "http://127.0.0.1:9/index.json".into(),
+            python_release_url: "http://127.0.0.1:9/python.json".into(),
+            go_index_url: "http://127.0.0.1:9/go.json".into(),
+            rust_dist_url: "http://127.0.0.1:9".into(),
+        }
+    }
+
+    #[test]
+    fn three_rust_archives_assemble_one_toolchain_prefix() {
+        let triple = rust_triple().unwrap();
+        let (version, files) = rust_fixture(triple, true);
+        let client = MapClient {
+            files,
+            hits: Mutex::new(Vec::new()),
+        };
+        let cache = tempfile::tempdir().unwrap();
+        let root = tempfile::tempdir().unwrap();
+
+        ensure(
+            RuntimeKind::Rust,
+            &hint::Scope::app(root.path()),
+            cache.path(),
+            &client,
+            &rust_endpoints(),
+            true,
+        )
+        .unwrap();
+
+        let prefix = cache.path().join("runtimes").join("rust").join(&version);
+        assert!(
+            prefix.join("bin").join("rustc").is_file(),
+            "rustc belongs at the prefix root, not under its component directory"
+        );
+        assert!(
+            prefix.join("bin").join("cargo").is_file(),
+            "cargo belongs at the prefix root"
+        );
+        assert!(
+            prefix.join("lib").join("librustc_driver.so").is_file(),
+            "the compiler's libraries belong under the prefix lib/"
+        );
+        assert!(
+            prefix
+                .join("lib")
+                .join("rustlib")
+                .join(triple)
+                .join("lib")
+                .join("libstd.rlib")
+                .is_file(),
+            "the standard library must land at lib/rustlib/{triple}/lib"
+        );
+        assert!(prefix.join(".srvm-ok").is_file());
+    }
+
+    #[test]
+    fn a_rust_prefix_without_its_standard_library_is_not_published() {
+        let triple = rust_triple().unwrap();
+        let (version, files) = rust_fixture(triple, false);
+        let client = MapClient {
+            files,
+            hits: Mutex::new(Vec::new()),
+        };
+        let cache = tempfile::tempdir().unwrap();
+        let root = tempfile::tempdir().unwrap();
+
+        let result = ensure(
+            RuntimeKind::Rust,
+            &hint::Scope::app(root.path()),
+            cache.path(),
+            &client,
+            &rust_endpoints(),
+            true,
+        );
+
+        let prefix = cache.path().join("runtimes").join("rust").join(&version);
+        assert!(
+            result.is_err(),
+            "a toolchain missing its standard library must not be accepted"
+        );
+        assert!(
+            !prefix.join(".srvm-ok").is_file(),
+            "an incomplete prefix must never be published as cached"
+        );
+    }
+
+    /// Counts what it serves and slows down, so two provisions overlap on
+    /// purpose instead of by luck.
+    struct CountingClient {
+        files: HashMap<String, Vec<u8>>,
+        hits: Mutex<Vec<String>>,
+        delay: std::time::Duration,
+    }
+
+    impl HttpGet for CountingClient {
+        fn get(&self, url: &str) -> Result<Vec<u8>> {
+            self.hits.lock().unwrap().push(url.to_string());
+            std::thread::sleep(self.delay);
+            self.files
+                .get(url)
+                .cloned()
+                .with_context(|| format!("missing fixture {url}"))
+        }
+    }
+
+    #[test]
+    fn concurrent_provisions_of_one_version_install_it_once() {
+        let version = "v22.21.0";
+        let target = node_target().unwrap();
+        let filename = format!("node-{version}-{target}.{}", node_archive_ext());
+        let tool_rel = if cfg!(windows) {
+            format!("node-{version}-{target}/node.exe")
+        } else {
+            format!("node-{version}-{target}/bin/node")
+        };
+        let archive = host_archive(&[(&tool_rel, b"#!/bin/sh\necho node\n")]);
+        let base = "http://127.0.0.1:9";
+        let mut files = HashMap::new();
+        files.insert(
+            format!("{base}/index.json"),
+            format!(r#"[{{"version":"{version}","lts":"Jod"}}]"#).into_bytes(),
+        );
+        files.insert(
+            format!("{base}/{version}/SHASUMS256.txt"),
+            format!("{}  {filename}\n", hex_of(&archive)).into_bytes(),
+        );
+        files.insert(format!("{base}/{version}/{filename}"), archive);
+        let client = CountingClient {
+            files,
+            hits: Mutex::new(Vec::new()),
+            delay: std::time::Duration::from_millis(200),
+        };
+        let cache = tempfile::tempdir().unwrap();
+        let root = tempfile::tempdir().unwrap();
+        let endpoints = rust_endpoints();
+
+        std::thread::scope(|scope| {
+            let run = || {
+                ensure(
+                    RuntimeKind::Node,
+                    &hint::Scope::app(root.path()),
+                    cache.path(),
+                    &client,
+                    &endpoints,
+                    true,
+                )
+            };
+            let first = scope.spawn(run);
+            let second = scope.spawn(run);
+            first.join().unwrap().unwrap();
+            second.join().unwrap().unwrap();
+        });
+
+        let hits = client.hits.lock().unwrap();
+        let downloads = hits.iter().filter(|url| url.ends_with(&filename)).count();
+        assert_eq!(
+            downloads, 1,
+            "a second provisioner must reuse the installed runtime instead of fetching it again: {hits:?}"
+        );
+    }
 }
