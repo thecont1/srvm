@@ -167,7 +167,10 @@ fn assert_fetched(cache: &Path, kind: &str) {
 fn write(repo: &Path, rel: &str, content: &str) {
     let path = repo.join(rel);
     fs::create_dir_all(path.parent().unwrap()).unwrap();
-    fs::write(path, content).unwrap();
+    fs::write(&path, content).unwrap();
+    if let Some(dump) = env::var_os("SRVM_LIVE_DUMP_DIR") {
+        let _ = fs::copy(&path, Path::new(&dump).join(rel));
+    }
 }
 
 // ---- real repositories ----------------------------------------------------
@@ -262,6 +265,7 @@ fn go_repo() -> TempDir {
 
 import (
 	"fmt"
+	"net"
 	"net/http"
 	"os"
 )

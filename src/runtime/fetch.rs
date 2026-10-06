@@ -113,8 +113,12 @@ pub struct UreqClient;
 impl HttpGet for UreqClient {
     fn get(&self, url: &str) -> Result<Vec<u8>> {
         allow_url(url)?;
+        // Big archives (rustc is ~150MB) can outrun a short global deadline
+        // on slow links; the per-read timeout still catches stalls within a
+        // minute, and the install step's own cap bounds the overall fetch.
         let config = ureq::Agent::config_builder()
-            .timeout_global(Some(Duration::from_secs(180)))
+            .timeout_global(Some(Duration::from_secs(1200)))
+            .timeout_recv_body(Some(Duration::from_secs(60)))
             .https_only(url.starts_with("https://"))
             .build();
         let agent: ureq::Agent = config.into();
