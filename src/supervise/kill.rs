@@ -1,8 +1,4 @@
-use std::{
-    process::Child,
-    thread,
-    time::{Duration, Instant},
-};
+use std::{process::Child, thread, time::Duration};
 
 #[cfg(unix)]
 use std::os::unix::process::CommandExt;

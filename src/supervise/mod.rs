@@ -34,6 +34,13 @@ static CURRENT_CHILDREN: OnceLock<Arc<Mutex<Vec<u32>>>> = OnceLock::new();
 static STATIC_STOP: OnceLock<Arc<AtomicBool>> = OnceLock::new();
 static SHUTDOWN: AtomicBool = AtomicBool::new(false);
 
+/// Whether a signal has already asked this run to stop. The shutdown path uses
+/// it so an interrupted run reports 130 even when the app's own death reaches
+/// the exit first.
+pub fn shutdown_requested() -> bool {
+    SHUTDOWN.load(Ordering::SeqCst)
+}
+
 #[derive(Debug, Clone, Copy)]
 pub struct SupervisorOptions {
     pub no_open: bool,
