@@ -189,6 +189,13 @@ fn ensure_node(
     if let Some(bins) = cached_bins(&dest, &[&["node"]]) {
         return Ok(bins);
     }
+    // Provision one version at a time: a second srvm process waits for
+    // the lock, then rechecks the cache rather than fetching the same
+    // archive again.
+    let _lock = CacheLock::acquire(&lock_path(&dest))?;
+    if let Some(bins) = cached_bins(&dest, &[&["node"]]) {
+        return Ok(bins);
+    }
     if !quiet {
         println!("  step       fetching node {}", choice.version);
     }
@@ -227,6 +234,13 @@ fn ensure_python(
         python_triple()?,
     )?;
     let dest = cache.join("runtimes").join("python").join(&choice.version);
+    if let Some(bins) = cached_bins(&dest, &[&["python3", "python"]]) {
+        return Ok(bins);
+    }
+    // Provision one version at a time: a second srvm process waits for
+    // the lock, then rechecks the cache rather than fetching the same
+    // archive again.
+    let _lock = CacheLock::acquire(&lock_path(&dest))?;
     if let Some(bins) = cached_bins(&dest, &[&["python3", "python"]]) {
         return Ok(bins);
     }
@@ -272,6 +286,13 @@ fn ensure_go(
     if let Some(bins) = cached_bins(&dest, &[&["go"]]) {
         return Ok(bins);
     }
+    // Provision one version at a time: a second srvm process waits for
+    // the lock, then rechecks the cache rather than fetching the same
+    // archive again.
+    let _lock = CacheLock::acquire(&lock_path(&dest))?;
+    if let Some(bins) = cached_bins(&dest, &[&["go"]]) {
+        return Ok(bins);
+    }
     if !quiet {
         println!("  step       fetching go {}", choice.version);
     }
@@ -307,6 +328,13 @@ fn ensure_rust(
     if let Some(bins) = cached_bins(&dest, &[&["cargo"], &["rustc"]]) {
         return Ok(bins);
     }
+    // Provision one version at a time: a second srvm process waits for
+    // the lock, then rechecks the cache rather than fetching the same
+    // archive again.
+    let _lock = CacheLock::acquire(&lock_path(&dest))?;
+    if let Some(bins) = cached_bins(&dest, &[&["cargo"], &["rustc"]]) {
+        return Ok(bins);
+    }
     if !quiet {
         println!("  step       fetching rust {version}");
     }
@@ -323,6 +351,7 @@ fn ensure_rust(
         &[(&rustc.0, &rustc.1), (&cargo.0, &cargo.1), (&std.0, &std.1)],
         &dest,
         &[&["cargo"], &["rustc"]],
+        triple,
     )
 }
 
@@ -394,6 +423,90 @@ fn url_dir(url: &str) -> Result<String> {
             .unwrap_or_else(|| path.to_string()))
     } else {
         Ok(path.to_string())
+    }
+}
+
+/// A staging directory nobody else can be using: the version directory name
+/// plus this process and a nonce, so two provisioners never share one.
+fn unique_staging(dest: &Path) -> PathBuf {
+    let name = dest.file_name().unwrap_or_default().to_string_lossy();
+    let nonce = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_nanos())
+        .unwrap_or(0);
+    dest.with_file_name(format!("{name}.{}.{nonce}.partial", std::process::id()))
+}
+
+/// Removes staging directories a crashed provision left behind. The caller
+/// holds this version's lock, so nothing else is extracting here right now.
+fn sweep_staging(dest: &Path) {
+    let (Some(parent), Some(name)) = (dest.parent(), dest.file_name()) else {
+        return;
+    };
+    let prefix = format!("{}.", name.to_string_lossy());
+    let Ok(entries) = fs::read_dir(parent) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let candidate = entry.file_name().to_string_lossy().into_owned();
+        if candidate.starts_with(&prefix) && candidate.ends_with(".partial") {
+            let _ = fs::remove_dir_all(entry.path());
+        }
+    }
+}
+
+/// The per-version lock file, kept beside the version directory so it survives
+/// the publish rename.
+fn lock_path(dest: &Path) -> PathBuf {
+    let name = dest.file_name().unwrap_or_default().to_string_lossy();
+    dest.with_file_name(format!("{name}.lock"))
+}
+
+/// How long a provisioner waits for another one before giving up.
+const LOCK_WAIT: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// Serialises provisioning of one runtime version across processes. Without
+/// it, two srvm processes both miss the cache, both download the archive, and
+/// both publish over each other.
+struct CacheLock {
+    file: fs::File,
+}
+
+impl CacheLock {
+    fn acquire(path: &Path) -> Result<Self> {
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        let file = fs::OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(false)
+            .open(path)
+            .with_context(|| format!("opening {}", path.display()))?;
+        let deadline = std::time::Instant::now() + LOCK_WAIT;
+        loop {
+            match file.try_lock() {
+                Ok(()) => return Ok(Self { file }),
+                Err(fs::TryLockError::WouldBlock) => {
+                    if std::time::Instant::now() >= deadline {
+                        bail!(
+                            "timed out waiting for the runtime cache lock {}",
+                            path.display()
+                        );
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(100));
+                }
+                Err(fs::TryLockError::Error(err)) => {
+                    return Err(err).with_context(|| format!("locking {}", path.display()));
+                }
+            }
+        }
+    }
+}
+
+impl Drop for CacheLock {
+    fn drop(&mut self) {
+        let _ = self.file.unlock();
     }
 }
 
@@ -510,17 +623,82 @@ fn install_archives(
     dest: &Path,
     groups: &[&[&str]],
 ) -> Result<Vec<PathBuf>> {
-    install_archives_mode(archives, dest, groups, false)
+    install_archives_mode(archives, dest, groups, false, &|_| Ok(()))
 }
 
-/// Variant for component-based toolchains (Rust): each archive's top-level
-/// directory is merged into the shared toolchain prefix.
+/// Variant for component-based toolchains (Rust): each archive's payload is
+/// merged into the shared toolchain prefix, and the result must pass
+/// `validate_rust_prefix` before the cache marker is published.
 fn install_archives_flat(
     archives: &[(&[u8], &[u8; 32])],
     dest: &Path,
     groups: &[&[&str]],
+    triple: &str,
 ) -> Result<Vec<PathBuf>> {
-    install_archives_mode(archives, dest, groups, true)
+    install_archives_mode(archives, dest, groups, true, &|prefix| {
+        validate_rust_prefix(prefix, triple)
+    })
+}
+
+/// Checks an assembled toolchain against the layout rustc itself expects,
+/// rather than trusting whatever the archives happened to contain: a toolchain
+/// that cannot find its standard library is not worth caching, and a marker
+/// published over one makes the breakage permanent.
+fn validate_rust_prefix(prefix: &Path, triple: &str) -> Result<()> {
+    for tool in ["rustc", "cargo"] {
+        // Whatever this platform can actually execute counts: a bare name on
+        // unix, and the `.exe`/`.cmd` shims Windows launches.
+        let mut candidates = vec![prefix.join("bin").join(tool)];
+        if cfg!(windows) {
+            candidates.push(prefix.join("bin").join(format!("{tool}.exe")));
+            candidates.push(prefix.join("bin").join(format!("{tool}.cmd")));
+        }
+        if !candidates.iter().any(|candidate| candidate.is_file()) {
+            bail!("assembled toolchain has no bin/{tool}");
+        }
+    }
+    let std_lib = prefix.join("lib").join("rustlib").join(triple).join("lib");
+    let entries = fs::read_dir(&std_lib)
+        .map(|entries| entries.flatten().count())
+        .unwrap_or(0);
+    if entries == 0 {
+        bail!(
+            "assembled toolchain has no standard library under {}",
+            std_lib.display()
+        );
+    }
+    if !compiler_libs_present(prefix) {
+        bail!("assembled toolchain has no compiler libraries");
+    }
+    Ok(())
+}
+
+/// Where the compiler's own libraries land: `lib/librustc_driver*` on unix,
+/// next to the binaries as `rustc_driver*.dll` on Windows.
+#[cfg(windows)]
+fn compiler_libs_present(prefix: &Path) -> bool {
+    fs::read_dir(prefix.join("bin"))
+        .map(|entries| {
+            entries.flatten().any(|entry| {
+                let name = entry.file_name().to_string_lossy().to_ascii_lowercase();
+                name.starts_with("rustc_driver") && name.ends_with(".dll")
+            })
+        })
+        .unwrap_or(false)
+}
+
+#[cfg(not(windows))]
+fn compiler_libs_present(prefix: &Path) -> bool {
+    fs::read_dir(prefix.join("lib"))
+        .map(|entries| {
+            entries.flatten().any(|entry| {
+                entry
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with("librustc_driver")
+            })
+        })
+        .unwrap_or(false)
 }
 
 fn install_archives_mode(
@@ -528,14 +706,13 @@ fn install_archives_mode(
     dest: &Path,
     groups: &[&[&str]],
     flat: bool,
+    validate: &dyn Fn(&Path) -> Result<()>,
 ) -> Result<Vec<PathBuf>> {
-    let partial = dest.with_file_name(format!(
-        "{}.partial",
-        dest.file_name().unwrap_or_default().to_string_lossy()
-    ));
-    if partial.exists() {
-        fs::remove_dir_all(&partial)?;
-    }
+    // The staging directory is owned by this process alone: two provisioners
+    // must never extract into one directory, and a stale one from a crashed
+    // run must not be mistaken for ours.
+    sweep_staging(dest);
+    let partial = unique_staging(dest);
     let installed: Result<()> = (|| {
         fs::create_dir_all(&partial)?;
         for (bytes, expected) in archives {
@@ -545,6 +722,7 @@ fn install_archives_mode(
                 extract_verified(bytes, expected, &partial)?;
             }
         }
+        validate(&partial)?;
         fs::write(partial.join(".srvm-ok"), b"ok")?;
         if dest.exists() {
             fs::remove_dir_all(dest)?;
@@ -1021,6 +1199,10 @@ mod tests {
                 b"driver".to_vec(),
             ),
             (
+                format!("rustc-{version}-{triple}/rustc/bin/rustc_driver-abc.dll"),
+                b"driver".to_vec(),
+            ),
+            (
                 format!("rustc-{version}-{triple}/install.sh"),
                 b"#!/bin/sh\n".to_vec(),
             ),
@@ -1101,9 +1283,14 @@ mod tests {
             prefix.join("bin").join("cargo").is_file(),
             "cargo belongs at the prefix root"
         );
+        let driver = if cfg!(windows) {
+            prefix.join("bin").join("rustc_driver-abc.dll")
+        } else {
+            prefix.join("lib").join("librustc_driver.so")
+        };
         assert!(
-            prefix.join("lib").join("librustc_driver.so").is_file(),
-            "the compiler's libraries belong under the prefix lib/"
+            driver.is_file(),
+            "the compiler's libraries belong at the prefix: {driver:?}"
         );
         assert!(
             prefix
@@ -1198,6 +1385,12 @@ mod tests {
         let cache = tempfile::tempdir().unwrap();
         let root = tempfile::tempdir().unwrap();
         let endpoints = rust_endpoints();
+        let stale = cache
+            .path()
+            .join("runtimes")
+            .join("node")
+            .join(format!("{version}.999.0.partial"));
+        fs::create_dir_all(&stale).unwrap();
 
         std::thread::scope(|scope| {
             let run = || {
@@ -1216,6 +1409,10 @@ mod tests {
             second.join().unwrap().unwrap();
         });
 
+        assert!(
+            !stale.exists(),
+            "a staging directory left by a crashed run must be swept, not reused"
+        );
         let hits = client.hits.lock().unwrap();
         let downloads = hits.iter().filter(|url| url.ends_with(&filename)).count();
         assert_eq!(

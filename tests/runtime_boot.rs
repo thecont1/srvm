@@ -169,16 +169,38 @@ fn path_scrubbed_fetch_boots_rust_app() {
         format!("cargo-{version}-{triple}.tar.gz"),
         format!("rust-std-{version}-{triple}.tar.gz"),
     );
-    let rustc_rel = format!("rustc-{version}-{triple}/rustc/bin/rustc");
-    let cargo_rel = format!("cargo-{version}-{triple}/cargo/bin/cargo");
-    let rustc = hashed_tool(&rustc_rel, "#!/bin/sh\nexit 0\n");
-    let cargo = hashed_tool(
-        &cargo_rel,
-        "#!/bin/sh\necho http://127.0.0.1:${PORT:-4321}\n",
+    // Each component is nested the way the dist server nests it: a versioned
+    // top-level directory wrapping the payload that belongs at the prefix, and
+    // the compiler's own libraries where this platform keeps them.
+    let rustc_driver_rel = if cfg!(windows) {
+        format!("rustc-{version}-{triple}/rustc/bin/rustc_driver-abc.dll")
+    } else {
+        format!("rustc-{version}-{triple}/rustc/lib/librustc_driver.so")
+    };
+    let rustc_archive = tar_gz(&[
+        (
+            &format!("rustc-{version}-{triple}/rustc/bin/rustc"),
+            &b"#!/bin/sh\nexit 0\n"[..],
+        ),
+        (&rustc_driver_rel, &b"driver"[..]),
+    ]);
+    let rustc = hashed(&rustc_archive, &rustc_name);
+    let cargo_rel = if cfg!(windows) {
+        format!("cargo-{version}-{triple}/cargo/bin/cargo.cmd")
+    } else {
+        format!("cargo-{version}-{triple}/cargo/bin/cargo")
+    };
+    let cargo_body: &[u8] = if cfg!(windows) {
+        b"@echo off\r\necho http://127.0.0.1:4321\r\n"
+    } else {
+        b"#!/bin/sh\necho http://127.0.0.1:${PORT:-4321}\n"
+    };
+    let cargo = hashed(&tar_gz(&[(&cargo_rel, cargo_body)]), &cargo_name);
+    // rust-std ships as its own component: its payload directory is what lands
+    // at the prefix, so the standard library ends up at lib/rustlib/<triple>.
+    let std_rel = format!(
+        "rust-std-{version}-{triple}/rust-std-{triple}/lib/rustlib/{triple}/lib/libstd.rlib"
     );
-    // rust-std ships as its own component and must merge into the toolchain
-    // prefix; the fixture archive carries a single rlib under lib/rustlib.
-    let std_rel = format!("rust-std-{version}-{triple}/lib/rustlib/{triple}/lib/libstd.rlib");
     let std_archive = tar_gz(&[(&std_rel, &b"stdlib"[..])]);
     let std_sums = format!(
         "{}  {}\n",
@@ -215,22 +237,12 @@ fn path_scrubbed_fetch_boots_rust_app() {
         .stdout(predicate::str::contains("app        http://127.0.0.1:"));
 }
 
-fn hashed_tool(rel: &str, unix_body: &str) -> (Vec<u8>, Vec<u8>) {
-    let (rel, body): (String, &[u8]) = if cfg!(windows) {
-        (
-            format!("{rel}.cmd"),
-            b"@echo off\r\necho http://127.0.0.1:4321\r\n",
-        )
-    } else {
-        (rel.to_string(), unix_body.as_bytes())
-    };
-    let archive = tar_gz(&[(&rel, body)]);
-    let sums = format!(
-        "{}  {}\n",
-        hex_sha256(&archive),
-        rel.rsplit('/').next().unwrap_or(&rel)
-    );
-    (archive, sums.into_bytes())
+/// An archive plus the `.sha256` body the dist server would serve for it.
+fn hashed(archive: &[u8], name: &str) -> (Vec<u8>, Vec<u8>) {
+    (
+        archive.to_vec(),
+        format!("{}  {name}\n", hex_sha256(archive)).into_bytes(),
+    )
 }
 
 fn launch_scrubbed(repo: &tempfile::TempDir, extra: &[(&str, &str)]) -> assert_cmd::assert::Assert {
@@ -317,11 +329,11 @@ fn tar_gz(files: &[(&str, &[u8])]) -> Vec<u8> {
         let mut builder = tar::Builder::new(&mut raw);
         for (path, body) in files {
             let mut header = tar::Header::new_gnu();
-            header.set_path(path).unwrap();
             header.set_size(body.len() as u64);
             header.set_mode(0o755);
-            header.set_cksum();
-            builder.append(&header, *body).unwrap();
+            // `set_path` refuses a path over 100 bytes, and the real component
+            // layout is deeper than that.
+            builder.append_data(&mut header, path, *body).unwrap();
         }
         builder.finish().unwrap();
     }
