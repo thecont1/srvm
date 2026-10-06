@@ -141,6 +141,8 @@ jobs:
             echo "probe: cargo=$(cargo -vV 2>&1 | head -1)"
             echo "probe: rustc=$(rustc -vV 2>&1 | grep '^host:')"
             echo "probe: default=$(rustup show active-toolchain 2>&1 | head -1)"
+            echo "probe-pwsh:"
+            pwsh -NoProfile -Command "cargo -vV; (rustc -vV | Select-String '^host:'); rustup show active-toolchain; Write-Host \"arch=$env:PROCESSOR_ARCHITECTURE\"; (Get-Command cargo).Source"
           fi
         shell: "bash"
       - uses: swatinem/rust-cache@v2
