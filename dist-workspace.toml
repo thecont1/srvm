@@ -3,23 +3,44 @@ members = ["cargo:."]
 
 # Config for 'dist'
 [dist]
+# The preferred dist version to use in CI (Cargo.toml SemVer syntax)
 cargo-dist-version = "0.28.0"
+# CI backends to support
 ci = "github"
+# The installers to generate for each app
 installers = ["shell", "powershell", "homebrew"]
-targets = [
-  "aarch64-apple-darwin",
-  "aarch64-unknown-linux-gnu",
-  "aarch64-pc-windows-msvc",
-  "x86_64-apple-darwin",
-  "x86_64-unknown-linux-gnu",
-  "x86_64-pc-windows-msvc",
-]
+# Target platforms to build apps for (Rust target-triple syntax)
+targets = ["aarch64-apple-darwin", "aarch64-unknown-linux-gnu", "aarch64-pc-windows-msvc", "x86_64-apple-darwin", "x86_64-unknown-linux-gnu", "x86_64-pc-windows-msvc"]
+# Where to host releases
 hosting = "github"
-# A prerelease (v0.1.0-rc.1) must never overwrite stable package-manager
-# feeds; rc tags publish GitHub archives/installers only, and Homebrew is
-# first updated by the separately approved stable release.
+# Whether to publish prereleases to package managers
 publish-prereleases = false
+# Path that installers should place binaries in
 install-path = "CARGO_HOME"
+# Whether to install an updater program
+install-updater = false
+# Attach GitHub provenance attestations to every artifact
+github-attestations = true
+# PRs build all six native artifacts and keep them as workflow artifacts
+# (no release, no publishing) so the matrix is exercised before any tag.
+pr-run-mode = "upload"
+# Release toolchain is pinned independently of the declared MSRV (1.89) via
+# rust-toolchain.toml: artifacts ship the locally verified 1.97.1.
+# Windows builds link the CRT statically where the toolchain supports it.
+msvc-crt-static = true
+
+# Six native execution hosts: each target builds, tests, and smokes on a
+# runner of its own architecture — never cross-compile only. The 0.28.0
+# defaults (macos-13, windows-2019, ubuntu-20.04, and a linux-hosted
+# windows-arm64 cross build) are retired or wrong for that requirement.
+[dist.github-custom-runners]
+"global" = "ubuntu-22.04"
+"x86_64-apple-darwin" = "macos-15-intel"
+"aarch64-apple-darwin" = "macos-15"
+"x86_64-unknown-linux-gnu" = "ubuntu-22.04"
+"aarch64-unknown-linux-gnu" = "ubuntu-22.04-arm"
+"x86_64-pc-windows-msvc" = "windows-2022"
+"aarch64-pc-windows-msvc" = "windows-11-arm"
 
 [dist.github]
 release-branch = "main"
