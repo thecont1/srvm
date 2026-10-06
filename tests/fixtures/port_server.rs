@@ -29,6 +29,37 @@ fn main() {
     }
 
     let mode = env::var("PORT_FIXTURE_MODE").unwrap_or_else(|_| "env-port".into());
+
+    // The Windows teardown regression runs this mode: the app and a spawned
+    // descendant both swallow console events themselves, so their death proves
+    // srvm's tree teardown rather than the console default handler.
+    if mode == "hold-break" {
+        #[cfg(windows)]
+        windows_console::resist_console_break();
+        if let Some(pid_file) = env::var_os("PORT_FIXTURE_PID_FILE") {
+            let _ = fs::write(&pid_file, format!("{}\n", std::process::id()));
+        }
+        if let Some(child_pid_file) = env::var_os("PORT_FIXTURE_CHILD_PID_FILE") {
+            let mut child = std::process::Command::new(env::current_exe().expect("fixture exe path"));
+            child
+                .arg("--child")
+                .env("PORT_FIXTURE_MODE", "hold-break-child")
+                .env("PORT_FIXTURE_CHILD_PID_FILE", &child_pid_file);
+            let _ = child.spawn().expect("spawn the break-resistant descendant");
+        }
+        // Fall through: serve as a normal app so srvm announces a real URL.
+    }
+
+    if mode == "hold-break-child" {
+        #[cfg(windows)]
+        windows_console::resist_console_break();
+        if let Some(pid_file) = env::var_os("PORT_FIXTURE_CHILD_PID_FILE") {
+            let _ = fs::write(&pid_file, format!("{}\n", std::process::id()));
+        }
+        std::thread::sleep(Duration::from_secs(300));
+        return;
+    }
+
     // The snipe tests need a child that is slow to bind. `sniped-argv-port` and
     // `fail-after-hold` always wait; any other mode waits only when a test asks
     // for it, so a test can steal the port srvm reserved for that child.
@@ -159,4 +190,27 @@ fn argv_port(args: &[String]) -> Option<u16> {
         }
     }
     args.iter().rev().find_map(|arg| arg.parse::<u16>().ok())
+}
+
+/// Console-control support for the Windows teardown regression.
+#[cfg(windows)]
+mod windows_console {
+    type HandlerRoutine = unsafe extern "system" fn(u32) -> i32;
+
+    #[link(name = "kernel32")]
+    unsafe extern "system" {
+        fn SetConsoleCtrlHandler(handler: Option<HandlerRoutine>, add: i32) -> i32;
+    }
+
+    /// Install a handler that swallows console control events. The regression
+    /// relies on this: an app or descendant that dies anyway cannot have been
+    /// killed by the event itself, so its death is srvm's teardown doing work.
+    pub fn resist_console_break() {
+        unsafe extern "system" fn ignore(_event: u32) -> i32 {
+            1 // TRUE: handled; do not pass it on or terminate.
+        }
+        unsafe {
+            SetConsoleCtrlHandler(Some(ignore), 1);
+        }
+    }
 }
