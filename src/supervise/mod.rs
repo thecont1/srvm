@@ -79,6 +79,7 @@ pub fn run(
         None,
         &opened,
         app_env,
+        &[],
     )
 }
 
@@ -180,6 +181,8 @@ pub fn run_many(items: &[LaunchItem], options: SupervisorOptions) -> Result<()> 
         selected.push(sel);
     }
     drop(held);
+    // Every port this launch selected, so a retry can steer clear of siblings.
+    let sibling_ports: Vec<u16> = selected.iter().flatten().copied().collect();
 
     let opened = Arc::new(AtomicBool::new(false));
     thread::scope(|scope| -> Result<()> {
@@ -188,6 +191,7 @@ pub fn run_many(items: &[LaunchItem], options: SupervisorOptions) -> Result<()> 
             let tx = tx.clone();
             let opened = opened.clone();
             let start = selected[idx];
+            let siblings = sibling_ports.clone();
             scope.spawn(move || {
                 let result = run_server(
                     &item.candidate.root,
@@ -198,6 +202,7 @@ pub fn run_many(items: &[LaunchItem], options: SupervisorOptions) -> Result<()> 
                     Some(item.label.as_str()),
                     &opened,
                     &item.env,
+                    &siblings,
                 );
                 let _ = tx.send(result);
             });
@@ -354,6 +359,7 @@ fn run_server(
     label: Option<&str>,
     opened: &Arc<AtomicBool>,
     app_env: &[(String, String)],
+    siblings: &[u16],
 ) -> Result<()> {
     let mut start = requested;
     for attempt in 0..=HANDOFF_RETRIES {
@@ -367,6 +373,7 @@ fn run_server(
             label,
             opened,
             app_env,
+            siblings,
         )? {
             Attempt::Done | Attempt::Stopped => return Ok(()),
             Attempt::Retry { next_start, .. } if attempt < HANDOFF_RETRIES => {
@@ -393,6 +400,7 @@ fn serve_attempt(
     label: Option<&str>,
     opened: &Arc<AtomicBool>,
     app_env: &[(String, String)],
+    siblings: &[u16],
 ) -> Result<Attempt> {
     let ring = Arc::new(Mutex::new(Ring::default()));
 
@@ -474,21 +482,15 @@ fn serve_attempt(
             } else {
                 error_with_tail(format!("{} exited: {status}", spec.name), &ring, label)
             };
-            // A child that died without announcing may have lost the
-            // reservation-to-bind handoff. The thief can come and go between
-            // the child's death and an occupancy probe, so treat a quick
-            // death as evidence on its own and probe the port only for
-            // slower deaths. Unrelated failures still surface unchanged once
-            // the bounded retries are exhausted.
-            let quick = started.elapsed() < Duration::from_secs(3);
-            let retry = if announced.is_none() && quick {
-                selected.map(|selected| selected.saturating_add(1))
-            } else if announced.is_none() {
-                selected.and_then(|selected| {
-                    retry_handoff_start(selected, |port| {
-                        std::net::TcpListener::bind(("127.0.0.1", port)).map(|_| ())
-                    })
-                })
+            // A child that died without announcing a URL may have lost the
+            // reservation-to-bind handoff, and timing cannot tell the two
+            // apart: a thief can come and go before srvm looks, so an
+            // occupancy probe is not evidence. Retry any such death of a
+            // port-injected app within the bounded retries, moving clear of
+            // the ports this launch already selected; a genuinely broken app
+            // still surfaces its own output once the retries are exhausted.
+            let retry = if announced.is_none() {
+                selected.map(|selected| retry_start(selected, siblings))
             } else {
                 None
             };
@@ -502,20 +504,18 @@ fn serve_attempt(
     }
 }
 
-/// Occupancy probe for slower deaths: if the injected port is still held by
-/// another process when the child died, relaunch one port up. Non-AddrInUse
-/// bind errors (permissions, protocol issues) are not a snipe. Quick deaths
-/// retry without this probe — the thief may already have come and gone.
-fn retry_handoff_start(
-    selected: u16,
-    bind: impl FnOnce(u16) -> std::io::Result<()>,
-) -> Option<u16> {
-    match bind(selected) {
-        Err(error) if error.kind() == std::io::ErrorKind::AddrInUse => {
-            Some(selected.saturating_add(1))
-        }
-        _ => None,
-    }
+/// The port to try after a handoff loss. `siblings` are the ports selected for
+/// the other apps in this launch: a retry must never target one of them, since
+/// those reservations are released before the children spawn, so a retried app
+/// could otherwise bind a port its sibling is about to use.
+fn retry_start(selected: u16, siblings: &[u16]) -> u16 {
+    let highest = siblings
+        .iter()
+        .copied()
+        .max()
+        .unwrap_or(selected)
+        .max(selected);
+    highest.saturating_add(1)
 }
 
 fn attach_pumps(
@@ -617,6 +617,34 @@ fn spawn(
 /// spawnable `.cmd`/`.exe` file, which a bare name cannot resolve to.
 /// Programs written with a path (`.venv/bin/python`, `./script.sh`) are left
 /// untouched; `Command` resolves them against the working directory.
+#[cfg(test)]
+mod retry_tests {
+    use super::retry_start;
+
+    #[test]
+    fn a_retry_moves_one_port_up_when_nothing_else_is_selected() {
+        assert_eq!(retry_start(4000, &[]), 4001);
+        assert_eq!(retry_start(4000, &[4000]), 4001);
+    }
+
+    #[test]
+    fn a_retry_clears_every_sibling_port() {
+        // The launch selected 4001 and 4002. When the first app loses 4001 it
+        // must not retry onto 4002: that port belongs to its sibling.
+        assert_eq!(retry_start(4001, &[4001, 4002]), 4003);
+    }
+
+    #[test]
+    fn a_retry_from_the_highest_sibling_still_moves_up() {
+        assert_eq!(retry_start(4002, &[4001, 4002]), 4003);
+    }
+
+    #[test]
+    fn saturation_does_not_wrap_around() {
+        assert_eq!(retry_start(u16::MAX, &[u16::MAX]), u16::MAX);
+    }
+}
+
 #[cfg(test)]
 mod env_tests {
     use super::child_env;
@@ -821,7 +849,7 @@ fn join_pumps(joins: &mut Vec<thread::JoinHandle<()>>) {
 
 #[cfg(test)]
 mod tests {
-    use super::{SupervisorOptions, announce_reported_url, probe_hint, retry_handoff_start};
+    use super::{SupervisorOptions, announce_reported_url, probe_hint};
     use std::{
         io::{Read, Write},
         net::{TcpListener, TcpStream},
@@ -860,57 +888,6 @@ mod tests {
 
         assert_eq!(probe_hint(port), Some(format!("http://127.0.0.1:{port}")));
         handle.join().unwrap();
-    }
-
-    #[test]
-    fn retries_when_the_selected_port_was_claimed() {
-        let port = 5000;
-        let mut calls = Vec::new();
-
-        assert_eq!(
-            retry_handoff_start(port, |candidate| {
-                calls.push(candidate);
-                Err(std::io::Error::new(
-                    std::io::ErrorKind::AddrInUse,
-                    "claimed",
-                ))
-            }),
-            Some(port.saturating_add(1))
-        );
-        assert_eq!(calls, vec![port]);
-    }
-
-    #[test]
-    fn does_not_retry_on_bind_errors_other_than_addr_in_use() {
-        let port = 5000;
-        let mut calls = Vec::new();
-
-        assert_eq!(
-            retry_handoff_start(port, |candidate| {
-                calls.push(candidate);
-                Err(std::io::Error::new(
-                    std::io::ErrorKind::PermissionDenied,
-                    "not a snipe",
-                ))
-            }),
-            None
-        );
-        assert_eq!(calls, vec![port]);
-    }
-
-    #[test]
-    fn does_not_retry_when_the_selected_port_is_free() {
-        let port = 5000;
-        let mut calls = Vec::new();
-
-        assert_eq!(
-            retry_handoff_start(port, |candidate| {
-                calls.push(candidate);
-                Ok(())
-            }),
-            None
-        );
-        assert_eq!(calls, vec![port]);
     }
 
     #[test]
