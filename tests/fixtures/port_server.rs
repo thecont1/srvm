@@ -29,7 +29,12 @@ fn main() {
     }
 
     let mode = env::var("PORT_FIXTURE_MODE").unwrap_or_else(|_| "env-port".into());
-    if matches!(mode.as_str(), "sniped-argv-port" | "fail-after-hold") {
+    // The snipe tests need a child that is slow to bind. `sniped-argv-port` and
+    // `fail-after-hold` always wait; any other mode waits only when a test asks
+    // for it, so a test can steal the port srvm reserved for that child.
+    let hold = matches!(mode.as_str(), "sniped-argv-port" | "fail-after-hold")
+        || env::var_os("PORT_FIXTURE_HOLD").is_some();
+    if hold {
         println!("fixture waiting before bind");
         let release = env::var_os("PORT_FIXTURE_RELEASE").expect("missing fixture release path");
         let deadline = Instant::now() + Duration::from_secs(15);
@@ -44,9 +49,26 @@ fn main() {
         std::process::exit(7);
     }
 
+    // Dies without announcing a URL, but slowly: a handoff loss detected after
+    // srvm's quick-death window, which must still be retried. The second run
+    // behaves normally, so a retry is observable as a serving app.
+    if mode == "fail-once-slow" {
+        let marker = env::var_os("PORT_FIXTURE_ONCE").expect("missing once marker path");
+        if fs::metadata(&marker).is_err() {
+            fs::write(&marker, "1").unwrap();
+            std::thread::sleep(Duration::from_secs(4));
+            eprintln!("boom after a slow start");
+            std::process::exit(7);
+        }
+    }
+
     let port = match mode.as_str() {
         "ignore-port" => 0,
         "argv-port" | "sniped-argv-port" => argv_port(&args).unwrap_or(0),
+        "fail-once-slow" => env::var("PORT")
+            .ok()
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(0),
         _ => env::var("PORT")
             .ok()
             .and_then(|value| value.parse().ok())

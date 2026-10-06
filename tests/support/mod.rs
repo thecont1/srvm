@@ -184,6 +184,43 @@ pub fn wait_for_all(
     }
 }
 
+/// Like `wait_for_all`, but also returns every line that arrived, including the
+/// narration (installs, handoff retries) that precedes the matched lines.
+pub fn wait_for_all_seen(
+    rx: &mpsc::Receiver<String>,
+    err: &mpsc::Receiver<String>,
+    needles: &[&str],
+    timeout: Duration,
+) -> (Vec<String>, Vec<String>) {
+    let mut seen = Vec::new();
+    let mut matched = vec![None; needles.len()];
+    let deadline = Instant::now() + timeout;
+    loop {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        match rx.recv_timeout(remaining) {
+            Ok(line) => {
+                for (idx, needle) in needles.iter().enumerate() {
+                    if matched[idx].is_none() && line.contains(needle) {
+                        matched[idx] = Some(line.clone());
+                    }
+                }
+                seen.push(line);
+                if matched.iter().all(Option::is_some) {
+                    let matched = matched.into_iter().map(Option::unwrap).collect();
+                    return (seen, matched);
+                }
+            }
+            Err(_) => {
+                let stderr = drain(err, Duration::from_secs(2)).join("\n");
+                panic!(
+                    "timed out waiting for all of {needles:?}; srvm stdout:\n{}\nsrvm stderr:\n{stderr}",
+                    seen.join("\n")
+                );
+            }
+        }
+    }
+}
+
 /// Like `wait_line` but the timeout panic includes both streams, so a failed
 /// launch reports srvm's stderr instead of a bare timeout.
 pub fn wait_for(

@@ -1,6 +1,7 @@
 use std::{
     fs,
     net::TcpListener,
+    path::Path,
     thread,
     time::{Duration, Instant},
 };
@@ -230,7 +231,7 @@ fn all_port_start_allocates_distinct_ascending_ports() {
     let out = line_reader(child.0.stdout.take().unwrap());
     let err = line_reader(child.0.stderr.take().unwrap());
 
-    let lines = wait_for_all(
+    let (seen, lines) = wait_for_all_seen(
         &out,
         &err,
         &[
@@ -243,7 +244,15 @@ fn all_port_start_allocates_distinct_ascending_ports() {
     let py_port = app_line_port(&lines[1]);
 
     assert!(js_port >= start, "{js_port} below requested {start}");
-    assert!(py_port > js_port, "{py_port} must follow {js_port}");
+    assert!(py_port >= start, "{py_port} below requested {start}");
+    assert_ne!(js_port, py_port, "ports must stay distinct");
+    // Ascending allocation describes the initial selection. If a port was
+    // stolen in the handoff window, the retried app moves above every port the
+    // launch selected, so launch order no longer implies port order and only
+    // distinctness is promised.
+    if !seen.iter().any(|line| line.contains("retrying")) {
+        assert!(py_port > js_port, "{py_port} must follow {js_port}");
+    }
 
     assert!(http_get(js_port).starts_with("HTTP/1.1 200"));
     assert!(http_get(py_port).starts_with("HTTP/1.1 200"));
@@ -263,4 +272,168 @@ fn package_only_repo() -> TempDir {
     )
     .unwrap();
     repo
+}
+
+/// A stolen port must never push the retried app onto a sibling's port.
+///
+/// Both children are held before they bind. The test steals the first app's
+/// reserved port and lets only that app proceed, so its retry happens while the
+/// sibling is still waiting to bind — exactly the window in which a naive
+/// `selected + 1` retry would land on the sibling's port and make the sibling
+/// fail and retry too. The launch must instead move the retried app clear of
+/// every port this launch selected.
+#[test]
+fn all_handoff_retry_never_steals_a_sibling_port() {
+    let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let repo = two_app_repo();
+    let bin = tempdir().unwrap();
+    stub_exec_mode(bin.path(), "npm", Some("env-port"));
+    // The django app takes its port from argv and gets its own release file, so
+    // it stays unbound while the npm app retries.
+    let py_release = repo.path().join("py-release");
+    write_python_stub(bin.path(), &py_release);
+    let release = repo.path().join("release");
+    let (_held, start) = free_with_free_next();
+    let npm_reserved = start + 1;
+    let py_reserved = start + 2;
+
+    let mut cmd = srvm(bin.path());
+    cmd.env("PORT_FIXTURE_RELEASE", &release)
+        .env("PORT_FIXTURE_HOLD", "1")
+        .arg("--all")
+        .arg("--port")
+        .arg(start.to_string())
+        .arg(repo.path());
+    let mut child = ChildGuard::new(&mut cmd);
+    let out = line_reader(child.0.stdout.take().unwrap());
+    let err = line_reader(child.0.stderr.take().unwrap());
+
+    // Reservations are made before any child spawns, so the first child to say
+    // it is waiting means every port is already chosen.
+    wait_for(
+        &out,
+        &err,
+        "fixture waiting before bind",
+        Duration::from_secs(30),
+    );
+    let stolen =
+        TcpListener::bind(("127.0.0.1", npm_reserved)).expect("steal the npm app's reserved port");
+    fs::write(&release, "go").unwrap();
+
+    let (seen, line) = wait_for_all_seen(
+        &out,
+        &err,
+        &["app        [package:dev] http://127.0.0.1:"],
+        Duration::from_secs(30),
+    );
+    let npm_port = app_line_port(&line[0]);
+
+    assert!(
+        seen.iter().any(|line| line.contains("retrying")),
+        "the stolen port must trigger a handoff retry: {seen:?}"
+    );
+    assert!(
+        npm_port > py_reserved,
+        "the retry must clear the sibling's port {py_reserved}, got {npm_port}; srvm said:\n{}",
+        seen.join("\n")
+    );
+    assert!(
+        !seen
+            .iter()
+            .any(|line| line.contains("[django]") && line.contains("retrying")),
+        "the sibling must not be disturbed: {seen:?}"
+    );
+
+    // Now the sibling binds the port it reserved all along.
+    fs::write(&py_release, "go").unwrap();
+    let line = wait_for(
+        &out,
+        &err,
+        "app        [django] http://127.0.0.1:",
+        Duration::from_secs(30),
+    );
+    let py_port = app_line_port(&line);
+
+    assert_eq!(py_port, py_reserved, "the sibling keeps its own port");
+    assert_ne!(npm_port, py_port);
+
+    assert!(http_get(npm_port).starts_with("HTTP/1.1 200"));
+    assert!(http_get(py_port).starts_with("HTTP/1.1 200"));
+    assert!(wait_exit(&mut child.0, Duration::from_secs(30)).success());
+    drop(stolen);
+}
+
+/// A stub for `python3` whose fixture waits on its own release file, so a test
+/// can hold one app back while another one fails and retries.
+fn write_python_stub(dir: &Path, release: &Path) {
+    #[cfg(windows)]
+    {
+        fs::write(
+            dir.join("python3.cmd"),
+            format!(
+                "@echo off\r\nset PORT_FIXTURE_MODE=argv-port\r\nset PORT_FIXTURE_RELEASE={}\r\n\"{}\" %*\r\nexit /b %ERRORLEVEL%\r\n",
+                release.display(),
+                fixture_bin().display()
+            ),
+        )
+        .unwrap();
+    }
+
+    #[cfg(not(windows))]
+    {
+        use std::os::unix::fs::PermissionsExt;
+
+        let path = dir.join("python3");
+        fs::write(
+            &path,
+            format!(
+                "#!/bin/sh\nPORT_FIXTURE_MODE=argv-port PORT_FIXTURE_HOLD=1 PORT_FIXTURE_RELEASE={} exec \"{}\" \"$@\"\n",
+                release.display(),
+                fixture_bin().display()
+            ),
+        )
+        .unwrap();
+        let mut perms = fs::metadata(&path).unwrap().permissions();
+        perms.set_mode(0o755);
+        fs::set_permissions(&path, perms).unwrap();
+    }
+}
+
+/// A port-injected app that dies without ever announcing a URL has lost the
+/// reservation-to-bind handoff, and that must be retried even when the death is
+/// not quick: the thief is often gone by the time srvm looks, so an occupancy
+/// probe cannot be the only evidence. Before this rule, a stolen port on a slow
+/// start failed the whole launch.
+#[test]
+fn all_retries_a_slow_death_that_never_announced() {
+    let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let repo = package_only_repo();
+    let bin = tempdir().unwrap();
+    stub_exec_mode(bin.path(), "npm", Some("fail-once-slow"));
+    let once = repo.path().join("once");
+
+    let mut cmd = srvm(bin.path());
+    cmd.env("PORT_FIXTURE_ONCE", &once)
+        .arg("--all")
+        .arg("--port")
+        .arg("0")
+        .arg(repo.path());
+    let mut child = ChildGuard::new(&mut cmd);
+    let out = line_reader(child.0.stdout.take().unwrap());
+    let err = line_reader(child.0.stderr.take().unwrap());
+
+    let (seen, lines) = wait_for_all_seen(
+        &out,
+        &err,
+        &["app        http://127.0.0.1:"],
+        Duration::from_secs(60),
+    );
+    let port = app_line_port(&lines[0]);
+
+    assert!(
+        seen.iter().any(|line| line.contains("retrying")),
+        "a slow death without a URL must be retried: {seen:?}"
+    );
+    assert!(http_get(port).starts_with("HTTP/1.1 200"));
+    assert!(wait_exit(&mut child.0, Duration::from_secs(30)).success());
 }
