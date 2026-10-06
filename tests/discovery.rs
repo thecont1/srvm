@@ -57,6 +57,12 @@ fn bare_srvm_runs_every_conventional_app() {
     assert!(wait_exit(&mut child.0, Duration::from_secs(30)).success());
 }
 
+/// App roots are reported with the host separator (`apps\web` on Windows), so
+/// literal expectations have to be built the same way.
+fn native(rel: &str) -> String {
+    rel.replace('/', std::path::MAIN_SEPARATOR_STR)
+}
+
 #[test]
 fn dry_run_lists_candidates_and_the_default_set_without_side_effects() {
     let repo = tempdir().unwrap();
@@ -76,14 +82,28 @@ fn dry_run_lists_candidates_and_the_default_set_without_side_effects() {
     assert!(output.status.success());
     let stdout = stdout_of(&output);
     assert!(stdout.contains("match      1. package:dev"), "{stdout}");
-    assert!(stdout.contains("root       apps/admin"), "{stdout}");
-    assert!(stdout.contains("root       apps/web"), "{stdout}");
     assert!(
-        stdout.contains("launch     1. apps/admin:package:dev  [apps/admin]"),
+        stdout.contains(&format!("root       {}", native("apps/admin"))),
         "{stdout}"
     );
     assert!(
-        stdout.contains("launch     2. apps/web:package:dev  [apps/web]"),
+        stdout.contains(&format!("root       {}", native("apps/web"))),
+        "{stdout}"
+    );
+    assert!(
+        stdout.contains(&format!(
+            "launch     1. {}:package:dev  [{}]",
+            native("apps/admin"),
+            native("apps/admin")
+        )),
+        "{stdout}"
+    );
+    assert!(
+        stdout.contains(&format!(
+            "launch     2. {}:package:dev  [{}]",
+            native("apps/web"),
+            native("apps/web")
+        )),
         "{stdout}"
     );
     assert!(
@@ -152,7 +172,7 @@ fn qualified_select_runs_exactly_one_app() {
     let mut cmd = srvm(bin.path());
     cmd.arg("--no-install")
         .arg("--select")
-        .arg("apps/admin:package:dev")
+        .arg(format!("{}:package:dev", native("apps/admin")))
         .arg(repo.path());
     let mut child = ChildGuard::new(&mut cmd);
     let out = line_reader(child.0.stdout.take().unwrap());
@@ -182,15 +202,15 @@ fn installs_run_in_each_app_root() {
     let out = line_reader(child.0.stdout.take().unwrap());
     let err = line_reader(child.0.stderr.take().unwrap());
 
-    let lines = wait_for_all(
-        &out,
-        &err,
-        &[
-            "app        [apps/admin:package:dev] http://127.0.0.1:",
-            "app        [apps/web:package:dev] http://127.0.0.1:",
-        ],
-        Duration::from_secs(30),
+    let admin = format!(
+        "app        [{}:package:dev] http://127.0.0.1:",
+        native("apps/admin")
     );
+    let web = format!(
+        "app        [{}:package:dev] http://127.0.0.1:",
+        native("apps/web")
+    );
+    let lines = wait_for_all(&out, &err, &[&admin, &web], Duration::from_secs(30));
 
     for path in [
         repo.path().join("apps/web/srvm-fixture-install.txt"),

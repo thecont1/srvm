@@ -432,6 +432,13 @@ fn override_description(spec: &ServeSpec) -> String {
 /// Resolves `--select` against every discovered candidate: a 1-based dry-run
 /// index, an exact qualified id (`apps/web:package:dev`), or a bare name, tool,
 /// or relative directory when exactly one candidate matches it.
+/// Whether a candidate field matches `select`, treating `/` and the host
+/// separator as the same character: a Windows app root reported as `apps\web`
+/// is still selected by `--select apps/web`, and vice versa.
+fn separator_eq(candidate: &str, select: &str) -> bool {
+    candidate == select || candidate.replace('\\', "/") == select.replace('\\', "/")
+}
+
 fn select_index(candidates: &[Candidate], select: &str) -> Result<usize> {
     if let Ok(index) = select.parse::<usize>() {
         if (1..=candidates.len()).contains(&index) {
@@ -444,7 +451,10 @@ fn select_index(candidates: &[Candidate], select: &str) -> Result<usize> {
         );
     }
 
-    if let Some(index) = candidates.iter().position(|c| c.id() == select) {
+    if let Some(index) = candidates
+        .iter()
+        .position(|c| separator_eq(&c.id(), select))
+    {
         return Ok(index);
     }
 
@@ -452,9 +462,9 @@ fn select_index(candidates: &[Candidate], select: &str) -> Result<usize> {
         .iter()
         .enumerate()
         .filter(|(_, candidate)| {
-            candidate.spec.name == select
-                || candidate.spec.tool == select
-                || candidate.rel.to_string_lossy() == select
+            separator_eq(&candidate.spec.name, select)
+                || separator_eq(&candidate.spec.tool, select)
+                || separator_eq(&candidate.rel.to_string_lossy(), select)
         })
         .map(|(index, _)| index)
         .collect();
@@ -471,6 +481,28 @@ fn select_index(candidates: &[Candidate], select: &str) -> Result<usize> {
                 .collect::<Vec<_>>()
                 .join(", ")
         ),
+    }
+}
+
+#[cfg(test)]
+mod selector_tests {
+    use super::separator_eq;
+
+    #[test]
+    fn a_selector_matches_across_path_separators() {
+        assert!(separator_eq("apps/web:package:dev", "apps/web:package:dev"));
+        assert!(separator_eq(
+            "apps\\web:package:dev",
+            "apps/web:package:dev"
+        ));
+        assert!(separator_eq(
+            "apps/web:package:dev",
+            "apps\\web:package:dev"
+        ));
+        assert!(!separator_eq(
+            "apps/web:package:dev",
+            "apps/admin:package:dev"
+        ));
     }
 }
 
