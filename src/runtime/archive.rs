@@ -25,15 +25,49 @@ pub fn extract_verified(bytes: &[u8], expected: &[u8; 32], dest: &Path) -> Resul
 /// separate archives whose contents must share one prefix (bin/, lib/…), so
 /// that rustc finds the standard library relative to its own binary.
 pub fn extract_verified_flat(bytes: &[u8], expected: &[u8; 32], dest: &Path) -> Result<()> {
-    extract_verified(bytes, expected, dest)?;
-    let top_dirs = fs::read_dir(dest)?
-        .filter_map(|entry| entry.ok())
-        .filter(|entry| entry.file_type().is_ok_and(|kind| kind.is_dir()))
-        .map(|entry| entry.path())
-        .collect::<Vec<_>>();
-    for dir in top_dirs {
-        merge_up(&dir, dest)?;
+    // Unpack beside the prefix and lift the payload in from there: merging
+    // straight out of the prefix would also re-visit the directories an
+    // earlier component already published there.
+    let stage = dest.join(".srvm-stage");
+    let _ = fs::remove_dir_all(&stage);
+    fs::create_dir_all(&stage)?;
+    let merged: Result<()> = (|| {
+        extract_verified(bytes, expected, &stage)?;
+        let top_dirs = fs::read_dir(&stage)?
+            .filter_map(|entry| entry.ok())
+            .filter(|entry| entry.file_type().is_ok_and(|kind| kind.is_dir()))
+            .map(|entry| entry.path())
+            .collect::<Vec<_>>();
+        for dir in top_dirs {
+            merge_payload(&dir, dest)?;
+        }
+        Ok(())
+    })();
+    let _ = fs::remove_dir_all(&stage);
+    merged
+}
+
+/// Lifts one component archive's payload into the shared prefix. A component
+/// tarball nests as `<component>-<version>-<triple>/<payload>/…`, and it is the
+/// payload's *contents* that belong at the prefix: `rustc/bin/rustc` becomes
+/// `bin/rustc` and `rust-std-<triple>/lib/rustlib/…` becomes
+/// `lib/rustlib/…`, which is where rustc looks for its standard library. The
+/// metadata files next to the payload (`install.sh`, `components`, `version`)
+/// stay at the prefix root.
+fn merge_payload(src: &Path, dest: &Path) -> Result<()> {
+    for entry in fs::read_dir(src)? {
+        let entry = entry?;
+        if entry.file_type()?.is_dir() {
+            merge_up(&entry.path(), dest)?;
+        } else {
+            let target = dest.join(entry.file_name());
+            if target.exists() {
+                fs::remove_file(&target)?;
+            }
+            fs::rename(entry.path(), &target)?;
+        }
     }
+    fs::remove_dir(src)?;
     Ok(())
 }
 
@@ -296,15 +330,44 @@ mod tests {
     }
 
     #[test]
-    fn flat_extraction_merges_component_roots_into_one_prefix() {
+    fn flat_extraction_lifts_one_component_payload_into_the_prefix() {
+        // The dist server nests a component as
+        // `<component>-<version>-<triple>/<payload>/…` with metadata beside
+        // the payload; the payload's contents are what belongs at the prefix.
         let archive = tar_gz(&[
-            ("rustc/bin/rustc", b"compiler"),
-            ("cargo/bin/cargo", b"builder"),
-            ("rust-std-x/lib/rustlib/x/lib/libstd.rlib", b"stdlib"),
+            ("rustc-1.81.0-x/rustc/bin/rustc", b"compiler"),
+            ("rustc-1.81.0-x/install.sh", b"installer"),
+            ("rustc-1.81.0-x/components", b"rustc\n"),
         ]);
         let digest = sha256(&archive);
         let dest = tempdir().unwrap();
         extract_verified_flat(&archive, &digest, dest.path()).unwrap();
+
+        assert_eq!(
+            fs::read(dest.path().join("bin/rustc")).unwrap(),
+            b"compiler"
+        );
+        assert_eq!(
+            fs::read(dest.path().join("install.sh")).unwrap(),
+            b"installer"
+        );
+        assert!(!dest.path().join("rustc-1.81.0-x").exists());
+        assert!(!dest.path().join("rustc").exists());
+        assert!(!dest.path().join(".srvm-stage").exists());
+    }
+
+    #[test]
+    fn flat_extraction_merges_three_components_into_one_prefix() {
+        let rustc = tar_gz(&[("rustc-1.81.0-x/rustc/bin/rustc", b"compiler")]);
+        let cargo = tar_gz(&[("cargo-1.81.0-x/cargo/bin/cargo", b"builder")]);
+        let std = tar_gz(&[(
+            "rust-std-1.81.0-x/rust-std-x/lib/rustlib/x/lib/libstd.rlib",
+            b"stdlib",
+        )]);
+        let dest = tempdir().unwrap();
+        for archive in [&rustc, &cargo, &std] {
+            extract_verified_flat(archive, &sha256(archive), dest.path()).unwrap();
+        }
 
         assert_eq!(
             fs::read(dest.path().join("bin/rustc")).unwrap(),
@@ -315,9 +378,7 @@ mod tests {
             fs::read(dest.path().join("lib/rustlib/x/lib/libstd.rlib")).unwrap(),
             b"stdlib"
         );
-        assert!(!dest.path().join("rustc").exists());
-        assert!(!dest.path().join("cargo").exists());
-        assert!(!dest.path().join("rust-std-x").exists());
+        assert!(!dest.path().join("cargo-1.81.0-x").exists());
 
         // The merged prefix is what find_tool searches: tools share bin/.
         let rustc = find_tool(dest.path(), &["rustc"]).unwrap();
