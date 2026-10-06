@@ -438,7 +438,8 @@ fn select_index(candidates: &[Candidate], select: &str) -> Result<usize> {
             return Ok(index - 1);
         }
         bail!(
-            "--select {index} is out of range; this workspace has {} candidate(s)",
+            "--select {index} is out of range; this workspace has {} candidate(s) — \
+             select by number, qualified id, name or path",
             candidates.len()
         );
     }
