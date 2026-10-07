@@ -97,7 +97,7 @@ def scoop_manifest(manifest: dict, repo: str, tag: str, version: str, sha_dir: P
         "autoupdate": {
             "architecture": {
                 key: {
-                    "url": release_url(repo, "$version", arts[triple]["name"]),
+                    "url": release_url(repo, "v$version", arts[triple]["name"]),
                     "hash": {"url": f"$url.sha256"},
                 }
                 for triple, (key, _) in ((t, WINDOWS_ARCH[t]) for t in arts)

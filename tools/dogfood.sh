@@ -136,8 +136,18 @@ EOF
 
 # --- runner -----------------------------------------------------------------
 
-snapshot() { # dir -> sorted file list on stdout
-  (cd "$1" && find . -type f | sort)
+hash_of() { # file -> sha256 hex
+  if command -v sha256sum >/dev/null 2>&1; then
+    sha256sum "$1" | awk '{print $1}'
+  else
+    shasum -a 256 "$1" | awk '{print $1}'
+  fi
+}
+
+snapshot() { # dir -> sorted "hash  path" lines on stdout
+  (cd "$1" && find . -type f | sort | while IFS= read -r f; do
+    printf '%s  %s\n' "$(hash_of "$f")" "$f"
+  done)
 }
 
 with_timeout() { # seconds cmd...
@@ -153,8 +163,8 @@ with_timeout() { # seconds cmd...
   return "$code"
 }
 
-run_shape() { # name [extra srvm args...]
-  local name="$1"; shift
+run_shape() { # name expected_urls [extra srvm args...]
+  local name="$1" expected="$2"; shift 2
   local dir="$ROOT/$name"
   local log="$ROOT/$name.log"
   : > "$log"
@@ -173,24 +183,28 @@ run_shape() { # name [extra srvm args...]
 
   "$SRVM" --no-open --no-color "$@" "$dir" > "$log" 2>&1 &
   local pid=$!
-  local url=""
+  local urls="" found=0
   for _ in $(seq 1 $((DEADLINE_BOOT * 2))); do
-    url="$(grep -o 'http://127.0.0.1:[0-9]*' "$log" | tail -1 || true)"
-    [ -n "$url" ] && break
+    urls="$(grep -o 'http://127.0.0.1:[0-9]*' "$log" | sort -u || true)"
+    found="$(printf '%s\n' "$urls" | grep -c .)"
+    [ "$found" -ge "$expected" ] && break
     kill -0 "$pid" 2>/dev/null || break
     sleep 0.5
   done
-  if [ -z "$url" ]; then
-    log "FAIL: no URL announced; tail: $(tail -8 "$log" | tr '\n' '|')"; FAIL=$((FAIL+1))
+  if [ "$found" -lt "$expected" ]; then
+    log "FAIL: expected $expected announced URL(s), saw $found; tail: $(tail -8 "$log" | tr '\n' '|')"; FAIL=$((FAIL+1))
     kill "$pid" 2>/dev/null; wait "$pid" 2>/dev/null
     return
   fi
-  if ! curl -fsS --max-time 5 "$url" | grep -q .; then
-    log "FAIL: announced $url but GET failed"; FAIL=$((FAIL+1))
-    kill "$pid" 2>/dev/null; wait "$pid" 2>/dev/null
-    return
-  fi
-  log "served at $url"
+  local url
+  for url in $urls; do
+    if ! curl -fsS --max-time 5 "$url" >/dev/null; then
+      log "FAIL: GET failed for $url"; FAIL=$((FAIL+1))
+      kill "$pid" 2>/dev/null; wait "$pid" 2>/dev/null
+      return
+    fi
+  done
+  log "served at $(printf '%s ' $urls)"
 
   kill -INT "$pid" 2>/dev/null
   local waited=0
@@ -201,7 +215,21 @@ run_shape() { # name [extra srvm args...]
     log "FAIL: srvm survived Ctrl+C"; FAIL=$((FAIL+1)); kill -9 "$pid" 2>/dev/null
     return
   fi
-  log "Ctrl+C teardown clean"; PASS=$((PASS+1))
+  # The process exited; its announced listeners must be gone too.
+  local released=0
+  for _ in $(seq 1 10); do
+    released=1
+    for url in $urls; do
+      curl -fsS --max-time 1 "$url" >/dev/null 2>&1 && released=0
+    done
+    [ "$released" = "1" ] && break
+    sleep 0.2
+  done
+  if [ "$released" != "1" ]; then
+    log "FAIL: announced URL(s) still serving after srvm exited"; FAIL=$((FAIL+1))
+    return
+  fi
+  log "Ctrl+C teardown clean (process exited, listeners released)"; PASS=$((PASS+1))
 }
 
 main() {
@@ -212,11 +240,11 @@ main() {
   shape_monorepo "$ROOT/monorepo"
   shape_dotenv_sample "$ROOT/dotenv-sample"
 
-  run_shape fullstack
-  run_shape static
-  run_shape rust-cli
-  run_shape django
-  run_shape monorepo --all
+  run_shape fullstack 2
+  run_shape static 1
+  run_shape rust-cli 1
+  run_shape django 1
+  run_shape monorepo 2 --all
 
   # The .env.example-only repo: no apps to boot; srvm must explain itself and
   # exit non-zero rather than hang or panic.
