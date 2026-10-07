@@ -125,7 +125,7 @@ impl HttpGet for UreqClient {
         let agent: ureq::Agent = config.into();
         let mut response = agent
             .get(url)
-            .header("User-Agent", "srvm/0.1.0")
+            .header("User-Agent", concat!("srvm/", env!("CARGO_PKG_VERSION")))
             .call()
             .with_context(|| format!("GET {url}"))?;
         let mut limited = response.body_mut().as_reader().take(MAX_DOWNLOAD_BYTES + 1);
