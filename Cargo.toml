@@ -8,6 +8,16 @@ license = "MIT"
 repository = "https://github.com/thecont1/srvm"
 homepage = "https://github.com/thecont1/srvm"
 readme = "README.md"
+exclude = [
+  # Repository, release and agent tooling. None of it is useful to a consumer of
+  # the crate, and some of it (the skill file, the release plan) is internal.
+  ".devin",
+  ".github",
+  "PLAN.md",
+  "dist-workspace.toml",
+  "examples",
+  "tools",
+]
 keywords = ["launcher", "developer-tools", "cli"]
 categories = ["command-line-utilities", "development-tools"]
 
