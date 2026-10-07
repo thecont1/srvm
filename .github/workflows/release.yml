@@ -167,6 +167,12 @@ jobs:
           echo "dist ran successfully"
       - name: Attest
         uses: actions/attest-build-provenance@v2
+        # MANUAL DELTA from `dist generate` (reapply after regenerating):
+        # fork PRs get a read-only token whose attestations:write is
+        # downgraded, so attesting there would fail the job. Run for
+        # pushes/tags and non-fork PRs; skip for fork PRs while the steps
+        # below still upload the artifacts.
+        if: ${{ !github.event.pull_request || github.event.pull_request.head.repo.full_name == github.repository }}
         with:
           subject-path: "target/distrib/*${{ join(matrix.targets, ', ') }}*"
       - id: cargo-dist

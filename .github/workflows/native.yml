@@ -60,12 +60,40 @@ jobs:
         with:
           components: clippy, rustfmt
 
+      # The windows-11-arm image's preinstalled rustup resolves x64 toolchains
+      # under emulation; select the native aarch64 toolchain explicitly so this
+      # job cannot silently build (and run, under emulation) an x64 binary.
+      - name: 'Force the native aarch64 toolchain (Windows ARM64)'
+        if: ${{ runner.os == 'Windows' && runner.arch == 'ARM64' }}
+        shell: bash
+        run: |
+          rustup toolchain install 1.97.1-aarch64-pc-windows-msvc --profile minimal -c clippy -c rustfmt
+          rustup default 1.97.1-aarch64-pc-windows-msvc
+          rm -f rust-toolchain.toml
+          rustc -vV | grep -q '^host: aarch64-pc-windows-msvc'
+
       - run: cargo fmt --check
       - run: cargo clippy --locked --all-targets -- -D warnings
       # Includes the Windows console-event regression (real CTRL_BREAK_EVENT)
       # on both Windows runners.
       - run: cargo test --locked
       - run: cargo build --locked --release
+
+      # An emulated x64 build must never pass as a native windows-arm64 (or
+      # windows-x64) success: the produced PE must match the runner's arch.
+      - name: 'Verify the release binary is native for this runner'
+        if: ${{ runner.os == 'Windows' }}
+        shell: pwsh
+        run: |
+          $bin = "target/release/srvm${{ matrix.suffix }}"
+          $bytes = [System.IO.File]::ReadAllBytes($bin)
+          $pe = [System.BitConverter]::ToInt32($bytes, 0x3C)
+          $machine = [System.BitConverter]::ToUInt16($bytes, $pe + 4)
+          $expected = if ($env:RUNNER_ARCH -eq 'ARM64') { 0xAA64 } else { 0x8664 }
+          if ($machine -ne $expected) {
+            throw "$bin has PE machine 0x$($machine.ToString('X4')), expected 0x$($expected.ToString('X4')) for $env:RUNNER_ARCH"
+          }
+          Write-Host "$bin is native $env:RUNNER_ARCH (PE machine 0x$($machine.ToString('X4')))"
 
       - name: 'Smoke (version, help, static serve)'
         shell: bash
