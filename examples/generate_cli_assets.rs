@@ -25,7 +25,10 @@ fn main() -> anyhow::Result<()> {
     fs::create_dir_all(&man_dir)?;
     let mut buffer = Vec::new();
     clap_mangen::Man::new(srvm::command()).render(&mut buffer)?;
-    fs::write(man_dir.join("srvm.1"), buffer)?;
+    // clap_mangen emits trailing spaces; committed output must pass `git diff --check`.
+    let man = String::from_utf8(buffer)?;
+    let man = man.lines().map(str::trim_end).collect::<Vec<_>>().join("\n") + "\n";
+    fs::write(man_dir.join("srvm.1"), man)?;
 
     println!("assets written under {}", out.display());
     Ok(())
