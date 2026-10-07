@@ -1,0 +1,159 @@
+name: RC verify
+
+# Proves the PUBLISHED artifacts on the six native hosts instead of trusting a
+# build: download the release, verify its checksums, install through the real
+# installer into a throwaway prefix, then smoke the installed binary. Dispatch
+# it against a tag, or let a published release trigger it. This is what makes
+# the clean-machine matrix repeatable rather than folklore.
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Release tag to verify (for example v0.1.0-rc.1)
+        required: true
+        default: v0.1.0-rc.1
+  release:
+    types: [published]
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    name: ${{ matrix.runner }} (${{ matrix.target }})
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: macos-15
+            target: aarch64-apple-darwin
+            suffix: ''
+          - runner: macos-15-intel
+            target: x86_64-apple-darwin
+            suffix: ''
+          - runner: ubuntu-22.04
+            target: x86_64-unknown-linux-gnu
+            suffix: ''
+          - runner: ubuntu-22.04-arm
+            target: aarch64-unknown-linux-gnu
+            suffix: ''
+          - runner: windows-2022
+            target: x86_64-pc-windows-msvc
+            suffix: '.exe'
+          - runner: windows-11-arm
+            target: aarch64-pc-windows-msvc
+            suffix: '.exe'
+    env:
+      TAG: ${{ inputs.tag || github.event.release.tag_name }}
+      TARGET: ${{ matrix.target }}
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.tag || github.event.release.tag_name }}
+          persist-credentials: false
+      - name: Download the published archive and its checksum
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p download
+          gh release download "$TAG" --repo "$GITHUB_REPOSITORY" --dir download \
+            --pattern "srvm-${TARGET}.*"
+          ls -l download
+      - name: Verify the published checksum
+        shell: bash
+        run: |
+          set -euo pipefail
+          sidecar="$(ls download/*.sha256 | head -1)"
+          archive="${sidecar%.sha256}"
+          want="$(awk '{print $1}' "$sidecar")"
+          if command -v sha256sum >/dev/null 2>&1; then
+            got="$(sha256sum -b "$archive" | awk '{print $1}')"
+          else
+            # Stock macOS: this is the tool the generated installer cannot use.
+            got="$(shasum -a 256 "$archive" | awk '{print $1}')"
+          fi
+          if [ "$got" != "$want" ]; then
+            echo "checksum mismatch for $archive" >&2
+            echo "want: $want" >&2
+            echo "got:  $got" >&2
+            exit 1
+          fi
+          echo "checksum verified: $archive"
+      - name: Install through the real installer into a throwaway prefix
+        shell: bash
+        run: |
+          set -euo pipefail
+          prefix="$(mktemp -d)"
+          echo "SRVM_VERIFY_PREFIX=$prefix" >> "$GITHUB_ENV"
+          # install-path is CARGO_HOME, so the prefix owns the whole install and
+          # no shell profile is touched.
+          export CARGO_HOME="$prefix"
+          export INSTALLER_NO_MODIFY_PATH=1
+          export SRVM_NO_MODIFY_PATH=1
+          if [ "${RUNNER_OS}" = "Windows" ]; then
+            # The PowerShell installer hashes with Get-FileHash, which always exists.
+            curl --proto '=https' --tlsv1.2 -LsSf \
+              "https://github.com/${GITHUB_REPOSITORY}/releases/download/${TAG}/srvm-installer.ps1" \
+              -o "$RUNNER_TEMP/srvm-installer.ps1"
+            pwsh -NoProfile -ExecutionPolicy Bypass -File "$RUNNER_TEMP/srvm-installer.ps1"
+          else
+            # The generated shell installer skips its own check when sha256sum is
+            # missing (stock macOS); tools/install.sh supplies one so it runs.
+            SRVM_INSTALLER_URL="https://github.com/${GITHUB_REPOSITORY}/releases/download/${TAG}/srvm-installer.sh" \
+              sh tools/install.sh
+          fi
+      - name: Smoke the installed binary
+        shell: bash
+        run: |
+          set -euo pipefail
+          BIN="$SRVM_VERIFY_PREFIX/bin/srvm${{ matrix.suffix }}"
+          if [ ! -f "$BIN" ]; then
+            echo "no installed binary at $BIN" >&2
+            find "$SRVM_VERIFY_PREFIX" -maxdepth 3 -type f >&2
+            exit 1
+          fi
+          "$BIN" --version
+          "$BIN" --help >/dev/null
+          SMOKE_DIR="$(mktemp -d)"
+          printf '<html>rc-verify</html>\n' > "$SMOKE_DIR/index.html"
+          "$BIN" "$SMOKE_DIR" --no-open --no-color --port 0 > "$SMOKE_DIR/log" 2>&1 &
+          SRVM_PID=$!
+          URL=""
+          for _ in $(seq 1 60); do
+            URL="$(grep -o 'http://127.0.0.1:[0-9]*' "$SMOKE_DIR/log" | head -1 || true)"
+            [ -n "$URL" ] && break
+            sleep 0.5
+          done
+          if [ -z "$URL" ]; then
+            cat "$SMOKE_DIR/log" >&2
+            exit 1
+          fi
+          curl -fsS "$URL" | grep -q rc-verify
+          kill "$SRVM_PID" 2>/dev/null || true
+          wait "$SRVM_PID" 2>/dev/null || true
+      # Windows teardown is proven by tests/lifecycle_windows.rs in native.yml,
+      # which raises a real console event; this workflow keeps the unix side.
+      - name: Ctrl+C teardown and exit 130
+        if: ${{ runner.os != 'Windows' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          BIN="$SRVM_VERIFY_PREFIX/bin/srvm"
+          SMOKE_DIR="$(mktemp -d)"
+          printf '<html>rc-verify</html>\n' > "$SMOKE_DIR/index.html"
+          "$BIN" "$SMOKE_DIR" --no-open --no-color --port 0 > "$SMOKE_DIR/log" 2>&1 &
+          SRVM_PID=$!
+          for _ in $(seq 1 60); do
+            grep -q 'http://127.0.0.1:' "$SMOKE_DIR/log" && break
+            sleep 0.5
+          done
+          kill -INT "$SRVM_PID"
+          status=0
+          wait "$SRVM_PID" || status=$?
+          if [ "$status" -ne 130 ]; then
+            echo "Ctrl+C must exit 130, got $status" >&2
+            exit 1
+          fi
+          echo "Ctrl+C teardown exited 130"
