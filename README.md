@@ -56,6 +56,31 @@ Prebuilt archives for macOS, Linux, and Windows on both x64 and ARM64 ship with 
 
 `srvm` is one self-contained executable, not a statically linked one: macOS and Linux builds link the platform C library (Linux is GNU/glibc, not musl), and Windows static-links the MSVC CRT where supported. Runtimes srvm fetches for you still need the host linker/SDK that their ecosystems normally require.
 
+### Installing a prebuilt binary
+
+`v0.1.0-rc.1` is the first release carrying prebuilt archives for macOS, Linux, and Windows on both x64 and ARM64, alongside the shell and PowerShell installers:
+
+```console
+# Linux and macOS
+$ curl --proto '=https' --tlsv1.2 -LsSf https://github.com/thecont1/srvm/releases/download/v0.1.0-rc.1/srvm-installer.sh | sh
+
+# Windows
+$ powershell -ExecutionPolicy Bypass -c "irm https://github.com/thecont1/srvm/releases/download/v0.1.0-rc.1/srvm-installer.ps1 | iex"
+
+# Homebrew (the formula reaches the tap at the stable release)
+$ brew install thecont1/srvm/srvm
+```
+
+Those commands name the prerelease tag on purpose: GitHub's `releases/latest` skips prereleases, so it would resolve to nothing until a stable release exists. Once one does, `releases/latest` works and the `/download/<tag>` segment can go.
+
+**On macOS, use the checked front door.** The generated installer verifies the download with `sha256sum`, which stock macOS does not provide — without it the installer prints a note and installs unverified. [`tools/install.sh`](tools/install.sh) supplies the command it is looking for, so the installer's own comparison runs and a tampered archive is refused, and then runs that same installer unchanged:
+
+```console
+$ curl -sSfL https://raw.githubusercontent.com/thecont1/srvm/main/tools/install.sh | sh
+```
+
+**The binaries are unsigned**, and this project has no signing certificate, so first runs are gated by the OS. macOS Gatekeeper blocks the binary once: right-click it in Finder and choose Open, or run `xattr -d com.apple.quarantine "$(command -v srvm)"`. Windows SmartScreen shows "Windows protected your PC": pick More info, then Run anyway. Every archive carries a `.sha256` sidecar and a GitHub artifact attestation, so `gh attestation verify <archive> --repo thecont1/srvm` confirms what you downloaded without trusting the download itself.
+
 ## Usage
 
 ```console
@@ -85,26 +110,3 @@ Detection design inspired by [px0](https://github.com/px0-ai/px0) (MIT), whose `
 ## License
 
 MIT — see [LICENSE](LICENSE).
-
-### Installing a prebuilt binary
-
-From `v0.1.0-rc.1` onward the release carries the installers directly:
-
-```console
-# Linux and macOS
-$ curl --proto '=https' --tlsv1.2 -LsSf https://github.com/thecont1/srvm/releases/latest/download/srvm-installer.sh | sh
-
-# Windows
-$ powershell -ExecutionPolicy Bypass -c "irm https://github.com/thecont1/srvm/releases/latest/download/srvm-installer.ps1 | iex"
-
-# Homebrew (the formula reaches the tap at the stable release)
-$ brew install thecont1/srvm/srvm
-```
-
-**On macOS, use the checked front door.** The generated installer verifies the download with `sha256sum`, which stock macOS does not provide — without it the installer prints a note and installs unverified. [`tools/install.sh`](tools/install.sh) supplies the command it is looking for, so the installer's own comparison runs and a tampered archive is refused, and then runs that same installer unchanged:
-
-```console
-$ curl -sSfL https://raw.githubusercontent.com/thecont1/srvm/main/tools/install.sh | sh
-```
-
-**The binaries are unsigned**, and this project has no signing certificate, so first runs are gated by the OS. macOS Gatekeeper blocks the binary once: right-click it in Finder and choose Open, or run `xattr -d com.apple.quarantine "$(command -v srvm)"`. Windows SmartScreen shows "Windows protected your PC": pick More info, then Run anyway. Every archive carries a `.sha256` sidecar and a GitHub artifact attestation, so `gh attestation verify <archive> --repo thecont1/srvm` confirms what you downloaded without trusting the download itself.

@@ -18,7 +18,9 @@
 # which is how the release workflow exercises this wrapper without publishing.
 set -eu
 
-installer_url="${SRVM_INSTALLER_URL:-https://github.com/thecont1/srvm/releases/latest/download/srvm-installer.sh}"
+# Pinned to the prerelease tag: GitHub's `releases/latest` skips prereleases.
+# Move this to releases/latest (or the stable tag) at stable promotion.
+installer_url="${SRVM_INSTALLER_URL:-https://github.com/thecont1/srvm/releases/download/v0.1.0-rc.1/srvm-installer.sh}"
 shim_dir="$(mktemp -d)"
 trap 'rm -rf "$shim_dir"' EXIT
 supplied=""
@@ -52,4 +54,11 @@ if [ -n "$supplied" ]; then
     echo "srvm: verifying the download with sha256sum supplied from $supplied (the installer skips its own check without one)" >&2
 fi
 
-curl --proto '=https' --tlsv1.2 -LsSf "$installer_url" | sh -s -- "$@"
+# Download, then run: a failure here is reported as a failed download rather
+# than becoming a half-executed pipeline with no installer behind it.
+installer_path="$shim_dir/srvm-installer.sh"
+if ! curl --proto '=https' --tlsv1.2 -fLsS "$installer_url" -o "$installer_path"; then
+    echo "srvm: could not download the installer from $installer_url" >&2
+    exit 1
+fi
+sh "$installer_path" "$@"

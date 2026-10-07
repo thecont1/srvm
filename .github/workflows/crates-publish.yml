@@ -36,14 +36,18 @@ jobs:
       - uses: dtolnay/rust-toolchain@1.89.0
       - name: Confirm the manifest version matches the tag
         shell: bash
+        # The tag reaches the script through the environment, never through the
+        # script source: an interpolated input would be executed as Bash before
+        # this check could object to it.
+        env:
+          TAG: ${{ inputs.tag }}
         run: |
           set -euo pipefail
-          want="${{ inputs.tag }}"
-          want="${want#v}"
+          want="${TAG#v}"
           got="$(cargo metadata --no-deps --format-version 1 \
             | python3 -c 'import json,sys; print(json.load(sys.stdin)["packages"][0]["version"])')"
           if [ "$got" != "$want" ]; then
-            echo "tag ${{ inputs.tag }} does not match the Cargo.toml version $got" >&2
+            echo "tag $TAG does not match the Cargo.toml version $got" >&2
             exit 1
           fi
           echo "publishing srvm $got"
