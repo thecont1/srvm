@@ -9,9 +9,9 @@ on:
   workflow_dispatch:
     inputs:
       tag:
-        description: Release tag to verify (for example v0.1.0-rc.1)
+        description: Release tag to verify (for example v0.1.0)
         required: true
-        default: v0.1.0-rc.1
+        default: v0.1.0
   release:
     types: [published]
 

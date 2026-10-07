@@ -46,33 +46,30 @@ The built-in server is deliberately minimal:
 
 ## Install
 
-There is no published release yet — the first gate is a `v0.1.0-rc.1` prerelease, and stable promotion is a separate, explicitly approved step. Until then, build from source:
-
 ```console
-$ cargo install --path .   # from a clone of this repository
+# macOS / Linux — the checked front door (see the note on sha256sum below)
+$ curl -sSfL https://raw.githubusercontent.com/thecont1/srvm/main/tools/install.sh | sh
+
+# Windows (PowerShell)
+$ powershell -ExecutionPolicy Bypass -c "irm https://github.com/thecont1/srvm/releases/latest/download/srvm-installer.ps1 | iex"
+
+# crates.io
+$ cargo install --locked srvm
+
+# Homebrew
+$ brew install thecont1/srvm/srvm
+
+# Scoop
+$ scoop bucket add srvm https://github.com/thecont1/scoop-bucket
+$ scoop install srvm
+
+# winget
+$ winget install thecont1.srvm
 ```
 
-Prebuilt archives for macOS, Linux, and Windows on both x64 and ARM64 ship with the release (`v0.1.0-rc.1` first), together with shell and PowerShell installers, a Homebrew formula, a Scoop manifest, a winget manifest, shell completions, and a man page.
+Prebuilt archives for macOS, Linux, and Windows on both x64 and ARM64 ship with each release, together with the shell and PowerShell installers, the Homebrew formula, the Scoop manifest, the winget manifest, shell completions, and a man page. Or build from source with `cargo install --path .` from a clone of this repository.
 
 `srvm` is one self-contained executable, not a statically linked one: macOS and Linux builds link the platform C library (Linux is GNU/glibc, not musl), and Windows static-links the MSVC CRT where supported. Runtimes srvm fetches for you still need the host linker/SDK that their ecosystems normally require.
-
-### Installing a prebuilt binary
-
-`v0.1.0-rc.1` is the first release carrying prebuilt archives for macOS, Linux, and Windows on both x64 and ARM64, alongside the shell and PowerShell installers:
-
-```console
-# Linux (on macOS use the checked front door below: this is the same installer,
-# with the checksum tool it would otherwise look for supplied for it)
-$ curl --proto '=https' --tlsv1.2 -LsSf https://github.com/thecont1/srvm/releases/download/v0.1.0-rc.1/srvm-installer.sh | sh
-
-# Windows
-$ powershell -ExecutionPolicy Bypass -c "irm https://github.com/thecont1/srvm/releases/download/v0.1.0-rc.1/srvm-installer.ps1 | iex"
-
-# Homebrew (the formula reaches the tap at the stable release)
-$ brew install thecont1/srvm/srvm
-```
-
-Those commands name the prerelease tag on purpose: GitHub's `releases/latest` skips prereleases, so it would resolve to nothing until a stable release exists. Once one does, `releases/latest` works and the `/download/<tag>` segment can go.
 
 **On macOS, use the checked front door.** The generated installer verifies the download with `sha256sum`, which macOS ships from `/sbin` on recent releases (26.x does) but not on older ones — without it, or with a `PATH` that omits `/sbin`, the installer prints a note and installs unverified. [`tools/install.sh`](tools/install.sh) supplies the command it is looking for, so the installer's own comparison runs and a tampered archive is refused, and then runs that same installer unchanged:
 
@@ -102,7 +99,7 @@ Port notes: `--port` sets where the free-port *search* starts, not a hard requir
 
 ## Status
 
-M0–M7 are implemented and merged (`main` is `507d1c8`, from PR #5). The release-candidate phase is under way: the installer's checksum gap on stock macOS is closed by [`tools/install.sh`](tools/install.sh), which supplies the `sha256sum` the installer looks for so that a tampered download is refused instead of warned through; the `RC verify` workflow installs the *published* artifacts into a throwaway prefix and smokes them on all six native hosts; and crates.io publication runs through a manual, token-based workflow until the crate exists and trusted publishing can take over. The external channels exist as empty repositories (`thecont1/homebrew-srvm`, `thecont1/scoop-bucket`) and stay dormant while `publish-prereleases = false`. What still gates `v0.1.0-rc.1`: a green `RC verify` run against the published artifacts, the dogfood pass recorded on the RC binary, winget validation on both Windows architectures, and the explicit tag approval. No release is published yet — see [`PLAN.md`](PLAN.md) for the gates and approval sequence.
+M0–M7 are implemented and merged; `v0.1.0` is the stable release. The `v0.1.0-rc.1` candidate exercised the full publish path before promotion: six-target archives with checksums and attestations, a green published-artifact install matrix on all six native hosts (`RC verify`), the crates.io canary (`cargo install --locked srvm`), validated Scoop/winget manifests, and a 6/6 real-repo dogfood pass. The installer's checksum gap on stock macOS is closed by [`tools/install.sh`](tools/install.sh), which supplies the `sha256sum` the installer looks for so a tampered download is refused instead of warned through. See [`PLAN.md`](PLAN.md) for the milestone map.
 
 ## License
 

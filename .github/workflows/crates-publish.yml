@@ -16,7 +16,7 @@ on:
       tag:
         description: Tag to publish (must match the version in Cargo.toml)
         required: true
-        default: v0.1.0-rc.1
+        default: v0.1.0
       dry_run:
         description: Only run cargo publish --dry-run
         type: boolean

@@ -13,15 +13,15 @@
 #
 # Usage:
 #   curl -sSfL https://raw.githubusercontent.com/thecont1/srvm/main/tools/install.sh | sh
-#   curl -sSfL https://raw.githubusercontent.com/thecont1/srvm/main/tools/install.sh | sh -s -- --version v0.1.0-rc.1
+#   curl -sSfL https://raw.githubusercontent.com/thecont1/srvm/main/tools/install.sh | sh -s -- --version v0.1.0
 #
 # SRVM_INSTALLER_URL overrides where the official installer is fetched from,
 # which is how the release workflow exercises this wrapper without publishing.
 set -eu
 
-# Pinned to the prerelease tag: GitHub's `releases/latest` skips prereleases.
-# Move this to releases/latest (or the stable tag) at stable promotion.
-installer_url="${SRVM_INSTALLER_URL:-https://github.com/thecont1/srvm/releases/download/v0.1.0-rc.1/srvm-installer.sh}"
+# `releases/latest` resolves to the newest non-prerelease release, so this
+# follows stable promotions without another edit here.
+installer_url="${SRVM_INSTALLER_URL:-https://github.com/thecont1/srvm/releases/latest/download/srvm-installer.sh}"
 shim_dir="$(mktemp -d)"
 trap 'rm -rf "$shim_dir"' EXIT
 supplied=""
