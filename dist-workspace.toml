@@ -1,0 +1,55 @@
+[workspace]
+members = ["cargo:."]
+
+# Config for 'dist'
+[dist]
+# The preferred dist version to use in CI (Cargo.toml SemVer syntax)
+cargo-dist-version = "0.30.2"
+# CI backends to support
+ci = "github"
+# The installers to generate for each app
+installers = ["shell", "powershell", "homebrew"]
+# Target platforms to build apps for (Rust target-triple syntax)
+targets = ["aarch64-apple-darwin", "aarch64-unknown-linux-gnu", "aarch64-pc-windows-msvc", "x86_64-apple-darwin", "x86_64-unknown-linux-gnu", "x86_64-pc-windows-msvc"]
+# Where to host releases
+hosting = "github"
+# Whether to publish prereleases to package managers
+publish-prereleases = false
+# Path that installers should place binaries in
+install-path = "CARGO_HOME"
+# Whether to install an updater program
+install-updater = false
+# Attach GitHub provenance attestations to every artifact
+github-attestations = true
+# The Attest step is gated off for fork pull requests in release.yml (their
+# read-only token cannot attest); that one manual delta is sanctioned here so
+# `dist plan` accepts the workflow without regenerating it away.
+allow-dirty = ["ci"]
+# Publish jobs to run in CI
+publish-jobs = ["homebrew"]
+# A GitHub repo to push Homebrew formulas to
+tap = "thecont1/homebrew-srvm"
+# Which actions to run on pull requests
+pr-run-mode = "upload"
+# Whether +crt-static should be used on msvc
+msvc-crt-static = true
+# The windows-11-arm image's preinstalled rustup resolves x64 toolchains
+# under emulation; force the native aarch64 toolchain there so the release
+# build is a native execution rather than a refused cross-compile.
+github-build-setup = "../build-setup.yaml"
+
+# Six native execution hosts: each target builds, tests, and smokes on a
+# runner of its own architecture — never cross-compile only. The 0.28.0
+# defaults (macos-13, windows-2019, ubuntu-20.04, and a linux-hosted
+# windows-arm64 cross build) are retired or wrong for that requirement.
+[dist.github-custom-runners]
+"global" = "ubuntu-22.04"
+"x86_64-apple-darwin" = "macos-15-intel"
+"aarch64-apple-darwin" = "macos-15"
+"x86_64-unknown-linux-gnu" = "ubuntu-22.04"
+"aarch64-unknown-linux-gnu" = "ubuntu-22.04-arm"
+"x86_64-pc-windows-msvc" = "windows-2022"
+"aarch64-pc-windows-msvc" = "windows-11-arm"
+
+[dist.github]
+release-branch = "main"

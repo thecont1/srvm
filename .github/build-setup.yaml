@@ -1,0 +1,19 @@
+# Injected into every cargo-dist build job before artifacts are built.
+# cargo-dist ships no native windows-arm64 binary: dist.exe runs x64-emulated
+# on windows-11-arm and reports an x86_64 host, and the image's preinstalled
+# rustup resolves x64 toolchains under emulation too. This step forces the
+# native aarch64 toolchain; dist (>=0.29) then accepts the win->win build and
+# the build is genuinely native because cargo itself is arm64.
+- name: 'Force the native aarch64 toolchain on Windows ARM64 runners'
+  shell: bash
+  run: |
+    if [ "${RUNNER_ARCH:-}" = "ARM64" ] && [ "${RUNNER_OS:-}" = "Windows" ]; then
+      rustup toolchain install 1.97.1-aarch64-pc-windows-msvc --profile minimal
+      rustup default 1.97.1-aarch64-pc-windows-msvc
+      # The repo rust-toolchain.toml would resolve through the x64 shim and
+      # rebuild on x86_64; drop it for this job only.
+      rm -f rust-toolchain.toml
+      # GITHUB_ENV holds a Windows path Git Bash cannot address directly;
+      # convert it so the build step's toolchain pin survives.
+      echo "RUSTUP_TOOLCHAIN=1.97.1-aarch64-pc-windows-msvc" >> "$(cygpath -u "$GITHUB_ENV")"
+    fi

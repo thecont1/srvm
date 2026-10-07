@@ -1,0 +1,137 @@
+name: Native
+
+# The gate executes dependency build scripts; keep the default token out of
+# .git/config (persist-credentials below) and limited to reading the repo.
+permissions:
+  contents: read
+
+# The six-native-execution gate: every supported target builds, tests, and
+# runs its own binary on a runner of its own architecture, plus the MSRV
+# proof and (when explicitly asked) the opt-in live suite. Cross-compile
+# success is never accepted as an execution pass.
+#
+# The live suite is heavy (real upstream downloads, real compiles) and is
+# enabled only by workflow_dispatch; the RC gate dispatches it deliberately.
+on:
+  workflow_dispatch:
+    inputs:
+      live:
+        description: 'Run the opt-in live suite (real upstream archives and toolchain boots)'
+        type: boolean
+        default: false
+  push:
+    branches: [main]
+    tags: ['v*']
+  pull_request:
+    paths:
+      - 'src/**'
+      - 'tests/**'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - 'rust-toolchain.toml'
+      - '.github/workflows/native.yml'
+
+jobs:
+  native:
+    name: ${{ matrix.runner }} (${{ matrix.target }})
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: macos-15
+            target: aarch64-apple-darwin
+            suffix: ''
+          - runner: macos-15-intel
+            target: x86_64-apple-darwin
+            suffix: ''
+          - runner: ubuntu-22.04
+            target: x86_64-unknown-linux-gnu
+            suffix: ''
+          - runner: ubuntu-22.04-arm
+            target: aarch64-unknown-linux-gnu
+            suffix: ''
+          - runner: windows-2022
+            target: x86_64-pc-windows-msvc
+            suffix: '.exe'
+          - runner: windows-11-arm
+            target: aarch64-pc-windows-msvc
+            suffix: '.exe'
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - uses: dtolnay/rust-toolchain@1.97.1
+        with:
+          components: clippy, rustfmt
+
+      # The windows-11-arm image's preinstalled rustup resolves x64 toolchains
+      # under emulation; select the native aarch64 toolchain explicitly so this
+      # job cannot silently build (and run, under emulation) an x64 binary.
+      - name: 'Force the native aarch64 toolchain (Windows ARM64)'
+        if: ${{ runner.os == 'Windows' && runner.arch == 'ARM64' }}
+        shell: bash
+        run: |
+          rustup toolchain install 1.97.1-aarch64-pc-windows-msvc --profile minimal -c clippy -c rustfmt
+          rustup default 1.97.1-aarch64-pc-windows-msvc
+          rm -f rust-toolchain.toml
+          rustc -vV | grep -q '^host: aarch64-pc-windows-msvc'
+
+      - run: cargo fmt --check
+      - run: cargo clippy --locked --all-targets -- -D warnings
+      # Includes the Windows console-event regression (real CTRL_BREAK_EVENT)
+      # on both Windows runners.
+      - run: cargo test --locked
+      - run: cargo build --locked --release
+
+      # An emulated x64 build must never pass as a native windows-arm64 (or
+      # windows-x64) success: the produced PE must match the runner's arch.
+      - name: 'Verify the release binary is native for this runner'
+        if: ${{ runner.os == 'Windows' }}
+        shell: pwsh
+        run: |
+          $bin = "target/release/srvm${{ matrix.suffix }}"
+          $bytes = [System.IO.File]::ReadAllBytes($bin)
+          $pe = [System.BitConverter]::ToInt32($bytes, 0x3C)
+          $machine = [System.BitConverter]::ToUInt16($bytes, $pe + 4)
+          $expected = if ($env:RUNNER_ARCH -eq 'ARM64') { 0xAA64 } else { 0x8664 }
+          if ($machine -ne $expected) {
+            throw "$bin has PE machine 0x$($machine.ToString('X4')), expected 0x$($expected.ToString('X4')) for $env:RUNNER_ARCH"
+          }
+          Write-Host "$bin is native $env:RUNNER_ARCH (PE machine 0x$($machine.ToString('X4')))"
+
+      - name: 'Smoke (version, help, static serve)'
+        shell: bash
+        run: |
+          set -euo pipefail
+          BIN="target/release/srvm${{ matrix.suffix }}"
+          "$BIN" --version
+          "$BIN" --help >/dev/null
+          SMOKE_DIR="$(mktemp -d)"
+          printf '<html>native-smoke</html>\n' > "$SMOKE_DIR/index.html"
+          "$BIN" "$SMOKE_DIR" --no-open --no-color --port 0 > "$SMOKE_DIR/log" 2>&1 &
+          SRVM_PID=$!
+          URL=""
+          for _ in $(seq 1 60); do
+            URL="$(grep -o 'http://127.0.0.1:[0-9]*' "$SMOKE_DIR/log" | head -1 || true)"
+            [ -n "$URL" ] && break
+            sleep 0.5
+          done
+          [ -n "$URL" ] || { cat "$SMOKE_DIR/log"; exit 1; }
+          curl -fsS "$URL" | grep -q native-smoke
+          kill "$SRVM_PID" 2>/dev/null || true
+          wait "$SRVM_PID" 2>/dev/null || true
+
+      - name: 'MSRV proof (cargo +1.89.0 check --locked --all-targets)'
+        shell: bash
+        run: |
+          rustup toolchain install 1.89.0 --profile minimal
+          cargo +1.89.0 check --locked --all-targets
+
+      - name: 'Live smokes (opt-in: real upstream archives and toolchain boots)'
+        if: ${{ inputs.live == true }}
+        shell: bash
+        timeout-minutes: 150
+        run: cargo test --locked --features live --test live -- --test-threads=1

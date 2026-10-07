@@ -1,9 +1,10 @@
 //! Lifecycle regressions: what a launcher owes the user when it is told to
 //! stop, and what it must never leave running.
 //!
-//! Unix only for now. The Windows console-event regression needs a real
-//! `CTRL_C_EVENT` and lands with that sub-gate; until then Windows teardown is
-//! covered by the multi-app tests, whose guard makes them weaker evidence.
+//! Unix side of the lifecycle regressions. The Windows console-event
+//! regression lives in `lifecycle_windows.rs` and sends a real
+//! `CTRL_BREAK_EVENT`; Windows teardown is also covered by the multi-app
+//! tests, whose guard makes them weaker evidence.
 #![cfg(unix)]
 
 mod support;

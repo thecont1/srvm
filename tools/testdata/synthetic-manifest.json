@@ -1,0 +1,20 @@
+{
+  "tag": "v0.1.0-rc.1",
+  "artifacts": {
+    "srvm-x86_64-pc-windows-msvc.zip": {
+      "name": "srvm-x86_64-pc-windows-msvc.zip",
+      "kind": "executable-zip",
+      "target_triples": ["x86_64-pc-windows-msvc"]
+    },
+    "srvm-aarch64-pc-windows-msvc.zip": {
+      "name": "srvm-aarch64-pc-windows-msvc.zip",
+      "kind": "executable-zip",
+      "target_triples": ["aarch64-pc-windows-msvc"]
+    },
+    "srvm-aarch64-apple-darwin.tar.xz": {
+      "name": "srvm-aarch64-apple-darwin.tar.xz",
+      "kind": "executable-zip",
+      "target_triples": ["aarch64-apple-darwin"]
+    }
+  }
+}
