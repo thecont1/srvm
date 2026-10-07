@@ -4,8 +4,9 @@
 #
 # The generated installer (cargo-dist 0.30.2) verifies the downloaded archive
 # with `sha256sum` and, when that command is missing, prints "skipping sha256
-# checksum verification" and installs anyway. Stock macOS has no `sha256sum`, so
-# a tampered download would install there with no warning worth the name. This
+# checksum verification" and installs anyway. macOS only ships `sha256sum` on
+# recent releases and from `/sbin`, so a Mac without it would install a tampered
+# download with no warning worth the name. This
 # wrapper supplies a `sha256sum` built from `shasum` or `openssl`, so the
 # installer's own comparison runs and a mismatch aborts the install, then runs
 # the official installer unchanged: there is still exactly one install path.

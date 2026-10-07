@@ -71,7 +71,7 @@ jobs:
           if command -v sha256sum >/dev/null 2>&1; then
             got="$(sha256sum -b "$archive" | awk '{print $1}')"
           else
-            # Stock macOS: this is the tool the generated installer cannot use.
+            # macOS without sha256sum: the tool the generated installer cannot use.
             got="$(shasum -a 256 "$archive" | awk '{print $1}')"
           fi
           if [ "$got" != "$want" ]; then

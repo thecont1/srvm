@@ -73,7 +73,7 @@ $ brew install thecont1/srvm/srvm
 
 Those commands name the prerelease tag on purpose: GitHub's `releases/latest` skips prereleases, so it would resolve to nothing until a stable release exists. Once one does, `releases/latest` works and the `/download/<tag>` segment can go.
 
-**On macOS, use the checked front door.** The generated installer verifies the download with `sha256sum`, which stock macOS does not provide — without it the installer prints a note and installs unverified. [`tools/install.sh`](tools/install.sh) supplies the command it is looking for, so the installer's own comparison runs and a tampered archive is refused, and then runs that same installer unchanged:
+**On macOS, use the checked front door.** The generated installer verifies the download with `sha256sum`, which macOS ships from `/sbin` on recent releases (26.x does) but not on older ones — without it, or with a `PATH` that omits `/sbin`, the installer prints a note and installs unverified. [`tools/install.sh`](tools/install.sh) supplies the command it is looking for, so the installer's own comparison runs and a tampered archive is refused, and then runs that same installer unchanged:
 
 ```console
 $ curl -sSfL https://raw.githubusercontent.com/thecont1/srvm/main/tools/install.sh | sh
