@@ -88,8 +88,8 @@ covers what it does and how to get it; this file covers how it works.
 ## Built-in static server
 
 A repo that's just `index.html` and assets (root or conventional `public/`,
-`www/`, `site/`) is served by a small HTTP server compiled into srvm — no
-runtime required. `--port`, `--no-open`, and the free-port walk apply
+`www/`, `site/`, `dist/`, `build/`, `out/`) is served by a small HTTP server
+compiled into srvm — no runtime required. `--port`, `--no-open`, and the free-port walk apply
 (default start `8000`); ambient `PORT` is ignored because srvm owns the
 listener.
 
