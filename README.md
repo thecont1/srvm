@@ -56,6 +56,32 @@ Prebuilt archives for macOS, Linux, and Windows on both x64 and ARM64 ship with 
 
 `srvm` is one self-contained executable, not a statically linked one: macOS and Linux builds link the platform C library (Linux is GNU/glibc, not musl), and Windows static-links the MSVC CRT where supported. Runtimes srvm fetches for you still need the host linker/SDK that their ecosystems normally require.
 
+### Installing a prebuilt binary
+
+`v0.1.0-rc.1` is the first release carrying prebuilt archives for macOS, Linux, and Windows on both x64 and ARM64, alongside the shell and PowerShell installers:
+
+```console
+# Linux (on macOS use the checked front door below: this is the same installer,
+# with the checksum tool it would otherwise look for supplied for it)
+$ curl --proto '=https' --tlsv1.2 -LsSf https://github.com/thecont1/srvm/releases/download/v0.1.0-rc.1/srvm-installer.sh | sh
+
+# Windows
+$ powershell -ExecutionPolicy Bypass -c "irm https://github.com/thecont1/srvm/releases/download/v0.1.0-rc.1/srvm-installer.ps1 | iex"
+
+# Homebrew (the formula reaches the tap at the stable release)
+$ brew install thecont1/srvm/srvm
+```
+
+Those commands name the prerelease tag on purpose: GitHub's `releases/latest` skips prereleases, so it would resolve to nothing until a stable release exists. Once one does, `releases/latest` works and the `/download/<tag>` segment can go.
+
+**On macOS, use the checked front door.** The generated installer verifies the download with `sha256sum`, which macOS ships from `/sbin` on recent releases (26.x does) but not on older ones — without it, or with a `PATH` that omits `/sbin`, the installer prints a note and installs unverified. [`tools/install.sh`](tools/install.sh) supplies the command it is looking for, so the installer's own comparison runs and a tampered archive is refused, and then runs that same installer unchanged:
+
+```console
+$ curl -sSfL https://raw.githubusercontent.com/thecont1/srvm/main/tools/install.sh | sh
+```
+
+**The binaries are unsigned**, and this project has no signing certificate, so first runs are gated by the OS. macOS Gatekeeper blocks the binary once: right-click it in Finder and choose Open, or run `xattr -d com.apple.quarantine "$(command -v srvm)"`. Windows SmartScreen shows "Windows protected your PC": pick More info, then Run anyway. Every archive carries a `.sha256` sidecar and a GitHub artifact attestation, so `gh attestation verify <archive> --repo thecont1/srvm` confirms what you downloaded without trusting the download itself.
+
 ## Usage
 
 ```console
@@ -76,7 +102,7 @@ Port notes: `--port` sets where the free-port *search* starts, not a hard requir
 
 ## Status
 
-M0–M6.1 and release-readiness milestone R are implemented and merged. M7 is implemented on the feature branch (`dev/diparati`, draft PR #5): the six-native-runner release pipeline (cargo-dist, attestations, installers), the Windows console-event teardown regression, the opt-in live suite against real upstream archives, the six-host MSRV proof job, CLI completions and man page, and the Scoop/winget manifest generators. What still gates `v0.1.0-rc.1`: green six-host native/CI evidence (including the live gate on all six), the recorded real-repo dogfood pass, and the approval-gated external steps (crates.io publisher identity, Homebrew tap, Scoop bucket, winget submission). No release is published yet — see [`PLAN.md`](PLAN.md) for the gates and approval sequence.
+M0–M7 are implemented and merged (`main` is `507d1c8`, from PR #5). The release-candidate phase is under way: the installer's checksum gap on stock macOS is closed by [`tools/install.sh`](tools/install.sh), which supplies the `sha256sum` the installer looks for so that a tampered download is refused instead of warned through; the `RC verify` workflow installs the *published* artifacts into a throwaway prefix and smokes them on all six native hosts; and crates.io publication runs through a manual, token-based workflow until the crate exists and trusted publishing can take over. The external channels exist as empty repositories (`thecont1/homebrew-srvm`, `thecont1/scoop-bucket`) and stay dormant while `publish-prereleases = false`. What still gates `v0.1.0-rc.1`: a green `RC verify` run against the published artifacts, the dogfood pass recorded on the RC binary, winget validation on both Windows architectures, and the explicit tag approval. No release is published yet — see [`PLAN.md`](PLAN.md) for the gates and approval sequence.
 
 ## Acknowledgements
 
