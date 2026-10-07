@@ -72,7 +72,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          python3 -m pip install --quiet --disable-pip-version-check check-jsonschema
+          python3 -m pip install --quiet --disable-pip-version-check check-jsonschema PyYAML
           version="${{ inputs.tag }}"
           version="${version#v}"
           dir="out/winget/thecont1.srvm/${version}"
