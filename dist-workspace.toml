@@ -21,9 +21,10 @@ install-path = "CARGO_HOME"
 install-updater = false
 # Attach GitHub provenance attestations to every artifact
 github-attestations = true
-# NOTE: release.yml carries one manual delta on top of `dist generate`
-# (the Attest step is gated off for fork pull requests, whose read-only
-# token would fail the attestation); reapply it after regenerating.
+# The Attest step is gated off for fork pull requests in release.yml (their
+# read-only token cannot attest); that one manual delta is sanctioned here so
+# `dist plan` accepts the workflow without regenerating it away.
+allow-dirty = ["ci"]
 # Publish jobs to run in CI
 publish-jobs = ["homebrew"]
 # A GitHub repo to push Homebrew formulas to
