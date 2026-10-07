@@ -5,6 +5,7 @@ edition = "2024"
 rust-version = "1.89"
 description = "Zero-config universal app launcher"
 license = "MIT"
+authors = ["Mahesh Shantaram <ms@thecontrarian.in>"]
 repository = "https://github.com/thecont1/srvm"
 homepage = "https://github.com/thecont1/srvm"
 readme = "README.md"
@@ -14,6 +15,7 @@ exclude = [
   ".devin",
   ".github",
   "PLAN.md",
+  "TECH-SPEC.md",
   "dist-workspace.toml",
   "examples",
   "tools",
