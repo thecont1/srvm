@@ -1,5 +1,10 @@
 name: CI
 
+# The test job executes dependency build scripts; keep the default token out
+# of .git/config (persist-credentials below) and limited to reading the repo.
+permissions:
+  contents: read
+
 on:
   push:
     branches: [main]
@@ -16,6 +21,8 @@ jobs:
 
     steps:
       - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
       # Pinned to the repo toolchain (rust-toolchain.toml, 1.97.1): the same
       # verified compiler that ships the release artifacts.
       - uses: dtolnay/rust-toolchain@1.97.1

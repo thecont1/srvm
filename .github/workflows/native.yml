@@ -1,5 +1,10 @@
 name: Native
 
+# The gate executes dependency build scripts; keep the default token out of
+# .git/config (persist-credentials below) and limited to reading the repo.
+permissions:
+  contents: read
+
 # The six-native-execution gate: every supported target builds, tests, and
 # runs its own binary on a runner of its own architecture, plus the MSRV
 # proof and (when explicitly asked) the opt-in live suite. Cross-compile
@@ -55,6 +60,8 @@ jobs:
 
     steps:
       - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
 
       - uses: dtolnay/rust-toolchain@1.97.1
         with:
