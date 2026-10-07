@@ -14,8 +14,9 @@ pub const APP_DIRS: &[&str] = &["frontend", "backend", "client", "server", "web"
 /// Conventional parents whose immediate children hold an app.
 pub const APP_PARENTS: &[&str] = &["apps", "packages", "services"];
 
-/// Conventional asset directories, tried only when nothing else matched.
-pub const ASSET_DIRS: &[&str] = &["public", "www", "site"];
+/// Conventional asset or build-output directories, tried only when nothing
+/// else matched — a served dist/ beats "nothing to run".
+pub const ASSET_DIRS: &[&str] = &["public", "www", "site", "dist", "build", "out"];
 
 /// Directories never descended into: generated output and dependency trees.
 pub const GENERATED_DIRS: &[&str] = &[
@@ -353,6 +354,25 @@ mod tests {
             &["npm"],
         );
         assert_eq!(rels(&mixed), vec!["frontend"]);
+    }
+
+    #[test]
+    fn serves_build_output_when_nothing_else_matches() {
+        // A repo whose only servable artifact is build output: marker-free
+        // root, tooling in a non-conventional dir, dist/index.html present.
+        // The fallback must serve it rather than report nothing to run.
+        for dir in ["dist", "build", "out"] {
+            let ws = discovered(
+                &[
+                    ("deck.yaml", "slides: []\n"),
+                    ("engine/build.py", ""),
+                    (&format!("{dir}/index.html"), "hello"),
+                ],
+                &[],
+            );
+            assert_eq!(rels(&ws), vec![dir]);
+            assert!(ws.candidates[0].spec.is_static);
+        }
     }
 
     #[test]
