@@ -1,0 +1,95 @@
+name: Manifest verify
+
+# Validates the Scoop and winget manifests generated from a published release on
+# Windows, then installs the binary from the local winget manifest and smokes it.
+#
+# Dispatch only: the manifests reach the Scoop bucket and winget-pkgs at the
+# stable gate, and those submissions are separately approved. Scoop and winget
+# are Windows tools, so this cannot run on the macOS and Linux runners the rest
+# of the matrix uses.
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Published release tag to generate and validate manifests for
+        required: true
+        default: v0.1.0-rc.1
+
+permissions:
+  contents: read
+
+jobs:
+  manifests:
+    name: manifests (${{ matrix.label }})
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - label: x64
+            runner: windows-2022
+          - label: arm64
+            runner: windows-11-arm
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.tag }}
+
+      - name: Download the release manifest and its checksum sidecars
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          mkdir -p checksums out
+          gh release download "${{ inputs.tag }}" --repo "${{ github.repository }}" \
+            --pattern dist-manifest.json --dir .
+          gh release download "${{ inputs.tag }}" --repo "${{ github.repository }}" \
+            --pattern '*.sha256' --dir checksums
+
+      - name: Generate the manifests from the published release
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 tools/gen_manifests.py \
+            --manifest dist-manifest.json \
+            --sha256-dir checksums \
+            --repo "${{ github.repository }}" \
+            --tag "${{ inputs.tag }}" \
+            --out-dir out
+
+      - name: Record the generated files
+        shell: bash
+        run: find out -type f | sort
+
+      - name: Validate the winget manifests
+        shell: pwsh
+        run: |
+          $version = "${{ inputs.tag }}" -replace '^v', ''
+          $dir = "out/winget/thecont1.srvm/$version"
+          winget validate --manifest $dir
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Install from the local winget manifest and smoke it
+        shell: pwsh
+        run: |
+          $version = "${{ inputs.tag }}" -replace '^v', ''
+          $dir = "out/winget/thecont1.srvm/$version"
+          winget install --manifest $dir --accept-package-agreements `
+            --accept-source-agreements --disable-interactivity
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $link = Join-Path $env:LOCALAPPDATA 'Microsoft\WinGet\Links\srvm.exe'
+          if (-not (Test-Path $link)) { throw "srvm.exe was not linked at $link" }
+          & $link --version
+
+      - name: Parse the Scoop manifest
+        shell: pwsh
+        run: |
+          $m = Get-Content out/scoop/srvm.json -Raw | ConvertFrom-Json
+          "scoop version: $($m.version)"
+          "scoop architectures: $($m.architecture.PSObject.Properties.Name -join ', ')"
+          foreach ($arch in $m.architecture.PSObject.Properties) {
+            if (-not $arch.Value.url) { throw "scoop $($arch.Name) has no url" }
+            if (-not $arch.Value.hash) { throw "scoop $($arch.Name) has no hash" }
+          }
