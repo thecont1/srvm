@@ -2,14 +2,15 @@ name: Publish to crates.io
 
 # Manual on purpose. cargo-dist does not publish to crates.io, and the
 # tag-triggered release run must not gain a step that fails when a secret is
-# missing, so the RC's first real publish stays exactly as proven.
+# missing, so publishing stays a deliberate dispatch.
 #
-# This workflow covers the token-based FIRST publish: crates.io requires an
-# initial publish with an API token before trusted publishing can be configured
-# ("Your crate must already be published to crates.io"; RFC 3691: "A Trusted
-# Publisher Configuration can only be created after an initial manual
-# publishing of a crate"). Once the crate exists and trusted publishing is set
-# up for thecont1/srvm, delete this workflow — and the token with it.
+# Authentication is crates.io trusted publishing (RFC 3691): the OIDC token
+# GitHub issues this job is exchanged for a short-lived cargo token, so no
+# API token is stored in repository secrets. This requires a Trusted
+# Publisher config on crates.io for thecont1/srvm naming this workflow file;
+# if an environment is set there it must match the job's `environment` field
+# (currently unset). The token-based first publish that seeded the crate is
+# history.
 on:
   workflow_dispatch:
     inputs:
@@ -24,6 +25,7 @@ on:
 
 permissions:
   contents: read
+  id-token: write
 
 jobs:
   publish:
@@ -53,9 +55,11 @@ jobs:
           echo "publishing srvm $got"
       - name: Show the packaged contents
         run: cargo package --locked --list
+      - uses: rust-lang/crates-io-auth-action@v1
+        id: auth
       - name: Publish
         env:
-          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+          CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token }}
         shell: bash
         run: |
           set -euo pipefail
