@@ -173,6 +173,17 @@ fn write(repo: &Path, rel: &str, content: &str) {
     }
 }
 
+/// An announced app must answer with a 200 status line — a body that merely
+/// contains "200" must not be mistaken for a served app.
+fn assert_served(line: &str) {
+    let response = http_get(app_line_port(line));
+    let status = response.lines().next().unwrap_or_default();
+    assert!(
+        status.contains(" 200 ") || status.ends_with(" 200"),
+        "expected a 200 status line from {line}, got {status:?}"
+    );
+}
+
 // ---- real repositories ----------------------------------------------------
 
 fn node_repo(with_dep: bool) -> TempDir {
@@ -335,7 +346,7 @@ fn real_rust_archives_compile_and_serve() {
     let repo = rust_repo();
     let boot = boot(repo.path(), RUST_BOOT);
     for line in &boot.urls {
-        assert!(http_get(app_line_port(line)).contains("200"));
+        assert_served(line);
     }
     assert_fetched(boot.cache.path(), "rust");
 }
@@ -346,7 +357,7 @@ fn real_node_package_manager_boot() {
     let repo = node_repo(true);
     let boot = boot(repo.path(), BOOT);
     for line in &boot.urls {
-        assert!(http_get(app_line_port(line)).contains("200"));
+        assert_served(line);
     }
     assert_fetched(boot.cache.path(), "node");
 }
@@ -357,7 +368,7 @@ fn real_python_venv_and_django_boot() {
     let repo = django_repo();
     let boot = boot(repo.path(), BOOT);
     for line in &boot.urls {
-        assert!(http_get(app_line_port(line)).contains("200"));
+        assert_served(line);
     }
     assert_fetched(boot.cache.path(), "python");
 }
@@ -368,7 +379,7 @@ fn real_go_compile_and_serve() {
     let repo = go_repo();
     let boot = boot(repo.path(), BOOT);
     for line in &boot.urls {
-        assert!(http_get(app_line_port(line)).contains("200"));
+        assert_served(line);
     }
     assert_fetched(boot.cache.path(), "go");
 }
@@ -400,7 +411,7 @@ fn nested_all_boots_two_real_apps() {
     // so keep reading until a second distinct URL appears.
     let urls = distinct_urls(out, err, urls, BOOT);
     for line in &urls {
-        assert!(http_get(app_line_port(line)).contains("200"));
+        assert_served(line);
     }
     assert_fetched(cache.path(), "node");
     assert_fetched(cache.path(), "python");
