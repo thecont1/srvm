@@ -61,7 +61,8 @@ Prebuilt archives for macOS, Linux, and Windows on both x64 and ARM64 ship with 
 `v0.1.0-rc.1` is the first release carrying prebuilt archives for macOS, Linux, and Windows on both x64 and ARM64, alongside the shell and PowerShell installers:
 
 ```console
-# Linux and macOS
+# Linux (on macOS use the checked front door below: this is the same installer,
+# with the checksum tool it would otherwise look for supplied for it)
 $ curl --proto '=https' --tlsv1.2 -LsSf https://github.com/thecont1/srvm/releases/download/v0.1.0-rc.1/srvm-installer.sh | sh
 
 # Windows
