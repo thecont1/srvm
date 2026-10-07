@@ -104,10 +104,6 @@ Port notes: `--port` sets where the free-port *search* starts, not a hard requir
 
 M0–M7 are implemented and merged (`main` is `507d1c8`, from PR #5). The release-candidate phase is under way: the installer's checksum gap on stock macOS is closed by [`tools/install.sh`](tools/install.sh), which supplies the `sha256sum` the installer looks for so that a tampered download is refused instead of warned through; the `RC verify` workflow installs the *published* artifacts into a throwaway prefix and smokes them on all six native hosts; and crates.io publication runs through a manual, token-based workflow until the crate exists and trusted publishing can take over. The external channels exist as empty repositories (`thecont1/homebrew-srvm`, `thecont1/scoop-bucket`) and stay dormant while `publish-prereleases = false`. What still gates `v0.1.0-rc.1`: a green `RC verify` run against the published artifacts, the dogfood pass recorded on the RC binary, winget validation on both Windows architectures, and the explicit tag approval. No release is published yet — see [`PLAN.md`](PLAN.md) for the gates and approval sequence.
 
-## Acknowledgements
-
-Detection design inspired by [px0](https://github.com/px0-ai/px0) (MIT), whose `serve.go` rule table this project ports and extends.
-
 ## License
 
 MIT — see [LICENSE](LICENSE).
