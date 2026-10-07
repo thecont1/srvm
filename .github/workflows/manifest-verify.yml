@@ -1,18 +1,24 @@
 name: Manifest verify
 
-# Validates the Scoop and winget manifests generated from a published release on
-# Windows, then installs the binary from the local winget manifest and smokes it.
+# Checks the Scoop and winget manifests generated from a published release, on
+# Windows, for both architectures.
 #
-# Dispatch only: the manifests reach the Scoop bucket and winget-pkgs at the
-# stable gate, and those submissions are separately approved. Scoop and winget
-# are Windows tools, so this cannot run on the macOS and Linux runners the rest
-# of the matrix uses.
+# Why not `winget validate`: GitHub's Windows runners do not ship winget (the
+# command is not on PATH), so it cannot run here. Instead this validates the
+# three winget manifests against the official schemas they declare
+# (ManifestVersion 1.6.0), and then performs the install the manifest actually
+# describes — download the InstallerUrl, check it against InstallerSha256,
+# unpack, and run the binary — which is the part a schema cannot prove. The
+# real `winget validate` runs in winget-pkgs CI when the manifest is submitted,
+# and that submission is a separately approved step at the stable gate.
+#
+# Dispatch only: nothing here publishes or submits anything.
 
 on:
   workflow_dispatch:
     inputs:
       tag:
-        description: Published release tag to generate and validate manifests for
+        description: Published release tag to generate and verify manifests for
         required: true
         default: v0.1.0-rc.1
 
@@ -29,8 +35,10 @@ jobs:
         include:
           - label: x64
             runner: windows-2022
+            winget_arch: x64
           - label: arm64
             runner: windows-11-arm
+            winget_arch: arm64
     steps:
       - uses: actions/checkout@v4
         with:
@@ -58,38 +66,65 @@ jobs:
             --repo "${{ github.repository }}" \
             --tag "${{ inputs.tag }}" \
             --out-dir out
+          find out -type f | sort
 
-      - name: Record the generated files
+      - name: Validate the winget manifests against their declared schemas
         shell: bash
-        run: find out -type f | sort
-
-      - name: Validate the winget manifests
-        shell: pwsh
         run: |
-          $version = "${{ inputs.tag }}" -replace '^v', ''
-          $dir = "out/winget/thecont1.srvm/$version"
-          winget validate --manifest $dir
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          set -euo pipefail
+          python3 -m pip install --quiet --disable-pip-version-check check-jsonschema
+          version="${{ inputs.tag }}"
+          version="${version#v}"
+          dir="out/winget/thecont1.srvm/${version}"
+          check-jsonschema --schemafile "https://aka.ms/winget-manifest.version.1.6.0.schema.json" \
+            "${dir}/thecont1.srvm.yaml"
+          check-jsonschema --schemafile "https://aka.ms/winget-manifest.installer.1.6.0.schema.json" \
+            "${dir}/thecont1.srvm.installer.yaml"
+          check-jsonschema --schemafile "https://aka.ms/winget-manifest.defaultLocale.1.6.0.schema.json" \
+            "${dir}/thecont1.srvm.locale.en-US.yaml"
 
-      - name: Install from the local winget manifest and smoke it
-        shell: pwsh
+      - name: Perform the install the manifest describes, then smoke it
+        shell: bash
         run: |
-          $version = "${{ inputs.tag }}" -replace '^v', ''
-          $dir = "out/winget/thecont1.srvm/$version"
-          winget install --manifest $dir --accept-package-agreements `
-            --accept-source-agreements --disable-interactivity
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          $link = Join-Path $env:LOCALAPPDATA 'Microsoft\WinGet\Links\srvm.exe'
-          if (-not (Test-Path $link)) { throw "srvm.exe was not linked at $link" }
-          & $link --version
+          set -euo pipefail
+          python3 - "${{ inputs.tag }}" "${{ matrix.winget_arch }}" <<'PY'
+          import hashlib, pathlib, subprocess, sys, urllib.request, zipfile, yaml
+
+          tag, arch = sys.argv[1], sys.argv[2]
+          version = tag[1:] if tag.startswith("v") else tag
+          manifest = pathlib.Path(f"out/winget/thecont1.srvm/{version}/thecont1.srvm.installer.yaml")
+          entries = yaml.safe_load(manifest.read_text())["Installers"]
+          entry = next(e for e in entries if e["Architecture"] == arch)
+          url, expected = entry["InstallerUrl"], entry["InstallerSha256"]
+          print(f"arch={arch} url={url}")
+
+          archive = pathlib.Path("payload.zip")
+          urllib.request.urlretrieve(url, archive)
+          actual = hashlib.sha256(archive.read_bytes()).hexdigest()
+          assert actual == expected, f"sha256 mismatch: manifest {expected} != download {actual}"
+          print(f"sha256 matches the manifest: {actual}")
+
+          with zipfile.ZipFile(archive) as z:
+              names = z.namelist()
+              print(f"archive contents: {names}")
+              z.extractall("payload")
+
+          exe = next(p for p in pathlib.Path("payload").rglob("srvm.exe"))
+          out = subprocess.run([str(exe), "--version"], capture_output=True, text=True, timeout=60)
+          print(f"binary reported: {out.stdout.strip()!r} (exit {out.returncode})")
+          assert out.returncode == 0 and version in out.stdout, "the installed binary did not report its version"
+          PY
 
       - name: Parse the Scoop manifest
-        shell: pwsh
+        shell: bash
         run: |
-          $m = Get-Content out/scoop/srvm.json -Raw | ConvertFrom-Json
-          "scoop version: $($m.version)"
-          "scoop architectures: $($m.architecture.PSObject.Properties.Name -join ', ')"
-          foreach ($arch in $m.architecture.PSObject.Properties) {
-            if (-not $arch.Value.url) { throw "scoop $($arch.Name) has no url" }
-            if (-not $arch.Value.hash) { throw "scoop $($arch.Name) has no hash" }
-          }
+          set -euo pipefail
+          python3 - <<'PY'
+          import json, pathlib
+          m = json.loads(pathlib.Path("out/scoop/srvm.json").read_text())
+          print("scoop version:", m["version"])
+          for arch, spec in m["architecture"].items():
+              assert spec.get("url"), f"scoop {arch} has no url"
+              assert spec.get("hash"), f"scoop {arch} has no hash"
+              print(f"scoop {arch}: {spec['bin']} <- {spec['url']} {spec['hash'][:24]}...")
+          PY
