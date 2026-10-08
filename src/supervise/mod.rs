@@ -174,7 +174,7 @@ pub fn run_many(items: &[LaunchItem], options: SupervisorOptions) -> Result<()> 
         };
         let sel = match start {
             Some(start) => {
-                let listener = ports::reserve(start)
+                let listener = ports::reserve_requested(start)
                     .with_context(|| format!("could not find a free port starting at {start}"))?;
                 let port = listener.local_addr()?.port();
                 held.push(listener);

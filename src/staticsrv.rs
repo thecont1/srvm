@@ -39,7 +39,7 @@ impl StaticServer {
         }
         let root = Dir::open_ambient_dir(root, cap_std::ambient_authority())
             .with_context(|| format!("cannot open {}", root.display()))?;
-        let listener = ports::reserve(start)?;
+        let listener = ports::reserve_requested(start)?;
         Ok(Self {
             root: Arc::new(root),
             listener,
