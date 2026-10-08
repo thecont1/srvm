@@ -1,7 +1,7 @@
 use std::{
     env,
     io::{Read, Write},
-    net::{SocketAddr, TcpStream},
+    net::{SocketAddr, TcpListener, TcpStream},
     path::{Path, PathBuf},
     process::{Command, Stdio},
     sync::{
@@ -87,6 +87,7 @@ pub fn run(
         &opened,
         app_env,
         &[],
+        None,
     )
 }
 
@@ -156,12 +157,15 @@ pub fn run_many(items: &[LaunchItem], options: SupervisorOptions) -> Result<()> 
         }
     }
 
-    // Hold every reservation while selecting so siblings cannot win the same
-    // port, and release them only right before the workers spawn so installs
-    // never widen the reservation-to-bind gap. With --port N the first app
+    // Reserve every port this launch will use, then move the listener
+    // straight into the worker that owns it. The handoff never re-binds.
+    // Re-binding would matter on Windows: a freshly released socket stays
+    // exclusive while the OS tears it down, so a `ports::reserve` in the
+    // worker would see WSAEACCES, walk to the next free port, and land on a
+    // sibling the launch had already claimed. With --port N the first app
     // starts at N and each later app starts one past the previously selected
     // port; --port 0 is OS-assigned per app.
-    let mut held = Vec::with_capacity(items.len());
+    let mut reservations: Vec<Option<TcpListener>> = Vec::with_capacity(items.len());
     let mut selected = Vec::with_capacity(items.len());
     let mut previous = None;
     for (idx, _) in items.iter().enumerate() {
@@ -177,17 +181,19 @@ pub fn run_many(items: &[LaunchItem], options: SupervisorOptions) -> Result<()> 
                 let listener = ports::reserve_requested(start)
                     .with_context(|| format!("could not find a free port starting at {start}"))?;
                 let port = listener.local_addr()?.port();
-                held.push(listener);
+                reservations.push(Some(listener));
                 Some(port)
             }
-            None => None,
+            None => {
+                reservations.push(None);
+                None
+            }
         };
         if sel.is_some() {
             previous = sel;
         }
         selected.push(sel);
     }
-    drop(held);
     // Every port this launch selected, so a retry can steer clear of siblings.
     let sibling_ports: Vec<u16> = selected.iter().flatten().copied().collect();
 
@@ -199,6 +205,7 @@ pub fn run_many(items: &[LaunchItem], options: SupervisorOptions) -> Result<()> 
             let opened = opened.clone();
             let start = selected[idx];
             let siblings = sibling_ports.clone();
+            let reserved = reservations[idx].take();
             scope.spawn(move || {
                 let result = run_server(
                     &item.candidate.root,
@@ -210,6 +217,7 @@ pub fn run_many(items: &[LaunchItem], options: SupervisorOptions) -> Result<()> 
                     &opened,
                     &item.env,
                     &siblings,
+                    reserved,
                 );
                 let _ = tx.send(result);
             });
@@ -372,9 +380,12 @@ fn run_server(
     opened: &Arc<AtomicBool>,
     app_env: &[(String, String)],
     siblings: &[u16],
+    pre_reserved: Option<TcpListener>,
 ) -> Result<()> {
+    let mut pre_reserved = pre_reserved;
     let mut start = requested;
     for attempt in 0..=HANDOFF_RETRIES {
+        let reserved = pre_reserved.take();
         match serve_attempt(
             root,
             spec,
@@ -386,6 +397,7 @@ fn run_server(
             opened,
             app_env,
             siblings,
+            reserved,
         )? {
             Attempt::Done | Attempt::Stopped => return Ok(()),
             Attempt::Retry { next_start, .. } if attempt < HANDOFF_RETRIES => {
@@ -413,20 +425,32 @@ fn serve_attempt(
     opened: &Arc<AtomicBool>,
     app_env: &[(String, String)],
     siblings: &[u16],
+    pre_reserved: Option<TcpListener>,
 ) -> Result<Attempt> {
     let ring = Arc::new(Mutex::new(Ring::default()));
 
-    let mut reservation = None;
-    let (command, env, selected) = match start {
-        Some(start) => {
-            let listener = ports::reserve(start)
-                .with_context(|| format!("could not find a free port starting at {start}"))?;
+    // A pre-reserved listener from the launch loop is used as-is so the
+    // handoff never has to re-bind to a port the OS may still hold in
+    // TIME_WAIT (Windows is the worst offender — the bind comes back as
+    // WSAEACCES and the walk would land on a sibling's port). Retries
+    // arrive with `pre_reserved = None` and fall through to a fresh
+    // `ports::reserve` against the new `next_start`.
+    let mut reservation = pre_reserved;
+    let (command, env, selected) = match (reservation.as_ref(), start) {
+        (Some(listener), _) => {
             let selected = listener.local_addr()?.port();
-            reservation = Some(listener);
             let (command, env) = ports::apply(spec, selected);
             (command, env, Some(selected))
         }
-        None => (spec.command.clone(), Vec::new(), None),
+        (None, Some(start)) => {
+            let listener = ports::reserve(start)
+                .with_context(|| format!("could not find a free port starting at {start}"))?;
+            let selected = listener.local_addr()?.port();
+            let (command, env) = ports::apply(spec, selected);
+            reservation = Some(listener);
+            (command, env, Some(selected))
+        }
+        (None, None) => (spec.command.clone(), Vec::new(), None),
     };
 
     if let (Some(start), Some(selected)) = (report_start, selected) {
