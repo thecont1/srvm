@@ -59,6 +59,10 @@ covers what it does and how to get it; this file covers how it works.
 - `--port N` sets where the free-port *search* starts; a busy port shifts the
   app forward rather than failing. `--port 0` is OS-assigned per app. Without
   `--port`, each app uses its own framework hint.
+  An explicitly requested port is retried for ~300ms before it counts as
+  busy: Windows refuses a bind with WSAEACCES while it is still tearing down
+  whatever released the port, which is indistinguishable from a real occupant
+  on a first attempt.
 - Reservations are held only across the immediate spawn handoff. A
   reservation stolen mid-handoff retries above every port already selected
   for the launch, never over a sibling's.
@@ -146,6 +150,10 @@ Deliberately minimal:
   workflows, plan, skill, dist config, or release tooling ships in the
   crates.io package.
 - Verified at `v0.1.0`: six-runner artifact install matrix, winget manifest
+  - Verified at `v0.1.2`: all six published archives match their `.sha256`
+    sidecars, the published macOS binary runs and reports `0.1.2`, the Homebrew
+    formula matches the same archives, and `manifest-verify` passes on both
+    Windows architectures.
   schema + real-install smoke on both Windows architectures, 6/6 real-repo
   dogfood, `cargo install --locked srvm`, `brew install thecont1/srvm/srvm`.
 
