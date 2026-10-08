@@ -114,7 +114,25 @@ fn main() {
     } else {
         None
     };
-    let listener = TcpListener::bind(("127.0.0.1", port)).expect("fixture bind failed");
+    // The port this fixture was handed can still be exclusive for a moment while
+    // the OS tears down whatever released it (Windows SO_EXCLUSIVEADDRUSE yields
+    // WSAEACCES), so retry briefly rather than failing the whole fixture on a
+    // transient refusal. Nothing holds the port; it only needs a moment.
+    let mut bound = None;
+    let mut refusal = None;
+    for _ in 0..25 {
+        match TcpListener::bind(("127.0.0.1", port)) {
+            Ok(listener) => {
+                bound = Some(listener);
+                break;
+            }
+            Err(err) => {
+                refusal = Some(err);
+                std::thread::sleep(Duration::from_millis(200));
+            }
+        }
+    }
+    let listener = bound.unwrap_or_else(|| panic!("fixture bind failed: {refusal:?}"));
     drop(excluded);
     let actual = listener.local_addr().unwrap().port();
     if mode != "silent-http" {

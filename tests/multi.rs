@@ -246,11 +246,16 @@ fn all_port_start_allocates_distinct_ascending_ports() {
     assert!(js_port >= start, "{js_port} below requested {start}");
     assert!(py_port >= start, "{py_port} below requested {start}");
     assert_ne!(js_port, py_port, "ports must stay distinct");
-    // Ascending allocation describes the initial selection. If a port was
-    // stolen in the handoff window, the retried app moves above every port the
-    // launch selected, so launch order no longer implies port order and only
-    // distinctness is promised.
-    if !seen.iter().any(|line| line.contains("retrying")) {
+    // Ascending allocation describes the initial selection. It stops implying
+    // port order when an app moves above every port the launch selected: a
+    // handoff retry after a steal ("retrying"), or a refusal while binding its
+    // selection ("busy ->"), which Windows produces transiently when the OS has
+    // not finished tearing down the socket that released the port. Only
+    // distinctness is promised in those cases.
+    let moved = seen
+        .iter()
+        .any(|line| line.contains("retrying") || line.contains("busy ->"));
+    if !moved {
         assert!(py_port > js_port, "{py_port} must follow {js_port}");
     }
 
@@ -317,19 +322,10 @@ fn all_handoff_retry_never_steals_a_sibling_port() {
         Duration::from_secs(30),
     );
     // A just-released reservation can still hold its port exclusively during
-    // socket teardown (Windows SO_EXCLUSIVEADDRUSE), so the steal retries
-    // briefly instead of racing that close.
-    let mut stolen = None;
-    for _ in 0..25 {
-        match TcpListener::bind(("127.0.0.1", npm_reserved)) {
-            Ok(listener) => {
-                stolen = Some(listener);
-                break;
-            }
-            Err(_) => std::thread::sleep(Duration::from_millis(200)),
-        }
-    }
-    let stolen = stolen.expect("steal the npm app's reserved port");
+    // socket teardown (Windows SO_EXCLUSIVEADDRUSE, WSAEACCES), so the steal
+    // retries briefly instead of racing that close.
+    let stolen = support::bind_retrying(npm_reserved, 25, Duration::from_millis(200))
+        .unwrap_or_else(|err| panic!("steal the npm app's reserved port: {err:?}"));
     fs::write(&release, "go").unwrap();
 
     let (seen, line) = wait_for_all_seen(

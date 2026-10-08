@@ -1,4 +1,4 @@
-use std::{io, net::TcpListener, sync::OnceLock};
+use std::{io, net::TcpListener, sync::OnceLock, thread, time::Duration};
 
 use anyhow::Result;
 use regex::Regex;
@@ -30,6 +30,45 @@ pub fn requested_port(
 
 pub fn reserve(start: u16) -> io::Result<TcpListener> {
     bind_available_with(start, |port| TcpListener::bind(("127.0.0.1", port)))
+}
+
+/// Attempts at an explicitly requested port before it is treated as taken.
+const REQUESTED_PORT_ATTEMPTS: u32 = 3;
+/// Wait between those attempts.
+const REQUESTED_PORT_PAUSE: Duration = Duration::from_millis(100);
+
+/// Reserve the port the caller explicitly asked for.
+///
+/// An explicit request deserves a moment of patience: Windows refuses a bind
+/// with WSAEACCES while the OS is still tearing down the socket that released
+/// the port, which on a first attempt is indistinguishable from another process
+/// holding it. Retry the requested port briefly, then fall back to the ordinary
+/// walk so a genuinely occupied port still launches on the next free one.
+pub fn reserve_requested(port: u16) -> io::Result<TcpListener> {
+    reserve_requested_with(
+        port,
+        |port| TcpListener::bind(("127.0.0.1", port)),
+        thread::sleep,
+    )
+}
+
+fn reserve_requested_with<T>(
+    port: u16,
+    mut bind: impl FnMut(u16) -> io::Result<T>,
+    mut pause: impl FnMut(Duration),
+) -> io::Result<T> {
+    for attempt in 0..REQUESTED_PORT_ATTEMPTS {
+        match bind(port) {
+            Ok(bound) => return Ok(bound),
+            Err(err) if is_skippable_bind_error(&err) => {
+                if attempt + 1 < REQUESTED_PORT_ATTEMPTS {
+                    pause(REQUESTED_PORT_PAUSE);
+                }
+            }
+            Err(err) => return Err(err),
+        }
+    }
+    bind_available_with(port, bind)
 }
 
 pub fn apply(spec: &ServeSpec, port: u16) -> (CommandSpec, Vec<(String, String)>) {
@@ -105,6 +144,64 @@ mod tests {
 
     fn spec(port: PortInjection, hint: Option<u16>) -> ServeSpec {
         ServeSpec::new("app", "tool", CommandSpec::new("run", ["it"]), hint, port)
+    }
+
+    #[test]
+    fn reserve_requested_waits_out_a_transient_refusal() {
+        let mut attempts = 0;
+        let mut pauses = 0;
+        let bound = reserve_requested_with(
+            5000,
+            |port| {
+                attempts += 1;
+                if attempts < REQUESTED_PORT_ATTEMPTS {
+                    Err(io::Error::new(io::ErrorKind::PermissionDenied, "not ready"))
+                } else {
+                    Ok(port)
+                }
+            },
+            |_| pauses += 1,
+        )
+        .unwrap();
+        assert_eq!(bound, 5000, "the requested port must win once it opens");
+        assert_eq!(attempts, REQUESTED_PORT_ATTEMPTS);
+        assert_eq!(pauses, REQUESTED_PORT_ATTEMPTS - 1, "wait between attempts");
+    }
+
+    #[test]
+    fn reserve_requested_still_walks_when_the_port_never_opens() {
+        let mut attempts = 0;
+        let bound = reserve_requested_with(
+            5000,
+            |port| {
+                attempts += 1;
+                if port == 5000 {
+                    Err(io::Error::new(io::ErrorKind::AddrInUse, "busy"))
+                } else {
+                    Ok(port)
+                }
+            },
+            |_| {},
+        )
+        .unwrap();
+        assert_eq!(bound, 5001, "an occupied port must still move on");
+        assert!(attempts > REQUESTED_PORT_ATTEMPTS, "retried before walking");
+    }
+
+    #[test]
+    fn reserve_requested_reports_genuine_failures_at_once() {
+        let mut attempts = 0;
+        let err = reserve_requested_with(
+            5000,
+            |_: u16| -> io::Result<u16> {
+                attempts += 1;
+                Err(io::Error::new(io::ErrorKind::AddrNotAvailable, "nope"))
+            },
+            |_| {},
+        )
+        .unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::AddrNotAvailable);
+        assert_eq!(attempts, 1, "a genuine failure is not worth retrying");
     }
 
     #[test]
