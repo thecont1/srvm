@@ -13,6 +13,8 @@ use std::{
     time::{Duration, Instant},
 };
 
+mod support;
+
 #[cfg(unix)]
 use std::process::ExitStatus;
 
@@ -349,7 +351,8 @@ fn stop_joins_and_releases_port() {
     server.stop_and_join(Duration::from_secs(3));
     assert!(began.elapsed() < Duration::from_secs(3));
 
-    TcpListener::bind(("127.0.0.1", port)).expect("port must be rebindable after stop");
+    support::bind_retrying(port, 25, Duration::from_millis(200))
+        .expect("port must be rebindable after stop");
 }
 
 #[test]

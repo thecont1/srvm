@@ -102,6 +102,34 @@ pub fn stub_exec_mode(dir: &Path, name: &str, mode: Option<&str>) {
     }
 }
 
+/// Bind `port`, retrying briefly while the OS finishes tearing down a socket
+/// that has just released it.
+///
+/// Windows keeps a closed listener's port exclusive until teardown completes,
+/// so an immediate rebind fails with WSAEACCES (10013, `PermissionDenied`) even
+/// though nothing holds the port. The product treats that error as skippable
+/// and walks on to another port (`is_skippable_bind_error`), but a test that
+/// means to occupy one specific port has to wait it out instead of racing it.
+///
+/// Returns the last bind error if every attempt fails, so the caller's panic
+/// names the real cause rather than just the intent.
+pub fn bind_retrying(port: u16, attempts: u32, delay: Duration) -> std::io::Result<TcpListener> {
+    let attempts = attempts.max(1);
+    let mut last = None;
+    for attempt in 0..attempts {
+        match TcpListener::bind(("127.0.0.1", port)) {
+            Ok(listener) => return Ok(listener),
+            Err(err) => {
+                last = Some(err);
+                if attempt + 1 < attempts {
+                    thread::sleep(delay);
+                }
+            }
+        }
+    }
+    Err(last.expect("attempts is at least one"))
+}
+
 pub fn free_with_free_next() -> (TcpListener, u16) {
     for _ in 0..25 {
         let held = TcpListener::bind(("127.0.0.1", 0)).unwrap();
