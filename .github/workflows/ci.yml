@@ -20,7 +20,7 @@ jobs:
         os: [macos-latest, ubuntu-latest, windows-latest]
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           persist-credentials: false
       # Pinned to the repo toolchain (rust-toolchain.toml, 1.97.1): the same
