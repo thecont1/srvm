@@ -316,8 +316,20 @@ fn all_handoff_retry_never_steals_a_sibling_port() {
         "fixture waiting before bind",
         Duration::from_secs(30),
     );
-    let stolen =
-        TcpListener::bind(("127.0.0.1", npm_reserved)).expect("steal the npm app's reserved port");
+    // A just-released reservation can still hold its port exclusively during
+    // socket teardown (Windows SO_EXCLUSIVEADDRUSE), so the steal retries
+    // briefly instead of racing that close.
+    let mut stolen = None;
+    for _ in 0..25 {
+        match TcpListener::bind(("127.0.0.1", npm_reserved)) {
+            Ok(listener) => {
+                stolen = Some(listener);
+                break;
+            }
+            Err(_) => std::thread::sleep(Duration::from_millis(200)),
+        }
+    }
+    let stolen = stolen.expect("steal the npm app's reserved port");
     fs::write(&release, "go").unwrap();
 
     let (seen, line) = wait_for_all_seen(
