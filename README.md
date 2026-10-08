@@ -71,9 +71,9 @@ $ powershell -ExecutionPolicy Bypass -c "irm https://github.com/thecont1/srvm/re
 
 The binaries are unsigned. Installs via `cargo`, `brew`, `scoop`, or the
 shell installer are unaffected; if you download an archive through a browser
-or install via PowerShell, the OS may gate the first run (macOS: right-click
-→ Open, or `xattr -d com.apple.quarantine "$(command -v srvm)"`; Windows:
-SmartScreen → More info → Run anyway). Every archive carries a `.sha256`
+or install via PowerShell, the OS may gate the first run — on macOS run
+`xattr -d com.apple.quarantine "$(command -v srvm)"`, on Windows pick
+More info → Run anyway in the SmartScreen dialog. Every archive carries a `.sha256`
 sidecar and a GitHub attestation:
 `gh attestation verify <archive> --repo thecont1/srvm`.
 
