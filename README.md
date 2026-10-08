@@ -69,11 +69,13 @@ $ curl -sSfL https://raw.githubusercontent.com/thecont1/srvm/main/tools/install.
 $ powershell -ExecutionPolicy Bypass -c "irm https://github.com/thecont1/srvm/releases/latest/download/srvm-installer.ps1 | iex"
 ```
 
-**Unsigned binaries:** the project has no signing certificate, so the first
-run is gated by the OS. On macOS, right-click → Open (or
-`xattr -d com.apple.quarantine "$(command -v srvm)"`); on Windows, SmartScreen
-→ More info → Run anyway. Every download is SHA-256 verified during install,
-and `gh attestation verify <archive> --repo thecont1/srvm` proves provenance.
+The binaries are unsigned. Installs via `cargo`, `brew`, `scoop`, or the
+shell installer are unaffected; if you download an archive through a browser
+or install via PowerShell, the OS may gate the first run (macOS: right-click
+→ Open, or `xattr -d com.apple.quarantine "$(command -v srvm)"`; Windows:
+SmartScreen → More info → Run anyway). Every archive carries a `.sha256`
+sidecar and a GitHub attestation:
+`gh attestation verify <archive> --repo thecont1/srvm`.
 
 ## Use
 
