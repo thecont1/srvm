@@ -1,5 +1,9 @@
 # srvm
 
+अहं सर्वं उन्नतां स्थितिं नयामि।
+Ahaṃ sarvaṃ unnatāṃ sthitiṃ nayāmi.
+"I take everything to the elevated state."
+
 **`srvm` launches an app from within any project's directory or repo.** 
 No reading the repo's docs for the right command, no remembering whether 
 this one wanted `bun run dev` or `cargo run`. Let `srvm` figure it out, 
