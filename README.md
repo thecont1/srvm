@@ -21,7 +21,7 @@ The common case — one project at the root, one URL back.
 
 ```console
 $ cd ~/projects/my-app && srvm
-  srvm 0.1.2
+  srvm 0.1.3
   workspace  ~/projects/my-app
   serve      npm run dev (npm)
   step       installing dependencies — npm install
@@ -39,7 +39,7 @@ launching either, and stops both on Ctrl+C.
 
 ```console
 $ cd ~/projects/ai-app && srvm
-  srvm 0.1.2
+  srvm 0.1.3
   workspace  ~/projects/ai-app
   serve      [frontend] npm run dev (npm)
   serve      [backend] python3 manage.py runserver (python)

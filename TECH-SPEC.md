@@ -154,6 +154,9 @@ Deliberately minimal:
     sidecars, the published macOS binary runs and reports `0.1.2`, the Homebrew
     formula matches the same archives, and `manifest-verify` passes on both
     Windows architectures.
+  - `v0.1.3` release: fixes infinite recursion when srvm runs in its own Cargo
+    workspace (`rule_cargo` skips Cargo packages whose name matches
+    `CARGO_PKG_NAME`); plus `cargo fmt` compliance and Windows CI test stability.
   schema + real-install smoke on both Windows architectures, 6/6 real-repo
   dogfood, `cargo install --locked srvm`, `brew install thecont1/srvm/srvm`.
 
