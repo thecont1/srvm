@@ -19,6 +19,38 @@ pub fn file_contains(root: &Path, rel: &str, needle: &str) -> bool {
         .unwrap_or(false)
 }
 
+/// Reads the `package.name` from a `Cargo.toml` using a lossy, line-based scan,
+/// so a malformed or oversized manifest degrades to `None` instead of failing the
+/// whole detection pass. This is just for self-identification — srvm must not
+/// launch itself — not for authoring or publishing Cargo metadata.
+pub fn cargo_package_name(root: &Path) -> Option<String> {
+    let text = read_lossy(root, "Cargo.toml")?;
+    let mut in_package = false;
+    for raw in text.lines() {
+        let line = raw.split('#').next().unwrap_or("").trim();
+        if line.starts_with('[') {
+            // Only `[package]` owns a top-level `name`; a virtual workspace
+            // (`[workspace]`) has none and the rule's `src/main.rs` guard
+            // already keeps it from matching here anyway.
+            in_package = line == "[package]";
+            continue;
+        }
+        if !in_package {
+            continue;
+        }
+        if let Some(rest) = line.strip_prefix("name") {
+            let rest = rest.trim_start();
+            if let Some(rest) = rest.strip_prefix('=') {
+                let value = rest.trim().trim_matches('"');
+                if !value.is_empty() {
+                    return Some(value.to_string());
+                }
+            }
+        }
+    }
+    None
+}
+
 pub fn read_to_string(root: &Path, rel: &str) -> Result<String> {
     let path = root.join(rel);
     let len = fs::metadata(&path)?.len();
@@ -139,7 +171,46 @@ fn read_capped(path: &Path) -> Result<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::strip_jsonc;
+    use super::{cargo_package_name, strip_jsonc};
+
+    #[test]
+    fn cargo_package_name_reads_the_manifest_package_name() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("Cargo.toml"),
+            "[package]\nname = \"srvm\"\nversion = \"0.1.2\"\n",
+        )
+        .unwrap();
+        assert_eq!(cargo_package_name(dir.path()), Some("srvm".to_string()));
+    }
+
+    #[test]
+    fn cargo_package_name_ignores_a_name_outside_package() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("Cargo.toml"),
+            "// leading comment\n[workspace]\nname = \"workspace-name\"\n[package]\nname = \"app\"\n",
+        )
+        .unwrap();
+        assert_eq!(cargo_package_name(dir.path()), Some("app".to_string()));
+    }
+
+    #[test]
+    fn cargo_package_name_handles_inline_tables_and_spacing() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("Cargo.toml"),
+            "[package] # comment\n  name   =   \"app\"  # trailing\n",
+        )
+        .unwrap();
+        assert_eq!(cargo_package_name(dir.path()), Some("app".to_string()));
+    }
+
+    #[test]
+    fn cargo_package_name_missing_manifest_is_none() {
+        let dir = tempfile::tempdir().unwrap();
+        assert_eq!(cargo_package_name(dir.path()), None);
+    }
 
     #[test]
     fn strips_comments_and_trailing_commas() {

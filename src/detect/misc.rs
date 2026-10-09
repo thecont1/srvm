@@ -215,6 +215,13 @@ fn rule_trunk(root: &Path, resolver: &dyn ToolResolver) -> Option<ServeSpec> {
 
 fn rule_cargo(root: &Path, resolver: &dyn ToolResolver) -> Option<ServeSpec> {
     if probe::file_exists(root, "Cargo.toml") && probe::file_exists(root, "src/main.rs") {
+        // srvm must never launch itself. Detecting its own crate here would
+        // spawn `cargo run`, which rebuilds and re-runs srvm in the same
+        // directory — an infinite recursion. Skip any Cargo project whose
+        // package name is the running binary's own.
+        if probe::cargo_package_name(root) == Some(env!("CARGO_PKG_NAME").into()) {
+            return None;
+        }
         return command_if_resolved(resolver, root, "cargo", ["run"]).map(|command| {
             ServeSpec::new(
                 "cargo",
@@ -317,10 +324,42 @@ mod tests {
     fn detects_static_site() {
         let dir = tempdir().unwrap();
         std::fs::write(dir.path().join("index.html"), "hello").unwrap();
-
         let specs = rules(dir.path(), &StubResolver::default()).unwrap();
-
         assert_eq!(specs[0].name, "static");
         assert!(specs[0].is_static);
+    }
+
+    #[test]
+    fn cargo_rule_skips_srvm_itself() {
+        // A Cargo project whose package name is the running binary's own would
+        // otherwise spawn `cargo run`, which rebuilds and re-runs srvm in the
+        // same directory — an infinite recursion.
+        let dir = tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("src")).unwrap();
+        std::fs::write(
+            dir.path().join("Cargo.toml"),
+            "[package]\nname = \"srvm\"\n",
+        )
+        .unwrap();
+        std::fs::write(dir.path().join("src/main.rs"), "fn main() {}\n").unwrap();
+        let specs = rules(dir.path(), &StubResolver::with(&["cargo"])).unwrap();
+        assert!(
+            !specs.iter().any(|spec| spec.name == "cargo"),
+            "srvm must not detect its own crate: {specs:#?}"
+        );
+    }
+
+    #[test]
+    fn cargo_rule_still_detects_unrelated_rust_apps() {
+        let dir = tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("src")).unwrap();
+        std::fs::write(
+            dir.path().join("Cargo.toml"),
+            "[package]\nname = \"hello\"\n",
+        )
+        .unwrap();
+        std::fs::write(dir.path().join("src/main.rs"), "fn main() {}\n").unwrap();
+        let specs = rules(dir.path(), &StubResolver::with(&["cargo"])).unwrap();
+        assert_eq!(specs.iter().find(|s| s.name == "cargo").unwrap().command_line(), "cargo run");
     }
 }
