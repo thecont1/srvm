@@ -360,6 +360,13 @@ mod tests {
         .unwrap();
         std::fs::write(dir.path().join("src/main.rs"), "fn main() {}\n").unwrap();
         let specs = rules(dir.path(), &StubResolver::with(&["cargo"])).unwrap();
-        assert_eq!(specs.iter().find(|s| s.name == "cargo").unwrap().command_line(), "cargo run");
+        assert_eq!(
+            specs
+                .iter()
+                .find(|s| s.name == "cargo")
+                .unwrap()
+                .command_line(),
+            "cargo run"
+        );
     }
 }
