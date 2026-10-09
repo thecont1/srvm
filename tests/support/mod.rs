@@ -130,18 +130,33 @@ pub fn bind_retrying(port: u16, attempts: u32, delay: Duration) -> std::io::Resu
     Err(last.expect("attempts is at least one"))
 }
 
+/// Returns a listener holding an OS-assigned port, along with that port
+/// number, verifying that `port + 1` *and* `port + 2` are also free.
+///
+/// Two-app launch tests point srvm at `port`: srvm keeps `port` held
+/// (occupied by a sibling or the test itself) and walks forward to
+/// `port + 1` for the first app and `port + 2` for the second. Verifying
+/// both successors up front closes the gap where Windows' ephemeral port
+/// range or a just-released socket let another process claim `port + 2`
+/// between the probe and srvm's reservation — which made the strict
+/// `py_port == py_reserved` assertion in `all_handoff_retry_never_steals_a_sibling_port`
+/// flaky on Windows CI.
 pub fn free_with_free_next() -> (TcpListener, u16) {
     for _ in 0..25 {
         let held = TcpListener::bind(("127.0.0.1", 0)).unwrap();
         let port = held.local_addr().unwrap().port();
-        if port == u16::MAX {
+        // Need headroom for two successors after `port`; skip ports too close
+        // to the u16 ceiling to avoid overflow on `port + 2`.
+        if port > u16::MAX - 2 {
             continue;
         }
-        if TcpListener::bind(("127.0.0.1", port + 1)).is_ok() {
+        if TcpListener::bind(("127.0.0.1", port + 1)).is_ok()
+            && TcpListener::bind(("127.0.0.1", port + 2)).is_ok()
+        {
             return (held, port);
         }
     }
-    panic!("could not find a free port with a free successor");
+    panic!("could not find a free port with two free successors");
 }
 
 pub fn line_reader(stream: impl Read + Send + 'static) -> mpsc::Receiver<String> {
