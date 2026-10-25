@@ -7,5 +7,16 @@ fn main() -> Result<()> {
     if srvm::supervise::shutdown_requested() {
         std::process::exit(130);
     }
-    outcome
+    match outcome {
+        Ok(()) => Ok(()),
+        // Exit honesty (TECH-SPEC): propagate the child's own nonzero code so
+        // a supervising script can tell "the app exited 7" from "srvm failed".
+        Err(err) => {
+            if let Some(code) = srvm::supervise::take_child_exit_code() {
+                eprintln!("Error: {err:#}");
+                std::process::exit(code);
+            }
+            Err(err)
+        }
+    }
 }

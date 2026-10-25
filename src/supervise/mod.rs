@@ -6,7 +6,7 @@ use std::{
     process::{Command, Stdio},
     sync::{
         Arc, Mutex, OnceLock,
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicI32, Ordering},
         mpsc,
     },
     thread,
@@ -33,6 +33,30 @@ use ring::Ring;
 static CURRENT_CHILDREN: OnceLock<Arc<Mutex<Vec<u32>>>> = OnceLock::new();
 static STATIC_STOP: OnceLock<Arc<AtomicBool>> = OnceLock::new();
 static SHUTDOWN: AtomicBool = AtomicBool::new(false);
+/// The child's own nonzero exit code, recorded when a child dies so `main`
+/// can exit with it (TECH-SPEC: "the child's original nonzero code on
+/// failure"). The first terminal failure's code wins; a code recorded for a
+/// transient handoff retry is deliberately skipped.
+static CHILD_EXIT_CODE: OnceLock<AtomicI32> = OnceLock::new();
+
+/// The exit code `main` should return when the run ended in a child failure.
+/// `None` means no child failed (srvm failed on its own, or succeeded).
+pub fn take_child_exit_code() -> Option<i32> {
+    let code = CHILD_EXIT_CODE.get()?.load(Ordering::SeqCst);
+    (code != 0).then_some(code)
+}
+
+/// Records a child's exit code the first time one terminates nonzero.
+fn record_child_exit(status: &std::process::ExitStatus) {
+    let Some(code) = status.code() else {
+        return;
+    };
+    if code == 0 {
+        return;
+    }
+    let cell = CHILD_EXIT_CODE.get_or_init(|| AtomicI32::new(0));
+    let _ = cell.compare_exchange(0, code, Ordering::SeqCst, Ordering::SeqCst);
+}
 
 /// Whether a signal has already asked this run to stop. The shutdown path uses
 /// it so an interrupted run reports 130 even when the app's own death reaches
@@ -317,6 +341,14 @@ fn run_install(
     label: Option<&str>,
     app_env: &[(String, String)],
 ) -> Result<()> {
+    // A symlinked `node_modules` sends the install's bytes outside the
+    // workspace; say where, instead of writing through the link silently.
+    if let Some(target) = crate::bootstrap::node_modules_symlink_target(root) {
+        eprintln!(
+            "  note       node_modules is a symlink to {}; installs write outside the workspace",
+            target.display()
+        );
+    }
     let ring = Arc::new(Mutex::new(Ring::default()));
     let mut child = spawn(command, root, &child_env(app_env, &[]), path_prepend)?;
     register_child(child.id());
@@ -331,6 +363,7 @@ fn run_install(
             if status.success() {
                 return Ok(());
             }
+            record_child_exit(&status);
             return Err(error_with_tail(
                 format!("install command failed: {}", command.command_line()),
                 &ring,
@@ -511,6 +544,11 @@ fn serve_attempt(
                 }
                 return Ok(Attempt::Done);
             }
+
+            // Record the child's code the moment it dies nonzero, so the exit
+            // contract holds whether this failure is terminal or exhausts the
+            // handoff retries below.
+            record_child_exit(&status);
 
             let err = if started.elapsed() < Duration::from_secs(3) {
                 error_with_tail(
