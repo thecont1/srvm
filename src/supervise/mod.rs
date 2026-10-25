@@ -343,10 +343,12 @@ fn run_install(
 ) -> Result<()> {
     // A symlinked `node_modules` sends the install's bytes outside the
     // workspace; say where, instead of writing through the link silently.
-    if let Some(target) = crate::bootstrap::node_modules_symlink_target(root) {
+    if !options.quiet
+        && let Some(target) = crate::bootstrap::node_modules_symlink_target(root)
+    {
         eprintln!(
             "  note       node_modules is a symlink to {}; installs write outside the workspace",
-            target.display()
+            scan::sanitize_display(&target.to_string_lossy())
         );
     }
     let ring = Arc::new(Mutex::new(Ring::default()));
@@ -399,7 +401,11 @@ const PROBE_INTERVAL: Duration = Duration::from_secs(3);
 enum Attempt {
     Done,
     Stopped,
-    Retry { next_start: u16, err: anyhow::Error },
+    Retry {
+        next_start: u16,
+        err: anyhow::Error,
+        status: std::process::ExitStatus,
+    },
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -440,7 +446,10 @@ fn run_server(
                 );
                 start = Some(next_start);
             }
-            Attempt::Retry { err, .. } => return Err(err),
+            Attempt::Retry { err, status, .. } => {
+                record_child_exit(&status);
+                return Err(err);
+            }
         }
     }
     unreachable!()
@@ -545,10 +554,9 @@ fn serve_attempt(
                 return Ok(Attempt::Done);
             }
 
-            // Record the child's code the moment it dies nonzero, so the exit
-            // contract holds whether this failure is terminal or exhausts the
-            // handoff retries below.
-            record_child_exit(&status);
+            // Record the child's code only on a terminal failure, never for a
+            // transient handoff retry: a retry that later succeeds must not
+            // leave a stale exit code behind.
 
             let err = if started.elapsed() < Duration::from_secs(3) {
                 error_with_tail(
@@ -572,8 +580,15 @@ fn serve_attempt(
                 None
             };
             if let Some(next_start) = retry {
-                return Ok(Attempt::Retry { next_start, err });
+                // Carry the status so the caller can record it only when the
+                // handoff retries are exhausted.
+                return Ok(Attempt::Retry {
+                    next_start,
+                    err,
+                    status,
+                });
             }
+            record_child_exit(&status);
             return Err(err);
         }
 
