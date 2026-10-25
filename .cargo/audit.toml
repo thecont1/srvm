@@ -1,0 +1,20 @@
+# cargo-audit configuration.
+#
+# The three `zip` advisories below are not reachable in srvm: it never calls
+# `ZipArchive::extract()` (or the stream extractor). It walks entries with
+# `enclosed_name()` and writes them with `File::create`, so the vulnerable
+# code paths — SUID/SGID preservation, symlink escape, and permission-follow
+# during extraction — are never exercised. See `runtime/archive.rs` and audit
+# finding F-06. Bumping `zip` to the patched 9.x line is a breaking major
+# change with no benefit here, so the advisories are ignored rather than the
+# dependency upgraded.
+
+[advisories]
+ignore = [
+    # zip: SUID/SGID bits preserved during ZipArchive::extract()
+    "RUSTSEC-2026-0367",
+    # zip: extract() creates symlinks whose targets escape the destination
+    "RUSTSEC-2026-0368",
+    # zip: extract() applies permissions through symlinks without confinement
+    "RUSTSEC-2026-0369",
+]

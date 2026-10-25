@@ -2,8 +2,10 @@ name: CI
 
 # The test job executes dependency build scripts; keep the default token out
 # of .git/config (persist-credentials below) and limited to reading the repo.
+# `checks: write` lets the RustSec audit-check action publish its check run.
 permissions:
   contents: read
+  checks: write
 
 on:
   push:
