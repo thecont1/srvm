@@ -2,10 +2,8 @@ name: CI
 
 # The test job executes dependency build scripts; keep the default token out
 # of .git/config (persist-credentials below) and limited to reading the repo.
-# `checks: write` lets the RustSec audit-check action publish its check run.
 permissions:
   contents: read
-  checks: write
 
 on:
   push:
@@ -39,6 +37,11 @@ jobs:
   audit:
     name: Dependency audit
     runs-on: ubuntu-latest
+    # `checks: write` lets rustsec/audit-check publish its check run; scoped to
+    # this job so the test matrix keeps least privilege.
+    permissions:
+      contents: read
+      checks: write
     steps:
       - uses: actions/checkout@v7
         with:
