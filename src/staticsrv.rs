@@ -202,7 +202,7 @@ fn handle_connection(
         return respond_error(&mut stream, 403, head, "", stop);
     }
 
-    let (rel, had_slash) = match decode_target(&request.target) {
+    let (rel, had_slash) = match decode_target(&request.target, port) {
         Ok(pair) => pair,
         Err(code) => return respond_error(&mut stream, code, head, "", stop),
     };
@@ -358,19 +358,25 @@ fn host_allowed(host: &str, port: u16) -> bool {
     }
 }
 
-fn decode_target(target: &str) -> std::result::Result<(PathBuf, bool), u16> {
+fn decode_target(target: &str, port: u16) -> std::result::Result<(PathBuf, bool), u16> {
     let raw_path = target.split_once('?').map(|(p, _)| p).unwrap_or(target);
     // Absolute-form request target (RFC 9112 §3.2.2): `http://host[:port]/…`.
-    // The Host header is validated separately, so only the path after the
-    // authority matters here; a scheme without a path is malformed.
+    // The target's own authority is validated against the loopback and bound
+    // port before serving, so `serve_path` can never reflect an unvalidated
+    // authority into a `Location` header. A scheme without a path is malformed.
     let raw_path = match raw_path
         .strip_prefix("http://")
         .or_else(|| raw_path.strip_prefix("https://"))
     {
-        Some(after_scheme) => match after_scheme.find('/') {
-            Some(idx) => &after_scheme[idx..],
-            None => return Err(400),
-        },
+        Some(after_scheme) => {
+            let Some(idx) = after_scheme.find('/') else {
+                return Err(400);
+            };
+            if !host_allowed(&after_scheme[..idx], port) {
+                return Err(403);
+            }
+            &after_scheme[idx..]
+        }
         None => raw_path,
     };
     if !raw_path.starts_with('/')
@@ -502,7 +508,11 @@ fn serve_path(
         (false, None) => return respond_error(stream, 404, head, "", stop),
     };
 
-    let file_path = if meta.is_dir() {
+    // `follow_leaf` is true only for the index.html exception: a symlinked
+    // index is served through its target (which may escape the served root),
+    // resolved with `std::fs`. Ordinary files stay anchored to the `Dir`
+    // capability, matching the `root.symlink_metadata` checks above.
+    let (file_path, follow_leaf) = if meta.is_dir() {
         let index = rel.join("index.html");
         // Follow a symlinked *leaf* here: discovery accepts a symlinked
         // `index.html` (`is_file` follows links), so the server must serve it
@@ -526,19 +536,26 @@ fn serve_path(
             let extra = format!("Location: {location}\r\n");
             return respond(stream, head, 308, None, &extra, Body::Empty, stop);
         }
-        index
+        (index, true)
     } else if meta.is_file() {
         if had_slash {
             return respond_error(stream, 404, head, "", stop);
         }
-        rel.to_path_buf()
+        (rel.to_path_buf(), false)
     } else {
         return respond_error(stream, 404, head, "", stop);
     };
 
-    let file = match open_leaf(&root_path.join(&file_path)) {
-        Ok(file) => file,
-        Err(_) => return respond_error(stream, 404, head, "", stop),
+    let file = if follow_leaf {
+        match open_leaf(&root_path.join(&file_path)) {
+            Ok(file) => file,
+            Err(_) => return respond_error(stream, 404, head, "", stop),
+        }
+    } else {
+        match root.open_with(&file_path, &open_options()) {
+            Ok(file) => file,
+            Err(_) => return respond_error(stream, 404, head, "", stop),
+        }
     };
     let meta = match file.metadata() {
         Ok(meta) if meta.file_type().is_file() => meta,
@@ -554,6 +571,23 @@ fn serve_path(
         Body::File(file, meta.len()),
         stop,
     )
+}
+
+/// Opens a file anchored to the `Dir` capability, matching the component loop
+/// above. `O_NONBLOCK` keeps a check-to-open FIFO swap from blocking a worker.
+#[cfg(unix)]
+fn open_options() -> cap_std::fs::OpenOptions {
+    use cap_std::fs::OpenOptionsExt;
+    let mut options = cap_std::fs::OpenOptions::new();
+    options.read(true).custom_flags(libc::O_NONBLOCK);
+    options
+}
+
+#[cfg(not(unix))]
+fn open_options() -> cap_std::fs::OpenOptions {
+    let mut options = cap_std::fs::OpenOptions::new();
+    options.read(true);
+    options
 }
 
 /// Opens a file to serve, following a symlink in the final component. The
@@ -742,31 +776,50 @@ mod tests {
 
     #[test]
     fn decode_accepts_plain_and_encoded_paths() {
-        assert_eq!(decode_target("/").unwrap(), (PathBuf::new(), true));
+        assert_eq!(decode_target("/", 8080).unwrap(), (PathBuf::new(), true));
         assert_eq!(
-            decode_target("/a/b.txt?x=1").unwrap(),
+            decode_target("/a/b.txt?x=1", 8080).unwrap(),
             (PathBuf::from("a/b.txt"), false)
         );
         assert_eq!(
-            decode_target("/a%20b/caf%C3%A9.txt").unwrap(),
+            decode_target("/a%20b/caf%C3%A9.txt", 8080).unwrap(),
             (PathBuf::from("a b/café.txt"), false)
         );
         assert_eq!(
-            decode_target("/docs/?y=2").unwrap(),
+            decode_target("/docs/?y=2", 8080).unwrap(),
             (PathBuf::from("docs"), true)
         );
         assert_eq!(
-            decode_target("/a+b.txt").unwrap().0,
+            decode_target("/a+b.txt", 8080).unwrap().0,
             PathBuf::from("a+b.txt")
         );
         assert_eq!(
-            decode_target("/docs%2f").unwrap(),
+            decode_target("/docs%2f", 8080).unwrap(),
             (PathBuf::from("docs"), true)
         );
         assert_eq!(
-            decode_target("/a%2Fb.txt").unwrap(),
+            decode_target("/a%2Fb.txt", 8080).unwrap(),
             (PathBuf::from("a/b.txt"), false)
         );
+    }
+
+    #[test]
+    fn absolute_form_target_authority_must_be_loopback() {
+        // A loopback authority matching the bound port is accepted.
+        assert_eq!(
+            decode_target("http://127.0.0.1:8080/", 8080).unwrap(),
+            (PathBuf::new(), true)
+        );
+        assert_eq!(
+            decode_target("http://127.0.0.1:8080/docs", 8080).unwrap(),
+            (PathBuf::from("docs"), false)
+        );
+        // A foreign or wrong-port authority is refused, so it can never reach
+        // a Location header.
+        assert_eq!(decode_target("http://evil.com/", 8080), Err(403));
+        assert_eq!(decode_target("http://127.0.0.1:9090/", 8080), Err(403));
+        // A scheme with no path component is malformed.
+        assert_eq!(decode_target("http://127.0.0.1:8080", 8080), Err(400));
     }
 
     #[test]
@@ -796,7 +849,7 @@ mod tests {
             ("/COM1", 404),
             ("/lpt9.png", 404),
         ] {
-            assert_eq!(decode_target(target), Err(code), "{target}");
+            assert_eq!(decode_target(target, 8080), Err(code), "{target}");
         }
     }
 
