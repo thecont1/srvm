@@ -60,6 +60,24 @@ jobs:
         with:
           persist-credentials: false
           submodules: recursive
+      - name: Confirm the manifest version matches the tag
+        if: ${{ !github.event.pull_request }}
+        shell: bash
+        # The tag reaches the script through the environment, never through the
+        # script source. A moved/renamed tag must not release a version that
+        # does not match what is in Cargo.toml.
+        env:
+          TAG: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          want="${TAG#v}"
+          got="$(cargo metadata --no-deps --format-version 1 \
+            | python3 -c 'import json,sys; print(json.load(sys.stdin)["packages"][0]["version"])')"
+          if [ "$got" != "$want" ]; then
+            echo "tag $TAG does not match the Cargo.toml version $got" >&2
+            exit 1
+          fi
+          echo "release tag $TAG matches Cargo.toml version $got"
       - name: Install dist
         # we specify bash to get pipefail; it guards against the `curl` command
         # failing. otherwise `sh` won't catch that `curl` returned non-0
