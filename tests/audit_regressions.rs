@@ -220,12 +220,31 @@ fn node_routes(archive: &[u8], digest: &str) -> HashMap<String, Vec<u8>> {
 /// in and satisfy the fetch from outside the fixture.
 fn scrubbed(path: &Path, home: &Path, cache: &Path) -> AssertCommand {
     let mut cmd = AssertCommand::cargo_bin("srvm").unwrap();
-    cmd.env("PATH", path)
+    // Clear the whole environment rather than override individual variables:
+    // on Windows an ambient toolchain leaks in through probes beyond PATH
+    // (Program Files, the toolcache on `Path`, LOCALAPPDATA) and case-
+    // insensitive environment lookup makes selective scrubbing unreliable.
+    cmd.env_clear()
+        .env("PATH", path)
         .env("HOME", home)
         .env("USERPROFILE", home)
-        .env("SRVM_CACHE_DIR", cache)
-        .env_remove("PORT");
+        .env("SRVM_CACHE_DIR", cache);
+    // Winsock cannot initialize without SystemRoot (os error 10106); forward
+    // the system root when the host provides one (it only exists on Windows).
+    if let Some(system_root) = std::env::var_os("SystemRoot") {
+        cmd.env("SystemRoot", system_root);
+    }
     cmd
+}
+
+/// Everything the child emitted, for assertion failures.
+fn show(out: &std::process::Output) -> String {
+    format!(
+        "exit: {:?}\n--- stdout ---\n{}\n--- stderr ---\n{}",
+        out.status.code(),
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    )
 }
 
 /// One raw HTTP exchange; nothing is normalised by a client library.
@@ -467,7 +486,7 @@ fn no_install_still_downloads_a_missing_runtime() {
     let cache = tempdir().unwrap();
     let home = tempdir().unwrap();
     let path = tempdir().unwrap();
-    scrubbed(path.path(), home.path(), cache.path())
+    let out = scrubbed(path.path(), home.path(), cache.path())
         .env("SRVM_NODE_INDEX_URL", format!("{base}/index.json"))
         .arg("--no-open")
         .arg("--no-install")
@@ -485,7 +504,8 @@ fn no_install_still_downloads_a_missing_runtime() {
         .join(".srvm-ok");
     assert!(
         installed.is_file(),
-        "a runtime was downloaded and published despite --no-install: {filename}"
+        "a runtime was downloaded and published despite --no-install: {filename}\n{}",
+        show(&out)
     );
 }
 
@@ -616,7 +636,7 @@ fn archive_member_with_parent_dir_is_refused() {
         .output()
         .unwrap();
     let stderr = String::from_utf8_lossy(&out.stderr);
-    assert!(stderr.contains("refusing archive entry"), "{stderr}");
+    assert!(stderr.contains("refusing archive entry"), "{}", show(&out));
     assert!(
         !cache
             .path()
@@ -643,7 +663,7 @@ fn archive_escaping_symlink_is_refused() {
         .output()
         .unwrap();
     let stderr = String::from_utf8_lossy(&out.stderr);
-    assert!(stderr.contains("refusing symlink"), "{stderr}");
+    assert!(stderr.contains("refusing symlink"), "{}", show(&out));
 }
 
 /// A checksum mismatch is detected before anything is unpacked or published.
@@ -663,7 +683,7 @@ fn checksum_mismatch_publishes_nothing() {
         .output()
         .unwrap();
     let stderr = String::from_utf8_lossy(&out.stderr);
-    assert!(stderr.contains("checksum mismatch"), "{stderr}");
+    assert!(stderr.contains("checksum mismatch"), "{}", show(&out));
     assert!(
         !cache
             .path()
