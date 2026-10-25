@@ -16,8 +16,8 @@ use cap_std::fs::Dir;
 
 use crate::ports;
 
-const WORKERS: usize = 4;
-const QUEUE_CAPACITY: usize = 32;
+const WORKERS: usize = 16;
+const QUEUE_CAPACITY: usize = 128;
 const MAX_HEADER_BYTES: usize = 16 * 1024;
 const MAX_HEADERS: usize = 64;
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
@@ -27,6 +27,10 @@ const STREAM_CHUNK: usize = 64 * 1024;
 
 pub struct StaticServer {
     root: Arc<Dir>,
+    /// The served root's filesystem path, kept for the one place the server
+    /// must follow a symlink that escapes the `Dir` capability: the `index.html`
+    /// leaf (see `serve_path`).
+    root_path: Arc<PathBuf>,
     listener: TcpListener,
 }
 
@@ -37,11 +41,13 @@ impl StaticServer {
         if !meta.is_dir() {
             bail!("{} is not a directory", root.display());
         }
+        let root_path = root.canonicalize().unwrap_or_else(|_| root.to_path_buf());
         let root = Dir::open_ambient_dir(root, cap_std::ambient_authority())
             .with_context(|| format!("cannot open {}", root.display()))?;
         let listener = ports::reserve_requested(start)?;
         Ok(Self {
             root: Arc::new(root),
+            root_path: Arc::new(root_path),
             listener,
         })
     }
@@ -64,8 +70,9 @@ impl StaticServer {
                     .spawn_scoped(scope, {
                         let rx = Arc::clone(&rx);
                         let root = Arc::clone(&self.root);
+                        let root_path = Arc::clone(&self.root_path);
                         let stop = Arc::clone(&stop);
-                        move || worker_loop(rx, root, port, stop)
+                        move || worker_loop(rx, root, root_path, port, stop)
                     });
                 match spawned {
                     Ok(handle) => workers.push(handle),
@@ -101,7 +108,23 @@ fn accept_loop(
                     continue;
                 }
                 match tx.try_send(stream) {
-                    Ok(()) | Err(mpsc::TrySendError::Full(_)) => {}
+                    Ok(()) => {}
+                    Err(mpsc::TrySendError::Full(mut stream)) => {
+                        // Answer instead of resetting: a saturated queue must
+                        // yield a response, not a dropped connection. Written
+                        // best-effort with a short write budget so a client
+                        // that never reads cannot stall the accept loop.
+                        let _ = stream.set_write_timeout(Some(WRITE_TIMEOUT));
+                        let body = "503 Service Unavailable\n";
+                        let head = format!(
+                            "HTTP/1.1 503 Service Unavailable\r\nConnection: close\r\n\
+                             Cache-Control: no-store\r\nRetry-After: 1\r\n\
+                             Content-Type: text/plain\r\nContent-Length: {}\r\n\r\n",
+                            body.len()
+                        );
+                        let _ = stream.write_all(head.as_bytes());
+                        let _ = stream.write_all(body.as_bytes());
+                    }
                     Err(mpsc::TrySendError::Disconnected(_)) => return Ok(()),
                 }
             }
@@ -117,6 +140,7 @@ fn accept_loop(
 fn worker_loop(
     rx: Arc<Mutex<mpsc::Receiver<TcpStream>>>,
     root: Arc<Dir>,
+    root_path: Arc<PathBuf>,
     port: u16,
     stop: Arc<AtomicBool>,
 ) {
@@ -132,7 +156,7 @@ fn worker_loop(
                 Err(mpsc::RecvTimeoutError::Disconnected) => return,
             }
         };
-        let _ = handle_connection(stream, &root, port, &stop);
+        let _ = handle_connection(stream, &root, &root_path, port, &stop);
     }
 }
 
@@ -150,6 +174,7 @@ enum RequestError {
 fn handle_connection(
     mut stream: TcpStream,
     root: &Dir,
+    root_path: &Path,
     port: u16,
     stop: &AtomicBool,
 ) -> io::Result<()> {
@@ -169,14 +194,15 @@ fn handle_connection(
         }
     };
 
-    let Some(host) = request.host.as_deref() else {
-        return respond_error(&mut stream, 400, head, "", stop);
+    let host = match request.host.as_deref() {
+        Some(host) if !host.trim().is_empty() => host,
+        _ => return respond_error(&mut stream, 400, head, "", stop),
     };
     if !host_allowed(host, port) {
         return respond_error(&mut stream, 403, head, "", stop);
     }
 
-    let (rel, had_slash) = match decode_target(&request.target) {
+    let (rel, had_slash) = match decode_target(&request.target, port) {
         Ok(pair) => pair,
         Err(code) => return respond_error(&mut stream, code, head, "", stop),
     };
@@ -184,6 +210,7 @@ fn handle_connection(
     serve_path(
         &mut stream,
         root,
+        root_path,
         &request.target,
         &rel,
         had_slash,
@@ -293,12 +320,36 @@ fn head_request(buf: &[u8]) -> bool {
 }
 
 fn host_allowed(host: &str, port: u16) -> bool {
-    let lower = host.to_ascii_lowercase();
-    let (name, port_part) = match lower.split_once(':') {
-        Some((name, port)) => (name, Some(port)),
-        None => (lower.as_str(), None),
+    let trimmed = host.to_ascii_lowercase().trim().to_string();
+    if trimmed.is_empty() {
+        return false;
+    }
+    // A bracketed IPv6 literal carries its port after the closing bracket;
+    // splitting on the first `:` would otherwise read a name of `[`. An
+    // unbracketed address with more than one colon is not a valid authority
+    // (RFC 3986) and stays rejected.
+    let (name, port_part) = if let Some(rest) = trimmed.strip_prefix('[') {
+        let Some((inner, after)) = rest.split_once(']') else {
+            return false;
+        };
+        (
+            inner.to_string(),
+            after.strip_prefix(':').map(str::to_string),
+        )
+    } else {
+        match trimmed.matches(':').count() {
+            0 => (trimmed, None),
+            1 => {
+                let (name, port) = trimmed.split_once(':').unwrap();
+                (name.to_string(), Some(port.to_string()))
+            }
+            _ => return false,
+        }
     };
-    if name != "127.0.0.1" && name != "localhost" {
+    // A trailing dot is a fully-qualified spelling of the same name:
+    // `127.0.0.1.` and `localhost.` are the same authorities.
+    let name = name.trim_end_matches('.');
+    if name != "127.0.0.1" && name != "localhost" && name != "::1" {
         return false;
     }
     match port_part {
@@ -307,8 +358,27 @@ fn host_allowed(host: &str, port: u16) -> bool {
     }
 }
 
-fn decode_target(target: &str) -> std::result::Result<(PathBuf, bool), u16> {
+fn decode_target(target: &str, port: u16) -> std::result::Result<(PathBuf, bool), u16> {
     let raw_path = target.split_once('?').map(|(p, _)| p).unwrap_or(target);
+    // Absolute-form request target (RFC 9112 §3.2.2): `http://host[:port]/…`.
+    // The target's own authority is validated against the loopback and bound
+    // port before serving, so `serve_path` can never reflect an unvalidated
+    // authority into a `Location` header. A scheme without a path is malformed.
+    let raw_path = match raw_path
+        .strip_prefix("http://")
+        .or_else(|| raw_path.strip_prefix("https://"))
+    {
+        Some(after_scheme) => {
+            let Some(idx) = after_scheme.find('/') else {
+                return Err(400);
+            };
+            if !host_allowed(&after_scheme[..idx], port) {
+                return Err(403);
+            }
+            &after_scheme[idx..]
+        }
+        None => raw_path,
+    };
     if !raw_path.starts_with('/')
         || raw_path.starts_with("//")
         || raw_path.contains('#')
@@ -399,9 +469,11 @@ fn is_device_stem(comp: &str) -> bool {
     false
 }
 
+#[allow(clippy::too_many_arguments)]
 fn serve_path(
     stream: &mut TcpStream,
     root: &Dir,
+    root_path: &Path,
     target: &str,
     rel: &Path,
     had_slash: bool,
@@ -436,12 +508,22 @@ fn serve_path(
         (false, None) => return respond_error(stream, 404, head, "", stop),
     };
 
-    let file_path = if meta.is_dir() {
+    // `follow_leaf` is true only for the index.html exception: a symlinked
+    // index is served through its target (which may escape the served root),
+    // resolved with `std::fs`. Ordinary files stay anchored to the `Dir`
+    // capability, matching the `root.symlink_metadata` checks above.
+    let (file_path, follow_leaf) = if meta.is_dir() {
         let index = rel.join("index.html");
-        let has_index = matches!(
-            root.symlink_metadata(&index),
-            Ok(meta) if !meta.file_type().is_symlink() && meta.file_type().is_file()
-        );
+        // Follow a symlinked *leaf* here: discovery accepts a symlinked
+        // `index.html` (`is_file` follows links), so the server must serve it
+        // too. The leaf is resolved with `std::fs` rather than the `Dir`
+        // capability, because a real-world symlinked index (`index.html ->
+        // ../dist/index.html`) points *outside* the served root and cap-std
+        // correctly refuses that. Symlinked *directories* in the path are
+        // still rejected above, which keeps the "no directory escape"
+        // property: only the one file the user shipped a symlink to is
+        // reachable.
+        let has_index = std::fs::metadata(root_path.join(&index)).is_ok_and(|meta| meta.is_file());
         if !has_index {
             return respond_error(stream, 404, head, "", stop);
         }
@@ -454,19 +536,26 @@ fn serve_path(
             let extra = format!("Location: {location}\r\n");
             return respond(stream, head, 308, None, &extra, Body::Empty, stop);
         }
-        index
+        (index, true)
     } else if meta.is_file() {
         if had_slash {
             return respond_error(stream, 404, head, "", stop);
         }
-        rel.to_path_buf()
+        (rel.to_path_buf(), false)
     } else {
         return respond_error(stream, 404, head, "", stop);
     };
 
-    let file = match root.open_with(&file_path, &open_options()) {
-        Ok(file) => file,
-        Err(_) => return respond_error(stream, 404, head, "", stop),
+    let file = if follow_leaf {
+        match open_leaf(&root_path.join(&file_path)) {
+            Ok(file) => file,
+            Err(_) => return respond_error(stream, 404, head, "", stop),
+        }
+    } else {
+        match root.open_with(&file_path, &open_options()) {
+            Ok(file) => file,
+            Err(_) => return respond_error(stream, 404, head, "", stop),
+        }
     };
     let meta = match file.metadata() {
         Ok(meta) if meta.file_type().is_file() => meta,
@@ -484,6 +573,8 @@ fn serve_path(
     )
 }
 
+/// Opens a file anchored to the `Dir` capability, matching the component loop
+/// above. `O_NONBLOCK` keeps a check-to-open FIFO swap from blocking a worker.
 #[cfg(unix)]
 fn open_options() -> cap_std::fs::OpenOptions {
     use cap_std::fs::OpenOptionsExt;
@@ -497,6 +588,26 @@ fn open_options() -> cap_std::fs::OpenOptions {
     let mut options = cap_std::fs::OpenOptions::new();
     options.read(true);
     options
+}
+
+/// Opens a file to serve, following a symlink in the final component. The
+/// component loop in `serve_path` has already rejected symlinked directories,
+/// so the only symlink that can reach here is a leaf file — served through its
+/// target. `O_NONBLOCK` keeps a check-to-open FIFO swap from blocking a worker.
+#[cfg(unix)]
+fn open_leaf(path: &Path) -> io::Result<cap_std::fs::File> {
+    use std::os::unix::fs::OpenOptionsExt;
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NONBLOCK)
+        .open(path)?;
+    Ok(cap_std::fs::File::from_std(file))
+}
+
+#[cfg(not(unix))]
+fn open_leaf(path: &Path) -> io::Result<cap_std::fs::File> {
+    let file = std::fs::OpenOptions::new().read(true).open(path)?;
+    Ok(cap_std::fs::File::from_std(file))
 }
 
 fn mime_type(path: &Path) -> &'static str {
@@ -653,6 +764,7 @@ fn reason_phrase(code: u16) -> &'static str {
         405 => "Method Not Allowed",
         408 => "Request Timeout",
         431 => "Request Header Fields Too Large",
+        503 => "Service Unavailable",
         _ => "Error",
     }
 }
@@ -664,31 +776,50 @@ mod tests {
 
     #[test]
     fn decode_accepts_plain_and_encoded_paths() {
-        assert_eq!(decode_target("/").unwrap(), (PathBuf::new(), true));
+        assert_eq!(decode_target("/", 8080).unwrap(), (PathBuf::new(), true));
         assert_eq!(
-            decode_target("/a/b.txt?x=1").unwrap(),
+            decode_target("/a/b.txt?x=1", 8080).unwrap(),
             (PathBuf::from("a/b.txt"), false)
         );
         assert_eq!(
-            decode_target("/a%20b/caf%C3%A9.txt").unwrap(),
+            decode_target("/a%20b/caf%C3%A9.txt", 8080).unwrap(),
             (PathBuf::from("a b/café.txt"), false)
         );
         assert_eq!(
-            decode_target("/docs/?y=2").unwrap(),
+            decode_target("/docs/?y=2", 8080).unwrap(),
             (PathBuf::from("docs"), true)
         );
         assert_eq!(
-            decode_target("/a+b.txt").unwrap().0,
+            decode_target("/a+b.txt", 8080).unwrap().0,
             PathBuf::from("a+b.txt")
         );
         assert_eq!(
-            decode_target("/docs%2f").unwrap(),
+            decode_target("/docs%2f", 8080).unwrap(),
             (PathBuf::from("docs"), true)
         );
         assert_eq!(
-            decode_target("/a%2Fb.txt").unwrap(),
+            decode_target("/a%2Fb.txt", 8080).unwrap(),
             (PathBuf::from("a/b.txt"), false)
         );
+    }
+
+    #[test]
+    fn absolute_form_target_authority_must_be_loopback() {
+        // A loopback authority matching the bound port is accepted.
+        assert_eq!(
+            decode_target("http://127.0.0.1:8080/", 8080).unwrap(),
+            (PathBuf::new(), true)
+        );
+        assert_eq!(
+            decode_target("http://127.0.0.1:8080/docs", 8080).unwrap(),
+            (PathBuf::from("docs"), false)
+        );
+        // A foreign or wrong-port authority is refused, so it can never reach
+        // a Location header.
+        assert_eq!(decode_target("http://evil.com/", 8080), Err(403));
+        assert_eq!(decode_target("http://127.0.0.1:9090/", 8080), Err(403));
+        // A scheme with no path component is malformed.
+        assert_eq!(decode_target("http://127.0.0.1:8080", 8080), Err(400));
     }
 
     #[test]
@@ -718,7 +849,7 @@ mod tests {
             ("/COM1", 404),
             ("/lpt9.png", 404),
         ] {
-            assert_eq!(decode_target(target), Err(code), "{target}");
+            assert_eq!(decode_target(target, 8080), Err(code), "{target}");
         }
     }
 
@@ -739,13 +870,20 @@ mod tests {
         assert!(host_allowed("localhost:8080", 8080));
         assert!(host_allowed("127.0.0.1", 80));
 
+        // Interop forms a real client or proxy may emit: a bracketed IPv6
+        // loopback and a fully-qualified trailing dot.
+        assert!(host_allowed("[::1]:8080", 8080));
+        assert!(host_allowed("127.0.0.1.:8080", 8080));
+        assert!(host_allowed("localhost.:8080", 8080));
+
         assert!(!host_allowed("127.0.0.1:8081", 8080));
         assert!(!host_allowed("127.0.0.1", 8080));
         assert!(!host_allowed("evil.com:8080", 8080));
         assert!(!host_allowed("example.com", 80));
         assert!(!host_allowed("::1:8080", 8080));
-        assert!(!host_allowed("[::1]:8080", 8080));
         assert!(!host_allowed("127.0.0.1:0x1f90", 8080));
+        assert!(!host_allowed("", 8080));
+        assert!(!host_allowed("   ", 8080));
     }
 
     #[test]

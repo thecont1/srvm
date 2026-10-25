@@ -34,6 +34,31 @@ pub fn strip_ansi(line: &str) -> String {
         .into_owned()
 }
 
+/// Escapes control characters so a user-controlled label or path cannot break
+/// the one-line-per-item layout or inject escape sequences. Newline, tab and
+/// carriage return become readable escapes; the rest of the C0 block becomes
+/// `\xNN`.
+pub fn escape_controls(input: &str) -> String {
+    let mut out = String::with_capacity(input.len());
+    for ch in input.chars() {
+        match ch {
+            '\n' => out.push_str("\\n"),
+            '\t' => out.push_str("\\t"),
+            '\r' => out.push_str("\\r"),
+            ch if ch.is_control() => out.push_str(&format!("\\x{:02x}", ch as u32)),
+            ch => out.push(ch),
+        }
+    }
+    out
+}
+
+/// Sanitizes a user-controlled string for display only: strips ANSI escape
+/// sequences, then escapes any remaining control characters. Raw bytes are
+/// kept for `--select` matching and file access.
+pub fn sanitize_display(input: &str) -> String {
+    escape_controls(&strip_ansi(input))
+}
+
 fn normalize_url(raw: &str) -> Option<String> {
     let mut url = raw
         .trim_matches(|ch: char| ch == ')' || ch == ']' || ch == '}' || ch == ',' || ch == '.')

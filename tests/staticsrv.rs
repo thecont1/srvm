@@ -746,6 +746,37 @@ fn idle_partial_request_does_not_block_others() {
 }
 
 #[test]
+fn eight_stalled_sockets_do_not_block_new_requests() {
+    // F-01 regression: with the old four-worker pool, four stalled sockets
+    // saturated every worker and stalled each request ~4.8 s. The pool must
+    // have enough headroom that eight stalled clients still leave a worker
+    // free to answer a new request in under a second.
+    let root = html_root(&[("index.html", b"ok")]);
+    let server = TestServer::start(root.path());
+
+    let mut stalled = Vec::new();
+    for _ in 0..8 {
+        let mut stream = connect(server.port);
+        stream
+            .write_all(b"GET /stuck HTTP/1.1\r\nHost: 12")
+            .unwrap();
+        stream.flush().unwrap();
+        stalled.push(stream);
+    }
+
+    let began = Instant::now();
+    let response = get(server.port, "/");
+    assert_eq!(response.status, 200);
+    assert!(
+        began.elapsed() < Duration::from_secs(1),
+        "a new request must not wait on the stalled sockets: {:?}",
+        began.elapsed()
+    );
+
+    drop(stalled);
+}
+
+#[test]
 fn stop_returns_quickly_with_idle_connection() {
     let root = html_root(&[("index.html", b"ok")]);
     let mut server = TestServer::start(root.path());

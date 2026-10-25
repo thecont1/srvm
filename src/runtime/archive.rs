@@ -1,12 +1,18 @@
 use std::{
     fs,
-    io::{self},
+    io::{self, Read},
     path::{Component, Path, PathBuf},
 };
 
 use anyhow::{Context, Result, bail};
 use flate2::read::GzDecoder;
 use sha2::{Digest, Sha256};
+
+/// Hard cap on the *decompressed* bytes one archive may expand into. The
+/// download cap (512 MiB in `fetch.rs`) bounds the compressed input; a
+/// zip/gzip bomb can still inflate far past that, so extraction enforces its
+/// own ceiling before writing.
+const MAX_EXTRACT_BYTES: u64 = 8 * 1024 * 1024 * 1024;
 
 pub fn extract_verified(bytes: &[u8], expected: &[u8; 32], dest: &Path) -> Result<()> {
     verify_digest(bytes, expected)?;
@@ -200,6 +206,7 @@ fn tool_names(name: &str) -> Vec<String> {
 fn extract_tar_gz(bytes: &[u8], dest: &Path) -> Result<()> {
     let mut archive = tar::Archive::new(GzDecoder::new(bytes));
     archive.set_preserve_permissions(true);
+    let mut total: u64 = 0;
     for entry in archive.entries()? {
         let mut entry = entry?;
         let path = entry.path()?.into_owned();
@@ -215,6 +222,10 @@ fn extract_tar_gz(bytes: &[u8], dest: &Path) -> Result<()> {
                 bail!("refusing symlink {} -> {}", path.display(), link.display());
             }
         }
+        total = total.saturating_add(entry.size());
+        if total > MAX_EXTRACT_BYTES {
+            bail!("archive expands beyond {MAX_EXTRACT_BYTES} bytes; refusing to unpack");
+        }
         let unpacked = entry
             .unpack_in(dest)
             .with_context(|| format!("unpack {}", path.display()))?;
@@ -227,11 +238,19 @@ fn extract_tar_gz(bytes: &[u8], dest: &Path) -> Result<()> {
 
 fn extract_zip(bytes: &[u8], dest: &Path) -> Result<()> {
     let mut archive = zip::ZipArchive::new(io::Cursor::new(bytes))?;
+    let mut total: u64 = 0;
     for index in 0..archive.len() {
         let mut file = archive.by_index(index)?;
         let Some(rel) = file.enclosed_name() else {
             bail!("refusing zip entry that escapes the destination");
         };
+        // The declared size is a hint, not a bound: a malformed entry's
+        // DEFLATE stream can inflate past its header. Enforce the remaining
+        // budget against the bytes actually decompressed, not `file.size()`.
+        let remaining = MAX_EXTRACT_BYTES - total;
+        if file.size() > remaining {
+            bail!("archive expands beyond {MAX_EXTRACT_BYTES} bytes; refusing to unpack");
+        }
         let out = dest.join(rel);
         if file.is_dir() {
             fs::create_dir_all(&out)?;
@@ -241,7 +260,13 @@ fn extract_zip(bytes: &[u8], dest: &Path) -> Result<()> {
             fs::create_dir_all(parent)?;
         }
         let mut dest_file = fs::File::create(&out)?;
-        io::copy(&mut file, &mut dest_file)?;
+        // Copy at most `remaining` bytes; one byte more means the entry lied
+        // about its size, so reject it rather than write past the budget.
+        let copied = io::copy(&mut (&mut file).take(remaining + 1), &mut dest_file)?;
+        if copied > remaining {
+            bail!("archive expands beyond {MAX_EXTRACT_BYTES} bytes; refusing to unpack");
+        }
+        total += copied;
     }
     Ok(())
 }

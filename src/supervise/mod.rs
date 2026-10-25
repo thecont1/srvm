@@ -6,7 +6,7 @@ use std::{
     process::{Command, Stdio},
     sync::{
         Arc, Mutex, OnceLock,
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicI32, Ordering},
         mpsc,
     },
     thread,
@@ -33,6 +33,30 @@ use ring::Ring;
 static CURRENT_CHILDREN: OnceLock<Arc<Mutex<Vec<u32>>>> = OnceLock::new();
 static STATIC_STOP: OnceLock<Arc<AtomicBool>> = OnceLock::new();
 static SHUTDOWN: AtomicBool = AtomicBool::new(false);
+/// The child's own nonzero exit code, recorded when a child dies so `main`
+/// can exit with it (TECH-SPEC: "the child's original nonzero code on
+/// failure"). The first terminal failure's code wins; a code recorded for a
+/// transient handoff retry is deliberately skipped.
+static CHILD_EXIT_CODE: OnceLock<AtomicI32> = OnceLock::new();
+
+/// The exit code `main` should return when the run ended in a child failure.
+/// `None` means no child failed (srvm failed on its own, or succeeded).
+pub fn take_child_exit_code() -> Option<i32> {
+    let code = CHILD_EXIT_CODE.get()?.load(Ordering::SeqCst);
+    (code != 0).then_some(code)
+}
+
+/// Records a child's exit code the first time one terminates nonzero.
+fn record_child_exit(status: &std::process::ExitStatus) {
+    let Some(code) = status.code() else {
+        return;
+    };
+    if code == 0 {
+        return;
+    }
+    let cell = CHILD_EXIT_CODE.get_or_init(|| AtomicI32::new(0));
+    let _ = cell.compare_exchange(0, code, Ordering::SeqCst, Ordering::SeqCst);
+}
 
 /// Whether a signal has already asked this run to stop. The shutdown path uses
 /// it so an interrupted run reports 130 even when the app's own death reaches
@@ -317,6 +341,16 @@ fn run_install(
     label: Option<&str>,
     app_env: &[(String, String)],
 ) -> Result<()> {
+    // A symlinked `node_modules` sends the install's bytes outside the
+    // workspace; say where, instead of writing through the link silently.
+    if !options.quiet
+        && let Some(target) = crate::bootstrap::node_modules_symlink_target(root)
+    {
+        eprintln!(
+            "  note       node_modules is a symlink to {}; installs write outside the workspace",
+            scan::sanitize_display(&target.to_string_lossy())
+        );
+    }
     let ring = Arc::new(Mutex::new(Ring::default()));
     let mut child = spawn(command, root, &child_env(app_env, &[]), path_prepend)?;
     register_child(child.id());
@@ -331,6 +365,7 @@ fn run_install(
             if status.success() {
                 return Ok(());
             }
+            record_child_exit(&status);
             return Err(error_with_tail(
                 format!("install command failed: {}", command.command_line()),
                 &ring,
@@ -366,7 +401,11 @@ const PROBE_INTERVAL: Duration = Duration::from_secs(3);
 enum Attempt {
     Done,
     Stopped,
-    Retry { next_start: u16, err: anyhow::Error },
+    Retry {
+        next_start: u16,
+        err: anyhow::Error,
+        status: std::process::ExitStatus,
+    },
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -407,7 +446,10 @@ fn run_server(
                 );
                 start = Some(next_start);
             }
-            Attempt::Retry { err, .. } => return Err(err),
+            Attempt::Retry { err, status, .. } => {
+                record_child_exit(&status);
+                return Err(err);
+            }
         }
     }
     unreachable!()
@@ -512,6 +554,10 @@ fn serve_attempt(
                 return Ok(Attempt::Done);
             }
 
+            // Record the child's code only on a terminal failure, never for a
+            // transient handoff retry: a retry that later succeeds must not
+            // leave a stale exit code behind.
+
             let err = if started.elapsed() < Duration::from_secs(3) {
                 error_with_tail(
                     format!("{} failed early: {status}", spec.name),
@@ -534,8 +580,15 @@ fn serve_attempt(
                 None
             };
             if let Some(next_start) = retry {
-                return Ok(Attempt::Retry { next_start, err });
+                // Carry the status so the caller can record it only when the
+                // handoff retries are exhausted.
+                return Ok(Attempt::Retry {
+                    next_start,
+                    err,
+                    status,
+                });
             }
+            record_child_exit(&status);
             return Err(err);
         }
 

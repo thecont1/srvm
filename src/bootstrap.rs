@@ -198,6 +198,19 @@ pub fn js_install_needed(root: &Path, manager: &str) -> bool {
     lock_time > marker_time
 }
 
+/// When `node_modules` is a symlink, the target its installs actually write
+/// into — which may be outside the workspace. Callers surface this as a note
+/// instead of silently writing through the link.
+pub fn node_modules_symlink_target(root: &Path) -> Option<PathBuf> {
+    let link = root.join("node_modules");
+    if !fs::symlink_metadata(&link).is_ok_and(|meta| meta.file_type().is_symlink()) {
+        return None;
+    }
+    // Prefer the fully-resolved target; fall back to the raw link for a
+    // dangling link.
+    fs::canonicalize(&link).or_else(|_| link.read_link()).ok()
+}
+
 /// The newest timestamp among every lockfile name `manager` may use: npm has
 /// both `package-lock.json` and `npm-shrinkwrap.json`, bun has both `bun.lock`
 /// and `bun.lockb`. `None` means no lockfile is present at all, which is

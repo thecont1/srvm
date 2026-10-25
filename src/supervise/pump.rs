@@ -34,7 +34,7 @@ where
         // decode lossily instead.
         loop {
             buf.clear();
-            match reader.read_until(b'\n', &mut buf) {
+            match read_until_capped(&mut reader, b'\n', &mut buf) {
                 Ok(0) | Err(_) => break,
                 Ok(_) => {}
             }
@@ -82,13 +82,49 @@ where
 
 fn format_child_line(line: &str, no_color: bool, label: Option<&str>) -> String {
     let line = match label {
-        Some(label) => format!("    [{label}] {line}"),
+        // The label can carry a sub-app's relative path; sanitize it so a
+        // hostile directory name cannot inject escapes into child output.
+        Some(label) => format!("    [{}] {line}", scan::sanitize_display(label)),
         None => format!("    {line}"),
     };
     if no_color || std::env::var_os("NO_COLOR").is_some() {
         line
     } else {
         format!("\x1b[2m{line}\x1b[0m")
+    }
+}
+
+/// Cap on a single child-output line. A child that never emits `\n` would
+/// otherwise grow the pump's buffer without bound; flushing at the cap keeps
+/// the line buffer O(cap) while still forwarding the bytes.
+const MAX_LINE_BYTES: usize = 1024 * 1024;
+
+/// Like `BufRead::read_until`, but the buffer is flushed once it reaches
+/// `MAX_LINE_BYTES`, so an unterminated run is split into bounded chunks.
+fn read_until_capped(
+    reader: &mut impl BufRead,
+    delim: u8,
+    buf: &mut Vec<u8>,
+) -> std::io::Result<usize> {
+    let mut total = 0;
+    loop {
+        let available = reader.fill_buf()?;
+        if available.is_empty() {
+            return Ok(total);
+        }
+        if let Some(pos) = available.iter().position(|&b| b == delim) {
+            buf.extend_from_slice(&available[..=pos]);
+            reader.consume(pos + 1);
+            return Ok(total + pos + 1);
+        }
+        let remaining = MAX_LINE_BYTES - buf.len();
+        if remaining == 0 {
+            return Ok(total);
+        }
+        let take = available.len().min(remaining);
+        buf.extend_from_slice(&available[..take]);
+        reader.consume(take);
+        total += take;
     }
 }
 
