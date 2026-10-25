@@ -220,17 +220,15 @@ fn node_routes(archive: &[u8], digest: &str) -> HashMap<String, Vec<u8>> {
 /// in and satisfy the fetch from outside the fixture.
 fn scrubbed(path: &Path, home: &Path, cache: &Path) -> AssertCommand {
     let mut cmd = AssertCommand::cargo_bin("srvm").unwrap();
-    cmd.env("PATH", path)
+    // Clear the whole environment rather than override individual variables:
+    // on Windows an ambient toolchain leaks in through probes beyond PATH
+    // (Program Files, the toolcache on `Path`, LOCALAPPDATA) and case-
+    // insensitive environment lookup makes selective scrubbing unreliable.
+    cmd.env_clear()
+        .env("PATH", path)
         .env("HOME", home)
         .env("USERPROFILE", home)
-        .env("SRVM_CACHE_DIR", cache)
-        .env_remove("PORT")
-        // srvm's tool probe also looks for preinstalled tools under
-        // `ProgramFiles\nodejs` and `LOCALAPPDATA\pnpm` (see detect::binpath);
-        // redirect them so a CI runner's ambient Node cannot satisfy detection
-        // and the fetch fixture is actually exercised.
-        .env("ProgramFiles", home)
-        .env("LOCALAPPDATA", home);
+        .env("SRVM_CACHE_DIR", cache);
     cmd
 }
 
