@@ -57,7 +57,16 @@ pub fn read_to_string(root: &Path, rel: &str) -> Result<String> {
     if len > PROBE_CAP {
         bail!("{rel} is {len} bytes, above the {PROBE_CAP}-byte marker cap");
     }
-    Ok(fs::read_to_string(path)?)
+    // Read through `take` so a FIFO or device node — which reports length 0
+    // yet can stream forever — cannot block detection. A real overflow past
+    // the cap is still caught even when the metadata length was not.
+    let mut file = fs::File::open(&path)?;
+    let mut buf = Vec::new();
+    file.by_ref().take(PROBE_CAP + 1).read_to_end(&mut buf)?;
+    if buf.len() as u64 > PROBE_CAP {
+        bail!("{rel} exceeds the {PROBE_CAP}-byte marker cap");
+    }
+    String::from_utf8(buf).map_err(|err| anyhow::anyhow!("{rel} is not utf-8: {err}"))
 }
 
 /// Capped, lossy file read for marker scanning — returns None when the file

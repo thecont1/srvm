@@ -221,10 +221,19 @@ fn pick_script(scripts: &BTreeMap<String, String>) -> Option<String> {
         }
     }
 
+    // Known dev verbs; a script key qualifies when its first whitespace-delimited
+    // token is one of them, so a lone `"dev app"` is not invisible.
+    const VERBS: [&str; 5] = ["dev", "serve", "develop", "start", "preview"];
     scripts
         .keys()
         .filter(|name| {
-            name.starts_with("dev:") || name.starts_with("dev_") || name.starts_with("dev-")
+            name.starts_with("dev:")
+                || name.starts_with("dev_")
+                || name.starts_with("dev-")
+                || name
+                    .split_whitespace()
+                    .next()
+                    .is_some_and(|token| VERBS.contains(&token))
         })
         .min()
         .cloned()
@@ -400,6 +409,18 @@ mod tests {
         let scripts = BTreeMap::from([("dev:z".into(), "z".into()), ("dev:a".into(), "a".into())]);
 
         assert_eq!(pick_script(&scripts), Some("dev:a".into()));
+    }
+
+    #[test]
+    fn a_script_whose_first_token_is_a_verb_is_picked() {
+        // F-13: a lone `"dev app"` must not fall through to the framework
+        // fallback — its first whitespace-delimited token is a known verb.
+        let scripts = BTreeMap::from([
+            ("dev app".into(), "node app.js".into()),
+            ("build".into(), "tsc".into()),
+        ]);
+
+        assert_eq!(pick_script(&scripts), Some("dev app".into()));
     }
 
     #[test]
