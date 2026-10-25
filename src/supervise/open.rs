@@ -89,7 +89,12 @@ fn platform_candidates(url: &str, _wsl: bool) -> Vec<BrowserCommand> {
         },
         BrowserCommand {
             program: "cmd".into(),
-            args: vec!["/C".into(), "start".into(), "".into(), url.into()],
+            // `cmd /C` re-parses its command line, so a bare URL containing
+            // `&` or spaces would split into extra tokens. Quoting keeps `&`
+            // and spaces literal; `%VAR%` expansion inside quotes remains an
+            // unverified residual edge (rundll32 above is preferred and
+            // normally wins). Not exercised on Windows in this audit.
+            args: vec!["/C".into(), "start".into(), "".into(), format!("\"{url}\"")],
         },
     ]
 }
@@ -105,7 +110,7 @@ fn platform_candidates(url: &str, wsl: bool) -> Vec<BrowserCommand> {
         });
         candidates.push(BrowserCommand {
             program: "cmd.exe".into(),
-            args: vec!["/C".into(), "start".into(), "".into(), url.into()],
+            args: vec!["/C".into(), "start".into(), "".into(), format!("\"{url}\"")],
         });
     }
 

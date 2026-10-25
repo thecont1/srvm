@@ -179,7 +179,7 @@ fn print_intro(workspace_root: &Path, candidate: &Candidate) {
     } else {
         println!(
             "  serve      [{}] {}",
-            candidate.rel.display(),
+            supervise::scan::sanitize_display(&candidate.rel.to_string_lossy()),
             candidate.spec.summary()
         );
     }
@@ -296,7 +296,10 @@ fn display_rel(candidate: &Candidate) -> String {
     if candidate.rel.as_os_str().is_empty() {
         ".".into()
     } else {
-        candidate.rel.to_string_lossy().into_owned()
+        // Sanitized for display only: a directory name must not be able to
+        // inject escapes or break the one-line-per-candidate layout. Raw
+        // bytes are kept for `--select` matching.
+        supervise::scan::sanitize_display(&candidate.rel.to_string_lossy())
     }
 }
 
