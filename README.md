@@ -82,7 +82,10 @@ Error: no servable app detected in /Users/home/projects/empty
   machine? srvm downloads an official, checksum-verified build and uses it
   just for your app.
 - **Serves plain static sites itself** — no runtime needed at all.
-- **Cleans up fully** — Ctrl+C stops the whole tree, nothing leaks.
+- **Cleans up** — Ctrl+C stops the app's whole process group, escalating from
+  TERM to SIGKILL for descendants that ignore the polite signal. An app that
+  daemonises itself (`setsid`) detaches into its own session and is not
+  guaranteed to stop.
 
 ## Install
 
@@ -131,7 +134,7 @@ $ srvm --dry-run             # show what it would launch; run nothing
 $ srvm --no-open             # don't open the app in a browser
 $ srvm --port <N>            # start the free-port search at N (0 = OS picks a free one)
 $ srvm --select <id>         # run exactly one app: 1-based number, qualified id, or unique name
-$ srvm --no-install          # never install anything; assume the project is already set up
+$ srvm --no-install          # skip dependency installation; a missing runtime may still be fetched to the cache
 $ srvm -v / --verbose        # show more diagnostic detail
 $ srvm --quiet               # suppress non-essential output
 $ srvm --no-color            # disable colored output

@@ -23,7 +23,8 @@ covers what it does and how to get it; this file covers how it works.
   not guesses. `BROWSER=none` is always injected into children.
 - **No config files, daemons, telemetry, or arbitrary script evaluation.**
 - **Exit honesty.** 130 on signal shutdown; the child's original nonzero code
-  on failure; nothing left running.
+  on failure; the app's process group is stopped (a daemonising app can detach
+  itself).
 
 ## Launch-set selection
 
@@ -88,6 +89,10 @@ covers what it does and how to get it; this file covers how it works.
   historical release index (`?mode=json&include=all`).
 - The runtime cache is per-version locked (`File::try_lock`), the prefix is
   validated before publish, and a post-lock recheck avoids duplicate work.
+- Runtime downloads are integrity-checked (SHA-256) against a digest fetched
+  from the same origin, and authenticated only by TLS to the four fixed hosts.
+  Checksums detect corruption and partial substitution, not a same-origin
+  attacker; the release build attestations are for maintainers and auditors.
 
 ## Built-in static server
 
@@ -103,7 +108,12 @@ Deliberately minimal:
   other machines or DNS-rebinding hostnames.
 - GET and HEAD only; everything else gets `405 Allow: GET, HEAD`.
 - No directory listing, dotfiles, symlinks, or path traversal — requests
-  resolve relative to the served root.
+  resolve relative to the served root. A symlinked `index.html` leaf is
+  followed (discovery accepts it too); symlinked directories are not.
+- No CORS header is sent, deliberately: a page on any other origin can load
+  assets (`<img>`, `<script>`, `<link>`) but cannot read bodies via `fetch`,
+  and cannot preflight. Adding `Access-Control-Allow-Origin: *` would make
+  every served byte cross-origin readable.
 - No SPA fallback: missing files are real `404`s.
 - No transforms, template injection, live reload, uploads, or CGI. Bytes are
   read fresh per request (`Cache-Control: no-store`) so edits appear on
@@ -117,6 +127,9 @@ Deliberately minimal:
   whole group so `npm → sh → node` grandchildren can't leak.
 - Unix teardown escalates TERM → SIGKILL for resistant descendants where a
   grace period exists; Windows uses `taskkill /T` on the tree.
+- A descendant that calls `setsid()` (or otherwise daemonises) leaves the
+  process group and is not signalled; teardown is best-effort over the group,
+  not a cgroup or Job Object. Daemonising apps are the documented leak.
 - Exit status is signal-owned: 130 on Ctrl+C shutdown, the child's real code
   otherwise.
 
@@ -146,6 +159,9 @@ Deliberately minimal:
   ARM64), `crates-publish.yml` (manual dispatch; publishes via crates.io
   trusted publishing over OIDC — no stored token), `release.yml` (dist
   publish + Homebrew tap push on stable tags only).
+- Release tags must match the Cargo.toml version (enforced in `release.yml`);
+  prefer annotated, signed tags and a `v*` tag-protection rule so a moved tag
+  cannot silently re-release.
 - The published crate is trimmed by `Cargo.toml` `exclude` (56 files): no
   workflows, plan, skill, dist config, or release tooling ships in the
   crates.io package.
