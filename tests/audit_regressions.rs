@@ -43,6 +43,7 @@ impl Drop for Guard {
     }
 }
 
+#[cfg(unix)]
 fn stub(dir: &Path, name: &str, body: &str) {
     use std::os::unix::fs::PermissionsExt;
     let path = dir.join(name);
@@ -61,12 +62,14 @@ fn project(script_body: &str) -> tempfile::TempDir {
     dir
 }
 
+#[cfg(unix)]
 fn bin_dir() -> tempfile::TempDir {
     let dir = tempdir().unwrap();
     stub(dir.path(), "npm", "exit 0");
     dir
 }
 
+#[cfg(unix)]
 fn srvm(path: &Path) -> Command {
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_srvm"));
     cmd.env("PATH", path)
@@ -319,6 +322,7 @@ fn site(files: &[(&str, &[u8])]) -> tempfile::TempDir {
 
 /// TECH-SPEC "Design rules": "Exit honesty. … the child's original nonzero
 /// code on failure."
+#[cfg(unix)]
 #[test]
 fn documented_child_exit_code_is_preserved() {
     let bin = tempdir().unwrap();
@@ -510,6 +514,7 @@ fn dry_run_writes_nothing_anywhere() {
 }
 
 /// `.env` is parse-only and the ambient environment wins.
+#[cfg(unix)]
 #[test]
 fn dotenv_is_parse_only_and_ambient_wins() {
     let bin = tempdir().unwrap();
@@ -557,6 +562,7 @@ fn dotenv_is_parse_only_and_ambient_wins() {
 }
 
 /// A script name reaches argv verbatim, as one element.
+#[cfg(unix)]
 #[test]
 fn script_name_reaches_argv_verbatim() {
     let bin = tempdir().unwrap();
