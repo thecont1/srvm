@@ -53,13 +53,19 @@ pub fn cargo_package_name(root: &Path) -> Option<String> {
 
 pub fn read_to_string(root: &Path, rel: &str) -> Result<String> {
     let path = root.join(rel);
-    let len = fs::metadata(&path)?.len();
+    let meta = fs::metadata(&path)?;
+    // Reject non-regular files before opening: `File::open` on a FIFO blocks
+    // until a writer appears, and metadata does not.
+    if !meta.is_file() {
+        bail!("{rel} is not a regular file");
+    }
+    let len = meta.len();
     if len > PROBE_CAP {
         bail!("{rel} is {len} bytes, above the {PROBE_CAP}-byte marker cap");
     }
-    // Read through `take` so a FIFO or device node — which reports length 0
-    // yet can stream forever — cannot block detection. A real overflow past
-    // the cap is still caught even when the metadata length was not.
+    // Read through `take` so a file that grows after the metadata check is
+    // still bounded; a real overflow past the cap is caught even when the
+    // recorded length was not.
     let mut file = fs::File::open(&path)?;
     let mut buf = Vec::new();
     file.by_ref().take(PROBE_CAP + 1).read_to_end(&mut buf)?;
@@ -172,6 +178,11 @@ fn remove_trailing_commas(input: &str) -> String {
 }
 
 fn read_capped(path: &Path) -> Result<String> {
+    // Reject non-regular files before opening: `File::open` on a FIFO blocks
+    // until a writer appears, and metadata does not.
+    if !fs::metadata(path)?.is_file() {
+        bail!("{} is not a regular file", path.display());
+    }
     let mut file = fs::File::open(path)?;
     let mut buf = Vec::new();
     file.by_ref().take(PROBE_CAP).read_to_end(&mut buf)?;

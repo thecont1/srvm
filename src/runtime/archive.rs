@@ -1,6 +1,6 @@
 use std::{
     fs,
-    io::{self},
+    io::{self, Read},
     path::{Component, Path, PathBuf},
 };
 
@@ -244,8 +244,11 @@ fn extract_zip(bytes: &[u8], dest: &Path) -> Result<()> {
         let Some(rel) = file.enclosed_name() else {
             bail!("refusing zip entry that escapes the destination");
         };
-        total = total.saturating_add(file.size());
-        if total > MAX_EXTRACT_BYTES {
+        // The declared size is a hint, not a bound: a malformed entry's
+        // DEFLATE stream can inflate past its header. Enforce the remaining
+        // budget against the bytes actually decompressed, not `file.size()`.
+        let remaining = MAX_EXTRACT_BYTES - total;
+        if file.size() > remaining {
             bail!("archive expands beyond {MAX_EXTRACT_BYTES} bytes; refusing to unpack");
         }
         let out = dest.join(rel);
@@ -257,7 +260,13 @@ fn extract_zip(bytes: &[u8], dest: &Path) -> Result<()> {
             fs::create_dir_all(parent)?;
         }
         let mut dest_file = fs::File::create(&out)?;
-        io::copy(&mut file, &mut dest_file)?;
+        // Copy at most `remaining` bytes; one byte more means the entry lied
+        // about its size, so reject it rather than write past the budget.
+        let copied = io::copy(&mut (&mut file).take(remaining + 1), &mut dest_file)?;
+        if copied > remaining {
+            bail!("archive expands beyond {MAX_EXTRACT_BYTES} bytes; refusing to unpack");
+        }
+        total += copied;
     }
     Ok(())
 }

@@ -82,21 +82,24 @@ fn platform_candidates(url: &str, _wsl: bool) -> Vec<BrowserCommand> {
 
 #[cfg(target_os = "windows")]
 fn platform_candidates(url: &str, _wsl: bool) -> Vec<BrowserCommand> {
-    vec![
-        BrowserCommand {
-            program: "rundll32".into(),
-            args: vec!["url.dll,FileProtocolHandler".into(), url.into()],
-        },
-        BrowserCommand {
+    let mut candidates = vec![BrowserCommand {
+        program: "rundll32".into(),
+        args: vec!["url.dll,FileProtocolHandler".into(), url.into()],
+    }];
+    // `cmd /C start` re-parses its command line, so it is only safe for a URL
+    // with no character cmd.exe would interpret — quotes, `&`/`|`/`;`
+    // separators, `%`-expansion, or `<`/`>`/`^` redirection/escape. Leave any
+    // such URL to rundll32 above, which is preferred anyway.
+    if url
+        .chars()
+        .all(|ch| !matches!(ch, '"' | '&' | '|' | ';' | '%' | '<' | '>' | '^'))
+    {
+        candidates.push(BrowserCommand {
             program: "cmd".into(),
-            // `cmd /C` re-parses its command line, so a bare URL containing
-            // `&` or spaces would split into extra tokens. Quoting keeps `&`
-            // and spaces literal; `%VAR%` expansion inside quotes remains an
-            // unverified residual edge (rundll32 above is preferred and
-            // normally wins). Not exercised on Windows in this audit.
-            args: vec!["/C".into(), "start".into(), "".into(), format!("\"{url}\"")],
-        },
-    ]
+            args: vec!["/C".into(), "start".into(), "".into(), url.into()],
+        });
+    }
+    candidates
 }
 
 #[cfg(all(unix, not(target_os = "macos")))]
@@ -108,10 +111,15 @@ fn platform_candidates(url: &str, wsl: bool) -> Vec<BrowserCommand> {
             program: "wslview".into(),
             args: vec![url.into()],
         });
-        candidates.push(BrowserCommand {
-            program: "cmd.exe".into(),
-            args: vec!["/C".into(), "start".into(), "".into(), format!("\"{url}\"")],
-        });
+        if url
+            .chars()
+            .all(|ch| !matches!(ch, '"' | '&' | '|' | ';' | '%' | '<' | '>' | '^'))
+        {
+            candidates.push(BrowserCommand {
+                program: "cmd.exe".into(),
+                args: vec!["/C".into(), "start".into(), "".into(), url.into()],
+            });
+        }
     }
 
     candidates.extend([
