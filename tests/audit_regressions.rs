@@ -229,6 +229,11 @@ fn scrubbed(path: &Path, home: &Path, cache: &Path) -> AssertCommand {
         .env("HOME", home)
         .env("USERPROFILE", home)
         .env("SRVM_CACHE_DIR", cache);
+    // Winsock cannot initialize without SystemRoot (os error 10106); forward
+    // the system root when the host provides one (it only exists on Windows).
+    if let Some(system_root) = std::env::var_os("SystemRoot") {
+        cmd.env("SystemRoot", system_root);
+    }
     cmd
 }
 
