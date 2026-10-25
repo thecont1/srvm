@@ -224,7 +224,13 @@ fn scrubbed(path: &Path, home: &Path, cache: &Path) -> AssertCommand {
         .env("HOME", home)
         .env("USERPROFILE", home)
         .env("SRVM_CACHE_DIR", cache)
-        .env_remove("PORT");
+        .env_remove("PORT")
+        // srvm's tool probe also looks for preinstalled tools under
+        // `ProgramFiles\nodejs` and `LOCALAPPDATA\pnpm` (see detect::binpath);
+        // redirect them so a CI runner's ambient Node cannot satisfy detection
+        // and the fetch fixture is actually exercised.
+        .env("ProgramFiles", home)
+        .env("LOCALAPPDATA", home);
     cmd
 }
 
