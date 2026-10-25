@@ -289,6 +289,9 @@ impl RawServer {
         }
     }
 
+    // Only the (unix-only) symlinked-index test uses this convenience wrapper;
+    // the cross-platform tests drive the server with `exchange` directly.
+    #[cfg(unix)]
     fn get(&self, target: &str) -> String {
         exchange(
             self.port,
